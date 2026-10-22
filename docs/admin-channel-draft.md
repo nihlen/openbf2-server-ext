@@ -89,14 +89,47 @@ Problems the native channel should fix:
   protection that cancels damage, refusing team stacking. These need their own engine hooks on
   `IGameLogic`, and their own approval.
 
+## Answers so far
+
+Read-only investigation, 2026-10-22: `docs/findings/admin-channel-a1-a4.md`.
+
+- **A1, mostly yes.**
+  - All 42 script events pass through `PythonHost::handleEvent` (`PythonHost.cpp:799`), but their
+    arguments are already Python tuples there. The typed arguments carry what mm_webadmin sends:
+    weapon template, vehicle (root via parents), control point (team and flag via `IControlPoint`)
+    and positions.
+  - The CD-key hash, team names and tickets need small methods appended to `IServerExtension`.
+  - Game state is not a script event. It comes as EventManager `ECGameLogic` id 1, which the
+    module can already hear.
+- **R4, refined.**
+  - One observer call at the top of `handleEvent`, before Python's handlers run.
+  - An engine-side decoder in `PythonHost.cpp` turns the tuple back into typed values (player,
+    object, int, float, string).
+  - Appended to `IServerExtension`: `IScriptEventListener` and `setScriptEventListener`.
+  - Cost is one branch per event with no listener set. Calls can nest, so the listener only copies
+    into the module's queue.
+- **Commands.**
+  - `rcon` goes through the `"MainConsole"` singleton, whose `executeLine` returns the output.
+  - `position`, `rotation`, `damage`, `team` and `score` have typed paths.
+  - `gameevent`, `hudevent`, `medal`, `rank` and `pm` each need an appended engine method.
+- **A4, yes:** no game module changes. The work is an adapter that feeds the same tab-separated
+  lines into `GameReader.QueueMessage`, plus a new `IGameWriter`. Modules rely on four details the
+  backend must keep:
+  - rcon output joined with ``;
+  - rcon commands run in strict order;
+  - `RootVehicleId` equal to the console grid id;
+  - Windows-1252 text.
+- **Existing mm_webadmin bugs found on the way:**
+  - `gameStatePaused` can never fire, because Python never receives Paused (`PythonHost.cpp:863-877`).
+  - Every `playerKilled` sends the attacker's vehicle position as the victim's.
+  - Suicides probably never produce `playerKilledSelf` (inferred, not run).
+
 ## Open questions
 
 | Id | Question |
 |---|---|
-| A1 | Does the Python host's dispatch carry everything each event needs (weapon template, root vehicle, CP team), or do some events need extra lookups? |
 | A2 | Should the module dial out (as proposed) or listen for WebAdmin? Dialling out matches today's deployment. |
 | A3 | Is HMAC with a pre-shared key enough, or is TLS needed in the first version? |
-| A4 | Does the existing `GameReader`/`GameWriter` interface fit a second backend without changes to the game modules? |
 | A5 | What happens when `mm_webadmin.py` and the native channel are both active? Proposal: the module refuses to start the admin channel if `mm_webadmin` is loaded, so events are never sent twice. |
 
 ## Order of work, once approved
