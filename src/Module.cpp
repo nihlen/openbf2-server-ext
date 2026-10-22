@@ -1,4 +1,4 @@
-// libserverext: the engine side of the bot channel, docs/protocol.md v0.
+// libserverext: the engine side of the bot channel, docs/protocol.md v1.
 //
 // Everything in this file runs on the server's main thread, inside the EventManager category-7
 // event that the module re-posts every tick (Q1), plus the ECHud unload notification. Socket work
@@ -24,6 +24,7 @@
 #include "Game/IEventListener.h"
 #include "Game/IGame.h"
 #include "Game/IGameServer.h"
+#include "Game/Objects/ICameraObject.h"
 #include "Game/GameServer/IServerExtension.h"
 #include "Game/Objects/GameLogicComp/IArmorGLComp.h"
 #include "Game/Objects/IObject.h"
@@ -52,9 +53,25 @@ const unsigned int kTickEventId = 1;
 const unsigned int kUnloadHudEventId = 3;   // GameServer::unload posts (ECHud, 3) first
 const float kTickRate = 30.0f;
 const int kDefaultKit = 0;
-const float kNearestVehicleRadius = 30.0f;
 const unsigned int kStatsPeriodTicks = 1800;   // one stats line per minute
-const unsigned int kGroupRetryTicks = 150;
+const unsigned int kGroupRetryTicks = 10;      // re-set a cleared target spawn group this often
+const unsigned int kVehicleListPeriod = 30;     // protocol.md v1: once a second
+const size_t kVehicleScanPerTick = 500;         // registered objects examined per tick
+const unsigned int kRestartMinTicks = 60 * 30;  // protocol.md v1: at most one RestartRound per 60 s
+const unsigned int kSpawnBlockedRepeatTicks = 10 * 30;
+const int kMaxSpawnGroups = 64;
+const int kGameStatusPlaying = 1;               // the only status in which dead players respawn
+
+// protocol.md v1 "Buttons": SetInput bit n presses PlayerInput slot kButtonSlots[n] for one tick.
+// The table and its evidence are in docs/findings/module-v1.md (Q11). PIUse is deliberately absent.
+const int kButtonSlots[32] = {
+    io::PIFire, io::PIAltFire, io::PIFlareFire, io::PIAction, io::PISprint, io::PICrouch, io::PILie,
+    io::PIReload, io::PIToggleCameraMode, io::PICameraMode1, io::PICameraMode2, io::PICameraMode3,
+    io::PICameraMode4, io::PIWeaponSelect1, io::PIWeaponSelect2, io::PIWeaponSelect3,
+    io::PIWeaponSelect4, io::PIWeaponSelect5, io::PIWeaponSelect6, io::PIWeaponSelect7,
+    io::PIWeaponSelect8, io::PIWeaponSelect9, io::PIToggleWeapon, io::PIToggleFireRate,
+    io::PIPositionSelect1, io::PIPositionSelect2, io::PIPositionSelect3, io::PIPositionSelect4,
+    io::PIPositionSelect5, io::PIPositionSelect6, io::PIPositionSelect7, io::PIPositionSelect8 };
 
 Channel* g_channel = 0;
 
@@ -116,6 +133,16 @@ std::string sanitizeName(const std::string& in, size_t maxLen)
     return out;
 }
 
+// A vehicle in protocol.md's sense: a root object with seats (IPlayerControlObject) that is not a
+// soldier. Cameras are excluded too: every player's MultiPlayerFreeCamera is a root
+// IPlayerControlObject that its player occupies while dead or spectating.
+IPlayerControlObject* vehiclePco(IObject* o)
+{
+    if (!o || o->getParent() || o->queryInterface(IID_ISoldier) || o->queryInterface(IID_ICameraObject))
+        return 0;
+    return static_cast<IPlayerControlObject*>(o->queryInterface(IID_IPlayerControlObject));
+}
+
 // The vehicle seat a player occupies, or null when on foot, dead or in a non-vehicle object.
 IPlayerControlObject* seatOf(world::IPlayer* p, IObject** rootOut)
 {
@@ -123,9 +150,33 @@ IPlayerControlObject* seatOf(world::IPlayer* p, IObject** rootOut)
     IObject* root = rootOf(vehicle);
     if (rootOut)
         *rootOut = root;
-    if (!p->getIsAlive() || !vehicle || !root || root->queryInterface(IID_ISoldier))
+    if (!p->getIsAlive() || !vehicle || !vehiclePco(root))
         return 0;
     return static_cast<IPlayerControlObject*>(vehicle->queryInterface(IID_IPlayerControlObject));
+}
+
+// Health of a vehicle root as 0..1 from its armour component, or -1 without one. destroyed is set
+// when the hit points are at or below 0.
+float healthOf(IObject* root, bool* destroyed)
+{
+    if (destroyed)
+        *destroyed = false;
+    IArmorGLComp* armor = static_cast<IArmorGLComp*>(root->queryComponent(IID_IArmorGLComp, IID_IArmorGLComp));
+    if (!armor)
+        return -1.0f;
+    const float hp = armor->getHitPoints();
+    if (destroyed)
+        *destroyed = !(hp > 0.0f);
+    const float maxHp = armor->getMaxHitPoints();
+    float h = maxHp > 0.0f ? hp / maxHp : 0.0f;
+    if (!(h >= 0.0f)) h = 0.0f;
+    if (h > 1.0f) h = 1.0f;
+    return h;
+}
+
+float yawOf(const Mat4& m)
+{
+    return std::atan2(m.m[8], m.m[10]) * 57.29577951f;
 }
 
 // Tick-cost histogram: 10 microsecond buckets up to 20 ms, plus an overflow count.
@@ -192,6 +243,8 @@ struct Bot
     int team;
     float axes[proto::AxisCount];      // what is written every tick
     float pending[proto::AxisCount];   // latest SetInput of this tick
+    uint32_t buttons;                  // pressed for this tick only
+    uint32_t pendingButtons;
     bool hasPending;
     unsigned int idleTicks;
     bool watchdogTripped;
@@ -199,6 +252,19 @@ struct Bot
     int removeCountdown;       // > 0 after the sidecar disconnected
     int missingTicks;
     unsigned long lastGroupTry;
+
+    // Spawn fallback (protocol.md v1 "Blocked spawns").
+    int home;                     // the pad group; -1 if the team has no on-foot group
+    int target;                   // the group the module wants the bot to spawn at
+    unsigned long readySince;     // tick the bot became ready to spawn, 0 while not ready
+    unsigned long targetSince;    // tick the current target's fallback timer started
+    unsigned long lastBlocked;    // tick SpawnBlocked was last sent, 0 if never this wait
+    std::vector<int> order;       // home first, then on-foot groups by distance, then enter-on-spawn
+    std::vector<bool> tried;
+    bool cycled;                  // every group of order was tried or found inactive
+
+    int viewMode;                 // last camera view mode seen, -1 if none (test observability)
+    bool firing;
 };
 
 class Module : public IEventListener
@@ -207,7 +273,8 @@ public:
     Module()
         : m_em(0), m_ext(0), m_players(0), m_objects(0), m_game(0), m_server(0), m_system(0),
           m_tick(0), m_conn(0), m_ready(false), m_unloadSeen(false), m_mask(humanMappingMask()),
-          m_rejectedInputs(0), m_lastRejectLog(0), m_buttonsLogged(false) {}
+          m_rejectedInputs(0), m_lastRejectLog(0), m_scanKey(0), m_scanFull(true), m_vehicleListDue(0),
+          m_lastRestart(0), m_restarted(false) {}
 
     bool init(ClassManager* cm)
     {
@@ -256,9 +323,11 @@ public:
         const bool tickOk = m_em->registerEventHandler(kTickCategory, this, 0);
         const bool hudOk = m_em->registerEventHandler(ECHud, this, 0);
         const unsigned int handle = m_em->postEventNextUpdate(kTickCategory, kTickEventId, 0);
-        logLine("loaded: protocol v%u, bot channel %s:%d, watchdog %d ticks; tick hook %d (event %u), unload hook %d, System %p",
+        logLine("loaded: protocol v%u, bot channel %s:%d, watchdog %d ticks, enterRange %.1f m, spawnFallback %d s, "
+             "spawnBlocked %d s, allowRoundRestart %d; tick hook %d (event %u), unload hook %d, System %p",
              static_cast<unsigned>(proto::kVersion), m_config.listenHost.c_str(), m_config.listenPort,
-             m_config.watchdogTicks, tickOk ? 1 : 0, handle, hudOk ? 1 : 0, (void*)m_system);
+             m_config.watchdogTicks, m_config.enterRange, m_config.spawnFallbackSeconds, m_config.spawnBlockedSeconds,
+             m_config.allowRoundRestart ? 1 : 0, tickOk ? 1 : 0, handle, hudOk ? 1 : 0, (void*)m_system);
         // The listener is already up, so the module cannot back out once the hook is registered.
         return true;
     }
@@ -270,6 +339,8 @@ public:
             if (id == kUnloadHudEventId)
             {
                 m_unloadSeen = true;
+                m_vehicles.clear();
+                m_scanFull = true;   // rebuilt with one full walk on the next tick
                 logLine("tick %lu: level unload", m_tick);
             }
             return;
@@ -282,8 +353,10 @@ public:
         m_em->postEventNextUpdate(kTickCategory, kTickEventId, 0);
         ++m_tick;
         processCommands();
+        scanVehicles();
         updateBots();
         sendState();
+        sendVehicleList();
         m_unloadSeen = m_unloadSeen && hasMissingBots();
         const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
         m_cost.add(us);
@@ -372,6 +445,7 @@ private:
             case Command::EnterVehicle: onEnterVehicle(c.enterVehicle); break;
             case Command::RemoveBot:    onRemoveBot(c.removeBot); break;
             case Command::SetInput:     onSetInput(c.setInput); break;
+            case Command::RestartRound: onRestartRound(c.restartRound); break;
             default: break;
             }
         }
@@ -405,6 +479,7 @@ private:
         proto::encodeWelcome(f, kTickRate, static_cast<uint32_t>(m_tick), map, mode);
         control(f);
         m_ready = true;
+        m_vehicleListDue = m_tick + 1;   // the first tick after Welcome
         logLine("tick %lu: Hello from '%s' on connection %u; Welcome map '%s' mode '%s'", m_tick,
              sanitizeName(m.name, 64).c_str(), m_conn, map.c_str(), mode.c_str());
     }
@@ -422,11 +497,15 @@ private:
             error(m.requestId, proto::ErrInvalidValue, "name is empty");
             return;
         }
-        const int group = m_ext->findSpawnGroup(m.team, false);
-        if (group < 0)
+        // protocol.md v1: CreateBot succeeds whenever the team has a spawn group a bot can use,
+        // active or not; a blocked one is handled by the spawn fallback.
+        const int groupCount = m_ext->listSpawnGroups(m.team, m_groups, kMaxSpawnGroups);
+        const int group = homeGroup(m_groups, groupCount < kMaxSpawnGroups ? groupCount : kMaxSpawnGroups);
+        if (group < 0 && !anyUsableGroup(m_groups, groupCount < kMaxSpawnGroups ? groupCount : kMaxSpawnGroups))
         {
-            error(m.requestId, proto::ErrRefused, "no active on-foot spawn group for that team (is a level loaded?)");
-            logLine("tick %lu: CreateBot '%s' team %d refused: findSpawnGroup -> %d", m_tick, name.c_str(), m.team, group);
+            error(m.requestId, proto::ErrRefused, "the team has no spawn group (is a level loaded?)");
+            logLine("tick %lu: CreateBot '%s' team %d refused: %d spawn groups, none usable", m_tick, name.c_str(),
+                 m.team, groupCount);
             return;
         }
         const int id = m_ext->createInputPlayer(name);
@@ -439,7 +518,6 @@ private:
         }
         p->setTeam(m.team, false);
         p->setKit(kDefaultKit);
-        p->setSpawnGroup(group);
 
         Bot b;
         b.id = id;
@@ -448,6 +526,7 @@ private:
         b.team = m.team;
         for (int i = 0; i < proto::AxisCount; ++i)
             b.axes[i] = b.pending[i] = 0.0f;
+        b.buttons = b.pendingButtons = 0;
         b.hasPending = false;
         b.idleTicks = 0;
         b.watchdogTripped = false;
@@ -455,21 +534,30 @@ private:
         b.removeCountdown = -1;
         b.missingTicks = 0;
         b.lastGroupTry = m_tick;
+        b.home = group;
+        b.viewMode = -1;
+        b.firing = false;
+        resetFallback(b);
+        if (b.target < 0)
+            b.target = firstFallbackGroup(m_groups, groupCount < kMaxSpawnGroups ? groupCount : kMaxSpawnGroups);
+        p->setSpawnGroup(b.target);
         m_bots.push_back(b);
 
         std::vector<uint8_t> f;
         proto::encodeBotCreated(f, m.requestId, static_cast<uint8_t>(id));
         control(f);
-        logLine("tick %lu: created bot %d '%s' team %d kit %d spawn group %d (ai %d connected %d)", m_tick, id,
-             p->getName().c_str(), m.team, kDefaultKit, group, p->getIsAIPlayer() ? 1 : 0, p->getIsConnected() ? 1 : 0);
+        logLine("tick %lu: created bot %d '%s' team %d kit %d home spawn group %d target %d (ai %d connected %d)", m_tick, id,
+             p->getName().c_str(), m.team, kDefaultKit, group, m_bots.back().target, p->getIsAIPlayer() ? 1 : 0,
+             p->getIsConnected() ? 1 : 0);
+        logGroups(m.team, m_groups, groupCount < kMaxSpawnGroups ? groupCount : kMaxSpawnGroups);
     }
 
     // The seat object with PCO id seat on vehicle root, if that seat is free and the vehicle's
     // team is 0 or team.
     IObject* freeSeat(IObject* root, int seat, int team, const char** why)
     {
-        IPlayerControlObject* pco = static_cast<IPlayerControlObject*>(root->queryInterface(IID_IPlayerControlObject));
-        if (!pco || root->queryInterface(IID_ISoldier))
+        IPlayerControlObject* pco = vehiclePco(root);
+        if (!pco)
         {
             *why = "not a vehicle";
             return 0;
@@ -516,7 +604,9 @@ private:
             return;
         }
 
-        const char* why = "no vehicle with that seat free within 30 m";
+        // protocol.md v1: both forms skip destroyed vehicles and require the bot within enterRange.
+        const Vec3& myPos = me->getAbsolutePosition();
+        const char* why = "no undestroyed vehicle with that seat free within enterRange";
         IObject* seat = 0;
         if (m.vehicleId != 0)
         {
@@ -532,20 +622,33 @@ private:
                 error(m.requestId, proto::ErrUnavailable, "no object with that networkable id");
                 return;
             }
-            seat = freeSeat(root, m.seat, b->team, &why);
+            bool destroyed = false;
+            const bool isVehicle = vehiclePco(root) != 0;
+            if (isVehicle)
+                healthOf(root, &destroyed);
+            if (!isVehicle)
+                why = "not a vehicle";
+            else if (destroyed)
+                why = "the vehicle is destroyed";
+            else if (distance(root->getAbsolutePosition(), myPos) > m_config.enterRange)
+                why = "the vehicle is out of enterRange";
+            else
+                seat = freeSeat(root, m.seat, b->team, &why);
         }
         else
         {
-            const Vec3& myPos = me->getAbsolutePosition();
-            float best = kNearestVehicleRadius;
-            const std::map<unsigned int, IObject*>& all = m_objects->getAllRegisteredObjects();
-            for (std::map<unsigned int, IObject*>::const_iterator it = all.begin(); it != all.end(); ++it)
+            float best = m_config.enterRange;
+            for (std::map<unsigned short, IObject*>::iterator it = m_vehicles.begin(); it != m_vehicles.end(); ++it)
             {
-                IObject* o = it->second;
-                if (!o || o->getParent() || o == me)
+                IObject* o = liveVehicle(it->first, it->second);
+                if (!o)
                     continue;
                 const float d = distance(o->getAbsolutePosition(), myPos);
-                if (d >= best)
+                if (d > best)
+                    continue;
+                bool destroyed = false;
+                healthOf(o, &destroyed);
+                if (destroyed)
                     continue;
                 const char* ignored = 0;
                 IObject* s = freeSeat(o, m.seat, b->team, &ignored);
@@ -621,28 +724,53 @@ private:
                 return;
             }
         }
-        if (m.buttons != 0 && !m_buttonsLogged)
-        {
-            logLine("tick %lu: SetInput buttons 0x%08X ignored; buttons are reserved in v0 (logged once)", m_tick, m.buttons);
-            m_buttonsLogged = true;
-        }
+        // Every one of the 32 bits is in the button table (kButtonSlots), so there is no unknown
+        // bit to ignore and log.
         for (int i = 0; i < proto::AxisCount; ++i)
-            b->pending[i] = axes[i];   // latest wins within a tick
+            b->pending[i] = axes[i];   // latest wins within a tick, buttons included
+        b->pendingButtons = m.buttons;
         b->hasPending = true;
+    }
+
+    void onRestartRound(const proto::RestartRoundMsg& m)
+    {
+        if (!m_config.allowRoundRestart)
+        {
+            error(m.requestId, proto::ErrRefused, "round restart is disabled (serverext.cfg allowRoundRestart 0)");
+            logLine("tick %lu: RestartRound refused: allowRoundRestart is 0", m_tick);
+            return;
+        }
+        if (m_restarted && m_tick - m_lastRestart < kRestartMinTicks)
+        {
+            error(m.requestId, proto::ErrRefused, "at most one round restart per 60 s");
+            logLine("tick %lu: RestartRound refused: last restart %lu ticks ago", m_tick, m_tick - m_lastRestart);
+            return;
+        }
+        if (!m_ext->restartRound())
+        {
+            error(m.requestId, proto::ErrRefused, "the engine refused the round restart (no game logic)");
+            logLine("tick %lu: RestartRound refused by the engine", m_tick);
+            return;
+        }
+        m_restarted = true;
+        m_lastRestart = m_tick;
+        logLine("tick %lu: round restarted on request (admin.restartMap)", m_tick);
+        ack(m.requestId);
     }
 
     // ---------------------------------------------------------------- per-tick bot work
 
-    // Watchdog neutral: cyclic and pedals 0, collective held while in a vehicle. On foot every axis
-    // is 0, since a held collective would keep the soldier walking.
+    // Watchdog neutral: cyclic, pedals and look 0, collective held while in a vehicle. On foot every
+    // axis is 0, since a held collective would keep the soldier walking. No buttons.
     void neutralise(Bot& b, world::IPlayer* p)
     {
         const bool inVehicle = p && seatOf(p, 0);
-        b.axes[proto::AxisPitch] = 0.0f;
-        b.axes[proto::AxisRoll] = 0.0f;
-        b.axes[proto::AxisPedals] = 0.0f;
-        if (!inVehicle)
-            b.axes[proto::AxisCollective] = 0.0f;
+        const float collective = b.axes[proto::AxisCollective];
+        for (int k = 0; k < proto::AxisCount; ++k)
+            b.axes[k] = 0.0f;
+        if (inVehicle)
+            b.axes[proto::AxisCollective] = collective;
+        b.buttons = 0;
         b.watchdogTripped = true;
     }
 
@@ -657,7 +785,12 @@ private:
         in->inputs[io::PIPitch] = b.axes[proto::AxisPitch];
         in->inputs[io::PIRoll] = b.axes[proto::AxisRoll];
         in->inputs[io::PIThrottle] = b.axes[proto::AxisCollective];
-        in->inputs[io::PIYaw] = b.axes[proto::AxisPedals];
+        in->inputs[io::PIYaw] = b.axes[proto::AxisPedals];          // strafe on foot (Q10)
+        in->inputs[io::PIMouseLookX] = b.axes[proto::AxisLookYaw];  // turn on foot
+        in->inputs[io::PIMouseLookY] = b.axes[proto::AxisLookPitch];
+        for (int bit = 0; bit < 32; ++bit)
+            if (b.buttons & (1u << bit))
+                in->inputs[kButtonSlots[bit]] = 1.0f;
     }
 
     void updateBots()
@@ -705,40 +838,372 @@ private:
             const bool alive = p->getIsAlive();
             if (alive != b.wasAlive)
             {
-                logLine("tick %lu: bot %d %s", m_tick, b.id, alive ? "spawned" : "died");
-                if (!alive)
+                if (alive)
+                    onSpawned(b, p);
+                else
+                {
+                    logLine("tick %lu: bot %d died", m_tick, b.id);
                     for (int k = 0; k < proto::AxisCount; ++k)
                         b.axes[k] = 0.0f;
+                    b.viewMode = -1;
+                    resetFallback(b);
+                }
                 b.wasAlive = alive;
             }
-            if (!alive && p->getSpawnGroup() == 0 && m_tick - b.lastGroupTry >= kGroupRetryTicks)
-            {
-                // uPlayingSpawning clears a stale group; give the bot its team's on-foot group again.
-                b.lastGroupTry = m_tick;
-                const int group = m_ext->findSpawnGroup(b.team, false);
-                if (group >= 0)
-                    p->setSpawnGroup(group);
-            }
+            if (!alive)
+                updateSpawnFallback(b, p);
+            else
+                observe(b, p);
 
             if (b.hasPending)
             {
                 for (int k = 0; k < proto::AxisCount; ++k)
                     b.axes[k] = b.pending[k];
+                b.buttons = b.pendingButtons;
                 b.hasPending = false;
                 b.idleTicks = 0;
                 if (b.watchdogTripped)
                     logLine("tick %lu: bot %d input resumed", m_tick, b.id);
                 b.watchdogTripped = false;
             }
-            else if (++b.idleTicks >= static_cast<unsigned int>(m_config.watchdogTicks) && !b.watchdogTripped)
+            else
             {
-                neutralise(b, p);
-                logLine("tick %lu: bot %d watchdog: no SetInput for %u ticks; cyclic and pedals 0, collective %.2f",
-                     m_tick, b.id, b.idleTicks, b.axes[proto::AxisCollective]);
+                b.buttons = 0;   // a button is pressed only for the tick its SetInput is applied
+                if (++b.idleTicks >= static_cast<unsigned int>(m_config.watchdogTicks) && !b.watchdogTripped)
+                {
+                    neutralise(b, p);
+                    logLine("tick %lu: bot %d watchdog: no SetInput for %u ticks; cyclic, pedals and look 0, collective %.2f",
+                         m_tick, b.id, b.idleTicks, b.axes[proto::AxisCollective]);
+                }
             }
             writeInput(b, p);
             ++i;
         }
+    }
+
+    // ---------------------------------------------------------------- spawn fallback (v1)
+
+    typedef IServerExtension::SpawnGroupInfo GroupInfo;
+
+    static bool usable(const GroupInfo& g)
+    {
+        return g.squad <= 0 && !g.onlyForHuman && g.pointCount > 0;
+    }
+
+    // The pad: the team's lowest-id usable group without enter-on-spawn points, active or not.
+    // Matches findSpawnGroup(team, false) whenever nothing is blocked.
+    static int homeGroup(const GroupInfo* groups, int n)
+    {
+        for (int i = 0; i < n; ++i)
+            if (usable(groups[i]) && groups[i].enterOnSpawnPoints == 0)
+                return groups[i].id;
+        return -1;
+    }
+
+    static bool anyUsableGroup(const GroupInfo* groups, int n)
+    {
+        for (int i = 0; i < n; ++i)
+            if (usable(groups[i]))
+                return true;
+        return false;
+    }
+
+    static int firstFallbackGroup(const GroupInfo* groups, int n)
+    {
+        for (int i = 0; i < n; ++i)
+            if (usable(groups[i]))
+                return groups[i].id;
+        return -1;
+    }
+
+    static const GroupInfo* findGroup(const GroupInfo* groups, int n, int id)
+    {
+        for (int i = 0; i < n; ++i)
+            if (groups[i].id == id)
+                return &groups[i];
+        return 0;
+    }
+
+    void logGroups(int team, const GroupInfo* groups, int n)
+    {
+        for (int i = 0; i < n; ++i)
+        {
+            const GroupInfo& g = groups[i];
+            logLine("  team %d spawn group %d: %d points (%d enter-on-spawn), active %d, squad %d, human-only %d, pos %.1f %.1f %.1f",
+                 team, g.id, g.pointCount, g.enterOnSpawnPoints, g.active ? 1 : 0, g.squad, g.onlyForHuman ? 1 : 0,
+                 g.x, g.y, g.z);
+        }
+    }
+
+    void resetFallback(Bot& b)
+    {
+        b.target = b.home;
+        b.readySince = 0;
+        b.targetSince = 0;
+        b.lastBlocked = 0;
+        b.order.clear();
+        b.tried.clear();
+        b.cycled = false;
+    }
+
+    // Home first, then the other on-foot groups nearest to home first, then the groups with any
+    // enter-on-spawn point, nearest first.
+    void buildOrder(Bot& b, const GroupInfo* groups, int n)
+    {
+        const GroupInfo* ref = findGroup(groups, n, b.home >= 0 ? b.home : b.target);
+        std::vector<std::pair<float, int> > onFoot, enters;
+        for (int i = 0; i < n; ++i)
+        {
+            const GroupInfo& g = groups[i];
+            if (!usable(g) || g.id == b.home)
+                continue;
+            float d = 0.0f;
+            if (ref)
+            {
+                const float dx = g.x - ref->x, dy = g.y - ref->y, dz = g.z - ref->z;
+                d = std::sqrt(dx * dx + dy * dy + dz * dz);
+            }
+            (g.enterOnSpawnPoints > 0 ? enters : onFoot).push_back(std::make_pair(d, g.id));
+        }
+        std::stable_sort(onFoot.begin(), onFoot.end());
+        std::stable_sort(enters.begin(), enters.end());
+        b.order.clear();
+        if (b.home >= 0)
+            b.order.push_back(b.home);
+        for (size_t i = 0; i < onFoot.size(); ++i)
+            b.order.push_back(onFoot[i].second);
+        for (size_t i = 0; i < enters.size(); ++i)
+            b.order.push_back(enters[i].second);
+        b.tried.assign(b.order.size(), false);
+    }
+
+    // The target's fallback time is up: move to the next group in the order that is active now.
+    void advanceTarget(Bot& b, world::IPlayer* p)
+    {
+        int n = m_ext->listSpawnGroups(b.team, m_groups, kMaxSpawnGroups);
+        if (n > kMaxSpawnGroups)
+            n = kMaxSpawnGroups;
+        if (b.order.empty())
+            buildOrder(b, m_groups, n);
+        b.targetSince = m_tick;
+        if (b.order.empty())
+            return;
+        const int size = static_cast<int>(b.order.size());
+        int pos = -1;
+        for (int i = 0; i < size; ++i)
+            if (b.order[i] == b.target)
+                pos = i;
+        if (pos >= 0)
+            b.tried[pos] = true;
+        int chosen = -1;
+        for (int k = 1; k <= size && chosen < 0; ++k)
+        {
+            const int idx = pos < 0 ? k - 1 : (pos + k) % size;
+            const GroupInfo* g = findGroup(m_groups, n, b.order[idx]);
+            if (g && g->active)
+                chosen = idx;
+            else
+                b.tried[idx] = true;
+        }
+        bool all = true;
+        for (int i = 0; i < size; ++i)
+            all = all && b.tried[i];
+        if (all && !b.cycled)
+            logLine("tick %lu: bot %d has tried every spawn group of team %d (%d)", m_tick, b.id, b.team, size);
+        b.cycled = all;
+        const int previous = b.target;
+        if (chosen >= 0)
+            b.target = b.order[chosen];
+        else if (b.target < 0)
+            b.target = b.order[0];
+        if (b.target != previous)
+        {
+            const GroupInfo* g = findGroup(m_groups, n, b.target);
+            logLine("tick %lu: bot %d spawn fallback: group %d -> %d (%s)", m_tick, b.id, previous, b.target,
+                 g && g->enterOnSpawnPoints > 0 ? "enter-on-spawn" : "on foot");
+        }
+        p->setSpawnGroup(b.target);
+        b.lastGroupTry = m_tick;
+    }
+
+    void updateSpawnFallback(Bot& b, world::IPlayer* p)
+    {
+        if (b.target >= 0 && p->getSpawnGroup() != b.target && m_tick - b.lastGroupTry >= kGroupRetryTicks)
+        {
+            // uPlayingSpawning clears a group that is inactive at the moment; keep offering it.
+            b.lastGroupTry = m_tick;
+            p->setSpawnGroup(b.target);
+        }
+        // Dead players respawn only while the game is playing and their spawn delay has run out
+        // (ServerGameLogic::uPlayingSpawning); the fallback timers run only then.
+        const bool ready = m_ext->getGameStatus() == kGameStatusPlaying && !(p->getTimeToSpawn() > 0.0f);
+        if (!ready)
+        {
+            b.readySince = 0;
+            return;
+        }
+        if (!b.readySince)
+        {
+            b.readySince = m_tick;
+            b.targetSince = m_tick;
+        }
+        if (b.target < 0 || m_tick - b.targetSince >= static_cast<unsigned long>(m_config.spawnFallbackSeconds) * 30)
+            advanceTarget(b, p);
+        const unsigned long waited = m_tick - b.readySince;
+        if (b.cycled && waited >= static_cast<unsigned long>(m_config.spawnBlockedSeconds) * 30 &&
+            (!b.lastBlocked || m_tick - b.lastBlocked >= kSpawnBlockedRepeatTicks))
+        {
+            b.lastBlocked = m_tick;
+            const unsigned long seconds = waited / 30;
+            logLine("tick %lu: bot %d SpawnBlocked: not spawned for %lu s with every spawn group tried", m_tick, b.id, seconds);
+            if (b.conn == m_conn && m_ready)
+            {
+                std::vector<uint8_t> f;
+                proto::encodeSpawnBlocked(f, static_cast<uint8_t>(b.id),
+                                          static_cast<uint16_t>(seconds > 0xFFFF ? 0xFFFF : seconds));
+                control(f);
+            }
+        }
+    }
+
+    void onSpawned(Bot& b, world::IPlayer* p)
+    {
+        IObject* root = 0;
+        IPlayerControlObject* seat = seatOf(p, &root);
+        const int group = p->getSpawnGroup();
+        const unsigned long waited = b.readySince ? m_tick - b.readySince : 0;
+        Vec3 pos;
+        pos.x = pos.y = pos.z = 0.0f;
+        if (root)
+            pos = root->getAbsolutePosition();
+        logLine("tick %lu: bot %d spawned at group %d (%s) after %lu ticks ready; %s%s seat %d; pos %.1f %.1f %.1f", m_tick,
+             b.id, group, group == b.home ? "home" : "fallback", waited, seat ? "in " : "on foot",
+             seat && root && root->getTemplate() ? root->getTemplate()->getName().c_str() : "",
+             seat ? seat->getPcoId() : -1, pos.x, pos.y, pos.z);
+        // protocol.md v1: after a successful spawn the target goes back to the home group.
+        if (b.home >= 0 && group != b.home)
+            p->setSpawnGroup(b.home);
+        resetFallback(b);
+    }
+
+    // Logs a bot's camera view mode and firing state changes, the server-side effects of the
+    // camera and fire buttons (docs/findings/module-v1.md, Q11).
+    void observe(Bot& b, world::IPlayer* p)
+    {
+        world::ICameraObject* cam = p->getCamera();
+        const int vm = cam ? static_cast<int>(cam->getViewMode()) : -1;
+        if (vm != b.viewMode)
+        {
+            if (b.viewMode != -1)
+                logLine("tick %lu: bot %d camera view mode %d -> %d", m_tick, b.id, b.viewMode, vm);
+            b.viewMode = vm;
+        }
+        const bool firing = p->getFiringState();
+        if (firing != b.firing)
+        {
+            b.firing = firing;
+            if (++m_firingLogs <= 50 || m_firingLogs % 100 == 0)
+                logLine("tick %lu: bot %d firing %d (change %lu)", m_tick, b.id, firing ? 1 : 0, m_firingLogs);
+        }
+    }
+
+    // ---------------------------------------------------------------- vehicle set (v1)
+
+    // The vehicle behind (id, stored), or null if the id no longer names that object. Only the
+    // engine's own lookup result is dereferenced, never the stored pointer.
+    IObject* liveVehicle(unsigned short id, IObject* stored)
+    {
+        IObject* o = m_game->getObjectFromNetworkableId(id);
+        return o && o == stored && vehiclePco(o) ? o : 0;
+    }
+
+    void logVehicle(const char* what, unsigned short id, IObject* o)
+    {
+        bool destroyed = false;
+        const float h = healthOf(o, &destroyed);
+        const Vec3& p = o->getAbsolutePosition();
+        logLine("tick %lu: vehicle %u '%s' %s: pos %.1f %.1f %.1f health %.2f destroyed %d objectDestroyed %d destroyList %d",
+             m_tick, static_cast<unsigned>(id), o->getTemplate() ? o->getTemplate()->getName().c_str() : "?", what,
+             p.x, p.y, p.z, h, destroyed ? 1 : 0, o->isObjectDestroyed() ? 1 : 0, o->getObjectInDestroyList() ? 1 : 0);
+    }
+
+    // Walks the registered objects a slice per tick (all of them after a level unload), adding
+    // vehicles to m_vehicles. Vanished vehicles are dropped when liveVehicle fails.
+    void scanVehicles()
+    {
+        const std::map<unsigned int, IObject*>& all = m_objects->getAllRegisteredObjects();
+        size_t budget = m_scanFull ? all.size() + 1 : kVehicleScanPerTick;
+        std::map<unsigned int, IObject*>::const_iterator it = m_scanAtStart ? all.begin() : all.upper_bound(m_scanKey);
+        m_scanAtStart = false;
+        for (; it != all.end() && budget; ++it, --budget)
+        {
+            m_scanKey = it->first;
+            IObject* o = it->second;
+            if (!vehiclePco(o))
+                continue;
+            io::INetworkable* net = o->getNetworkable();
+            if (!net || !net->m_networkableId)
+                continue;
+            IObject*& slot = m_vehicles[net->m_networkableId];
+            if (slot != o)
+                logVehicle("added to the vehicle set", net->m_networkableId, o);
+            slot = o;
+        }
+        if (it == all.end())
+        {
+            m_scanAtStart = true;
+            if (m_scanFull)
+                logLine("tick %lu: vehicle set rebuilt: %u vehicles in %u registered objects", m_tick,
+                     static_cast<unsigned>(m_vehicles.size()), static_cast<unsigned>(all.size()));
+        }
+        m_scanFull = false;
+    }
+
+    void sendVehicleList()
+    {
+        if (!m_ready || !m_conn || m_tick < m_vehicleListDue)
+            return;
+        m_vehicleListDue = m_tick + kVehicleListPeriod;
+        m_vehicleEntries.clear();
+        for (std::map<unsigned short, IObject*>::iterator it = m_vehicles.begin(); it != m_vehicles.end();)
+        {
+            IObject* o = liveVehicle(it->first, it->second);
+            if (!o)
+            {
+                logLine("tick %lu: vehicle %u left the vehicle set", m_tick, static_cast<unsigned>(it->first));
+                m_vehicles.erase(it++);
+                continue;
+            }
+            IPlayerControlObject* pco = vehiclePco(o);
+            m_vehicleEntries.push_back(proto::VehicleEntry());
+            proto::VehicleEntry& e = m_vehicleEntries.back();
+            e.netId = it->first;
+            e.templateName = o->getTemplate() ? o->getTemplate()->getName() : std::string();
+            const int team = pco->getTeam();
+            e.team = static_cast<uint8_t>(team > 0 && team < 256 ? team : 0);
+            bool destroyed = false;
+            e.health = healthOf(o, &destroyed);
+            e.flags = destroyed ? proto::kVehicleDestroyed : 0;
+            const Mat4& m = o->getAbsoluteTransformation();
+            e.pos[0] = m.m[12];
+            e.pos[1] = m.m[13];
+            e.pos[2] = m.m[14];
+            e.yaw = yawOf(m);
+            e.seats = 0;
+            e.occupied = 0;
+            std::map<int, IPlayerControlObject*>* seats = pco->getPcos();
+            if (seats)
+            {
+                e.seats = static_cast<uint8_t>(seats->size() > 255 ? 255 : seats->size());
+                for (std::map<int, IPlayerControlObject*>::iterator s = seats->begin(); s != seats->end(); ++s)
+                    if (s->first >= 0 && s->first < 32 && s->second && s->second->isOccupied())
+                        e.occupied |= 1u << s->first;
+            }
+            ++it;
+        }
+        m_vehicleBuf.clear();
+        proto::encodeVehicleList(m_vehicleBuf, static_cast<uint32_t>(m_tick - 1), m_vehicleEntries);
+        g_channel->sendVehicles(m_conn, m_vehicleBuf);
     }
 
     // ---------------------------------------------------------------- state
@@ -858,7 +1323,17 @@ private:
     unsigned long long m_mask;
     unsigned long m_rejectedInputs;
     unsigned long m_lastRejectLog;
-    bool m_buttonsLogged;
+    unsigned int m_scanKey;
+    bool m_scanFull;
+    bool m_scanAtStart = true;
+    unsigned long m_vehicleListDue;
+    unsigned long m_lastRestart;
+    bool m_restarted;
+    unsigned long m_firingLogs = 0;
+    GroupInfo m_groups[kMaxSpawnGroups];
+    std::map<unsigned short, IObject*> m_vehicles;   // networkable id -> root; validated on every use
+    std::vector<proto::VehicleEntry> m_vehicleEntries;
+    std::vector<uint8_t> m_vehicleBuf;
 
     std::vector<Bot> m_bots;
     std::deque<Command> m_inbox;

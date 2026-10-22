@@ -18,7 +18,7 @@ namespace serverext {
 // One inbound item. conn identifies the TCP connection; it increases with every accepted one.
 struct Command
 {
-    enum Kind { Connected, Disconnected, Hello, CreateBot, EnterVehicle, RemoveBot, SetInput };
+    enum Kind { Connected, Disconnected, Hello, CreateBot, EnterVehicle, RemoveBot, SetInput, RestartRound };
 
     Kind kind;
     uint32_t conn;
@@ -27,6 +27,7 @@ struct Command
     proto::EnterVehicleMsg enterVehicle;
     proto::RemoveBotMsg removeBot;
     proto::SetInputMsg setInput;
+    proto::RestartRoundMsg restartRound;
 };
 
 class Channel
@@ -48,6 +49,8 @@ public:
     // Replaces the pending TickState with frame; an unsent older one is dropped. frame receives the
     // previous buffer back so the caller can reuse its capacity.
     void sendState(uint32_t conn, std::vector<uint8_t>& frame);
+    // The same for the pending VehicleList, which is sent after the TickState.
+    void sendVehicles(uint32_t conn, std::vector<uint8_t>& frame);
 
     // --- any thread ---
     void log(const std::string& line);
@@ -58,7 +61,7 @@ public:
     // Starts a new outbound stream for conn and drops anything queued for an older one, in both
     // directions (connection lifecycle events excepted).
     void setConnection(uint32_t conn);
-    // Appends the queued control frames, then the latest TickState, to out.
+    // Appends the queued control frames, then the latest TickState, then the latest VehicleList, to out.
     // @return True if anything was appended.
     bool takeOutbound(std::vector<uint8_t>& out);
     bool controlOverflow() const;
@@ -79,6 +82,8 @@ private:
     bool m_overflow;
     std::vector<uint8_t> m_state;
     bool m_hasState;
+    std::vector<uint8_t> m_vehicles;
+    bool m_hasVehicles;
     std::deque<std::string> m_logs;
     size_t m_logsDropped;
     int m_wake[2];

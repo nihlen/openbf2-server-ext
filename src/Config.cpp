@@ -31,6 +31,30 @@ bool parseInt(const std::string& s, long lo, long hi, int& out)
     return true;
 }
 
+// A plain decimal number: digits with at most one '.', no sign or exponent.
+bool parseFloat(const std::string& s, double lo, double hi, float& out)
+{
+    if (s.empty() || s.size() > 12)
+        return false;
+    int dots = 0, digits = 0;
+    for (size_t i = 0; i < s.size(); ++i)
+    {
+        if (s[i] == '.')
+            ++dots;
+        else if (s[i] >= '0' && s[i] <= '9')
+            ++digits;
+        else
+            return false;
+    }
+    if (dots > 1 || digits == 0)
+        return false;
+    const double v = std::strtod(s.c_str(), 0);
+    if (!(v >= lo && v <= hi))
+        return false;
+    out = static_cast<float>(v);
+    return true;
+}
+
 bool parseIpv4(const std::string& s)
 {
     int parts = 0;
@@ -118,6 +142,48 @@ bool parseConfig(const std::string& text, Config& out, std::vector<std::string>&
             else
             {
                 out.watchdogTicks = ticks;
+            }
+        }
+        else if (key == "enterRange")
+        {
+            float range = 0;
+            if (!parseFloat(value, 1.0, 1000.0, range))
+            {
+                diagnostics.push_back(std::string(where) + "enterRange must be 1..1000 metres, got '" + value + "'");
+                ok = false;
+            }
+            else
+            {
+                out.enterRange = range;
+            }
+        }
+        else if (key == "spawnFallbackSeconds" || key == "spawnBlockedSeconds")
+        {
+            int seconds = 0;
+            if (!parseInt(value, 1, 3600, seconds))
+            {
+                diagnostics.push_back(std::string(where) + key + " must be 1..3600, got '" + value + "'");
+                ok = false;
+            }
+            else if (key == "spawnFallbackSeconds")
+            {
+                out.spawnFallbackSeconds = seconds;
+            }
+            else
+            {
+                out.spawnBlockedSeconds = seconds;
+            }
+        }
+        else if (key == "allowRoundRestart")
+        {
+            if (value != "0" && value != "1")
+            {
+                diagnostics.push_back(std::string(where) + "allowRoundRestart must be 0 or 1, got '" + value + "'");
+                ok = false;
+            }
+            else
+            {
+                out.allowRoundRestart = value == "1";
             }
         }
         else

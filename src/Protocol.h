@@ -1,4 +1,4 @@
-// Wire format of the bot channel, docs/protocol.md v0. Engine-free: the I/O thread, the main thread
+// Wire format of the bot channel, docs/protocol.md v1. Engine-free: the I/O thread, the main thread
 // and the unit tests all use it.
 
 #ifndef SERVEREXT_PROTOCOL_H
@@ -12,7 +12,7 @@
 namespace serverext {
 namespace proto {
 
-const uint16_t kVersion = 0;
+const uint16_t kVersion = 1;
 const size_t kHeaderSize = 8;
 const uint32_t kMaxPayload = 64 * 1024;
 
@@ -26,8 +26,11 @@ enum MsgType : uint16_t
     MsgRemoveBot    = 0x0104,
     MsgAck          = 0x0105,
     MsgBotRemoved   = 0x0106,
+    MsgSpawnBlocked = 0x0107,
+    MsgRestartRound = 0x0108,
     MsgSetInput     = 0x0201,
     MsgTickState    = 0x0301,
+    MsgVehicleList  = 0x0302,
     MsgError        = 0xFFFF
 };
 
@@ -134,9 +137,14 @@ struct HelloMsg        { uint16_t version; std::string name; };
 struct CreateBotMsg    { uint32_t requestId; std::string name; uint8_t team; };
 struct EnterVehicleMsg { uint32_t requestId; uint8_t playerId; uint32_t vehicleId; uint8_t seat; };
 struct RemoveBotMsg    { uint32_t requestId; uint8_t playerId; };
+struct RestartRoundMsg { uint32_t requestId; };
 
-// Axis order on the wire: cyclic pitch, cyclic roll, collective, pedals.
-enum Axis { AxisPitch = 0, AxisRoll = 1, AxisCollective = 2, AxisPedals = 3, AxisCount = 4 };
+// Axis order on the wire: cyclic pitch, cyclic roll, collective, pedals, look yaw, look pitch.
+enum Axis
+{
+    AxisPitch = 0, AxisRoll = 1, AxisCollective = 2, AxisPedals = 3, AxisLookYaw = 4, AxisLookPitch = 5,
+    AxisCount = 6
+};
 
 struct SetInputMsg
 {
@@ -152,6 +160,7 @@ bool parseCreateBot(const std::vector<uint8_t>& p, CreateBotMsg& out);
 bool parseEnterVehicle(const std::vector<uint8_t>& p, EnterVehicleMsg& out);
 bool parseRemoveBot(const std::vector<uint8_t>& p, RemoveBotMsg& out);
 bool parseSetInput(const std::vector<uint8_t>& p, SetInputMsg& out);
+bool parseRestartRound(const std::vector<uint8_t>& p, RestartRoundMsg& out);
 
 // True for the message types a sidecar may send.
 bool isClientMessage(uint16_t type);
@@ -161,6 +170,7 @@ void encodeWelcome(std::vector<uint8_t>& out, float tickRate, uint32_t tick, con
 void encodeBotCreated(std::vector<uint8_t>& out, uint32_t requestId, uint8_t playerId);
 void encodeAck(std::vector<uint8_t>& out, uint32_t requestId);
 void encodeBotRemoved(std::vector<uint8_t>& out, uint8_t playerId, uint8_t reason);
+void encodeSpawnBlocked(std::vector<uint8_t>& out, uint8_t playerId, uint16_t secondsWaiting);
 // Messages longer than 1024 bytes are truncated.
 void encodeError(std::vector<uint8_t>& out, uint32_t requestId, uint16_t code, const std::string& message);
 
@@ -180,6 +190,26 @@ struct StateEntry
 
 // At most 255 entries are written; the rest are dropped.
 void encodeTickState(std::vector<uint8_t>& out, uint32_t tick, double time, const std::vector<StateEntry>& entries);
+
+// VehicleList entry flags.
+const uint8_t kVehicleDestroyed = 1;
+
+struct VehicleEntry
+{
+    uint32_t netId;
+    std::string templateName;
+    uint8_t team;
+    uint8_t flags;
+    float pos[3];
+    float yaw;
+    float health;
+    uint8_t seats;
+    uint32_t occupied;   // bit n = seat n
+};
+
+// Template names longer than 255 bytes are truncated. Entries that would take the payload past
+// kMaxPayload (or past 65535 entries) are dropped from the end.
+void encodeVehicleList(std::vector<uint8_t>& out, uint32_t tick, const std::vector<VehicleEntry>& entries);
 
 // The engine's convertAxisToInternalResolution (Game/Common/PlayerAction.cpp).
 float convertAxisToInternalResolution(float value);

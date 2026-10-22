@@ -6,7 +6,7 @@
 namespace serverext {
 
 Channel::Channel()
-    : m_conn(0), m_controlBytes(0), m_overflow(false), m_hasState(false), m_logsDropped(0)
+    : m_conn(0), m_controlBytes(0), m_overflow(false), m_hasState(false), m_hasVehicles(false), m_logsDropped(0)
 {
     m_wake[0] = m_wake[1] = -1;
     if (::pipe(m_wake) == 0)
@@ -63,6 +63,18 @@ void Channel::sendState(uint32_t conn, std::vector<uint8_t>& frame)
     wake();
 }
 
+void Channel::sendVehicles(uint32_t conn, std::vector<uint8_t>& frame)
+{
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (conn == 0 || conn != m_conn)
+            return;
+        m_vehicles.swap(frame);
+        m_hasVehicles = true;
+    }
+    wake();
+}
+
 void Channel::log(const std::string& line)
 {
     {
@@ -105,6 +117,7 @@ void Channel::setConnection(uint32_t conn)
     m_controlBytes = 0;
     m_overflow = false;
     m_hasState = false;
+    m_hasVehicles = false;
 }
 
 bool Channel::takeOutbound(std::vector<uint8_t>& out)
@@ -119,6 +132,11 @@ bool Channel::takeOutbound(std::vector<uint8_t>& out)
     {
         out.insert(out.end(), m_state.begin(), m_state.end());
         m_hasState = false;
+    }
+    if (m_hasVehicles)
+    {
+        out.insert(out.end(), m_vehicles.begin(), m_vehicles.end());
+        m_hasVehicles = false;
     }
     return out.size() != before;
 }

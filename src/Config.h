@@ -13,8 +13,14 @@ struct Config
     std::string listenHost;   // IPv4 dotted quad
     int listenPort;
     int watchdogTicks;
+    float enterRange;            // metres, v1
+    int spawnFallbackSeconds;    // v1
+    int spawnBlockedSeconds;     // v1
+    bool allowRoundRestart;      // v1
 
-    Config() : listenHost("127.0.0.1"), listenPort(16700), watchdogTicks(6) {}
+    Config()
+        : listenHost("127.0.0.1"), listenPort(16700), watchdogTicks(6), enterRange(30.0f),
+          spawnFallbackSeconds(5), spawnBlockedSeconds(15), allowRoundRestart(false) {}
 };
 
 // Parses the file's text. One "key value" or "key = value" per line; '#' and "//" start a comment.

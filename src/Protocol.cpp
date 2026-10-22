@@ -197,6 +197,13 @@ bool parseSetInput(const std::vector<uint8_t>& p, SetInputMsg& out)
     return r.done();
 }
 
+bool parseRestartRound(const std::vector<uint8_t>& p, RestartRoundMsg& out)
+{
+    Reader r(p.data(), p.size());
+    out.requestId = r.u32();
+    return r.done();
+}
+
 bool isClientMessage(uint16_t type)
 {
     switch (type)
@@ -206,6 +213,7 @@ bool isClientMessage(uint16_t type)
     case MsgEnterVehicle:
     case MsgRemoveBot:
     case MsgSetInput:
+    case MsgRestartRound:
         return true;
     default:
         return false;
@@ -251,6 +259,15 @@ void encodeBotRemoved(std::vector<uint8_t>& out, uint8_t playerId, uint8_t reaso
     w.finish();
 }
 
+void encodeSpawnBlocked(std::vector<uint8_t>& out, uint8_t playerId, uint16_t secondsWaiting)
+{
+    Writer w(out);
+    w.begin(MsgSpawnBlocked);
+    w.u8(playerId);
+    w.u16(secondsWaiting);
+    w.finish();
+}
+
 void encodeError(std::vector<uint8_t>& out, uint32_t requestId, uint16_t code, const std::string& message)
 {
     Writer w(out);
@@ -282,6 +299,40 @@ void encodeTickState(std::vector<uint8_t>& out, uint32_t tick, double time, cons
         for (int k = 0; k < 3; ++k) w.f32(e.vel[k]);
         for (int k = 0; k < 3; ++k) w.f32(e.angVel[k]);
         w.f32(e.health);
+    }
+    w.finish();
+}
+
+void encodeVehicleList(std::vector<uint8_t>& out, uint32_t tick, const std::vector<VehicleEntry>& entries)
+{
+    // Keep the payload within kMaxPayload, which a sidecar may enforce as the module does.
+    const size_t fixed = 4 + 2 + 1 + 1 + 12 + 4 + 4 + 1 + 4;   // every entry field but the name's bytes
+    size_t n = 0;
+    size_t bytes = 4 + 2;
+    while (n < entries.size() && n < 0xFFFF)
+    {
+        const size_t name = entries[n].templateName.size() > 255 ? 255 : entries[n].templateName.size();
+        if (bytes + fixed + name > kMaxPayload)
+            break;
+        bytes += fixed + name;
+        ++n;
+    }
+    Writer w(out);
+    w.begin(MsgVehicleList);
+    w.u32(tick);
+    w.u16(static_cast<uint16_t>(n));
+    for (size_t i = 0; i < n; ++i)
+    {
+        const VehicleEntry& e = entries[i];
+        w.u32(e.netId);
+        w.str(e.templateName.size() > 255 ? e.templateName.substr(0, 255) : e.templateName);
+        w.u8(e.team);
+        w.u8(e.flags);
+        for (int k = 0; k < 3; ++k) w.f32(e.pos[k]);
+        w.f32(e.yaw);
+        w.f32(e.health);
+        w.u8(e.seats);
+        w.u32(e.occupied);
     }
     w.finish();
 }

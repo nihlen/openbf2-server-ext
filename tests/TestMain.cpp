@@ -47,14 +47,26 @@ std::vector<uint8_t> helloPayload(uint16_t version, const std::string& name)
     return p;
 }
 
-std::vector<uint8_t> setInputPayload(uint8_t id, float a, float b, float c, float d)
+std::vector<uint8_t> setInputPayload(uint8_t id, float a, float b, float c, float d, float lookYaw = 0.0f,
+                                     float lookPitch = 0.0f, uint32_t buttons = 0)
 {
     std::vector<uint8_t> p;
     Writer w(p);
     w.u8(id);
     w.u32(7);
     w.f32(a); w.f32(b); w.f32(c); w.f32(d);
-    w.u32(0);
+    w.f32(lookYaw); w.f32(lookPitch);
+    w.u32(buttons);
+    return p;
+}
+
+const size_t kSetInputSize = 1 + 4 + 6 * 4 + 4;
+
+std::vector<uint8_t> restartPayload(uint32_t requestId)
+{
+    std::vector<uint8_t> p;
+    Writer w(p);
+    w.u32(requestId);
     return p;
 }
 
@@ -127,7 +139,7 @@ void testDecoder()
         while (d.next(f) == FrameDecoder::GotFrame)
         {
             if (got < 3)
-                CHECK(f.type == MsgSetInput && f.payload.size() == 25 && f.payload[0] == got);
+                CHECK(f.type == MsgSetInput && f.payload.size() == kSetInputSize && f.payload[0] == got);
             else
                 CHECK(f.type == MsgHello && f.payload.empty());
             ++got;
@@ -160,7 +172,7 @@ void testDecoder()
     d5.feed(huge, sizeof(huge));
     CHECK(d5.next(f) == FrameDecoder::Oversize);
 
-    std::vector<uint8_t> res = frame(MsgHello, helloPayload(0, "x"), 1);
+    std::vector<uint8_t> res = frame(MsgHello, helloPayload(kVersion, "x"), 1);
     FrameDecoder d6;
     d6.feed(res.data(), res.size());
     CHECK(d6.next(f) == FrameDecoder::BadReserved);
@@ -202,11 +214,24 @@ void testParsers()
     CHECK(parseRemoveBot(rb, r) && r.requestId == 9 && r.playerId == 254);
 
     SetInputMsg s;
-    CHECK(parseSetInput(setInputPayload(3, 0.1f, -0.2f, 0.3f, -0.4f), s) && s.playerId == 3 && s.tick == 7 &&
-          s.axes[AxisPitch] == 0.1f && s.axes[AxisPedals] == -0.4f && s.buttons == 0);
-    CHECK(!parseSetInput(std::vector<uint8_t>(24, 0), s));
-    CHECK(!parseSetInput(std::vector<uint8_t>(26, 0), s));
+    CHECK(parseSetInput(setInputPayload(3, 0.1f, -0.2f, 0.3f, -0.4f, 0.5f, -0.6f, 0x80000101u), s) && s.playerId == 3 &&
+          s.tick == 7 && s.axes[AxisPitch] == 0.1f && s.axes[AxisRoll] == -0.2f && s.axes[AxisCollective] == 0.3f &&
+          s.axes[AxisPedals] == -0.4f && s.axes[AxisLookYaw] == 0.5f && s.axes[AxisLookPitch] == -0.6f &&
+          s.buttons == 0x80000101u);
+    CHECK(kSetInputSize == 33);
+    CHECK(!parseSetInput(std::vector<uint8_t>(kSetInputSize - 1, 0), s));
+    CHECK(!parseSetInput(std::vector<uint8_t>(kSetInputSize + 1, 0), s));
+    CHECK(!parseSetInput(std::vector<uint8_t>(25, 0), s));   // a v0 SetInput is malformed in v1
     CHECK(!parseSetInput(std::vector<uint8_t>(), s));
+
+    RestartRoundMsg rr;
+    CHECK(parseRestartRound(restartPayload(0xA1B2C3D4u), rr) && rr.requestId == 0xA1B2C3D4u);
+    CHECK(!parseRestartRound(std::vector<uint8_t>(3, 0), rr));
+    CHECK(!parseRestartRound(std::vector<uint8_t>(5, 0), rr));
+    CHECK(!parseRestartRound(std::vector<uint8_t>(), rr));
+
+    CHECK(isClientMessage(MsgRestartRound));
+    CHECK(!isClientMessage(MsgSpawnBlocked) && !isClientMessage(MsgVehicleList));
 }
 
 void testEncoders()
@@ -218,7 +243,7 @@ void testEncoders()
     Frame f;
     CHECK(d.next(f) == FrameDecoder::GotFrame && f.type == MsgWelcome);
     Reader r(f.payload.data(), f.payload.size());
-    CHECK(r.u16() == 0);
+    CHECK(r.u16() == 1);
     CHECK(r.f32() == 30.0f);
     CHECK(r.u32() == 123);
     std::string map, mode;
@@ -233,6 +258,81 @@ void testEncoders()
     encodeTickState(b, 1, 2.0, entries);
     CHECK(b.size() == kHeaderSize + 4 + 8 + 1 + 255 * 60);
     CHECK(b[kHeaderSize + 12] == 255);
+
+    b.clear();
+    encodeSpawnBlocked(b, 254, 15);
+    {
+        FrameDecoder sd;
+        sd.feed(b.data(), b.size());
+        Frame sf;
+        CHECK(sd.next(sf) == FrameDecoder::GotFrame && sf.type == MsgSpawnBlocked && sf.payload.size() == 3);
+        Reader sr(sf.payload.data(), sf.payload.size());
+        CHECK(sr.u8() == 254 && sr.u16() == 15 && sr.done());
+    }
+
+    // VehicleList: one entry round-trips field by field.
+    {
+        std::vector<VehicleEntry> v(1);
+        VehicleEntry& e = v[0];
+        e.netId = 1819;
+        e.templateName = "ahe_z10";
+        e.team = 1;
+        e.flags = kVehicleDestroyed;
+        e.pos[0] = -218.0f; e.pos[1] = 153.5f; e.pos[2] = 159.0f;
+        e.yaw = 163.5f;
+        e.health = 0.0f;
+        e.seats = 2;
+        e.occupied = 2;
+        b.clear();
+        encodeVehicleList(b, 77, v);
+        FrameDecoder vd;
+        vd.feed(b.data(), b.size());
+        Frame vf;
+        CHECK(vd.next(vf) == FrameDecoder::GotFrame && vf.type == MsgVehicleList);
+        Reader vr(vf.payload.data(), vf.payload.size());
+        CHECK(vr.u32() == 77 && vr.u16() == 1 && vr.u32() == 1819);
+        std::string name;
+        vr.str(name);
+        CHECK(name == "ahe_z10" && vr.u8() == 1 && vr.u8() == kVehicleDestroyed);
+        CHECK(vr.f32() == -218.0f && vr.f32() == 153.5f && vr.f32() == 159.0f && vr.f32() == 163.5f && vr.f32() == 0.0f);
+        CHECK(vr.u8() == 2 && vr.u32() == 2 && vr.done());
+    }
+    // Empty list; and a list too large for one frame is cut at kMaxPayload, never beyond.
+    {
+        b.clear();
+        encodeVehicleList(b, 1, std::vector<VehicleEntry>());
+        CHECK(b.size() == kHeaderSize + 6);
+        std::vector<VehicleEntry> many(3000);
+        for (size_t i = 0; i < many.size(); ++i)
+        {
+            std::memset(many[i].pos, 0, sizeof(many[i].pos));
+            many[i].netId = static_cast<uint32_t>(i);
+            many[i].templateName = std::string(i % 2 ? 300 : 10, 'v');   // 300 is truncated to 255
+            many[i].team = many[i].flags = many[i].seats = 0;
+            many[i].yaw = many[i].health = 0.0f;
+            many[i].occupied = 0;
+        }
+        b.clear();
+        encodeVehicleList(b, 2, many);
+        CHECK(b.size() - kHeaderSize <= kMaxPayload);
+        FrameDecoder md;
+        md.feed(b.data(), b.size());
+        Frame mf;
+        CHECK(md.next(mf) == FrameDecoder::GotFrame);
+        Reader mr(mf.payload.data(), mf.payload.size());
+        mr.u32();
+        const uint16_t n = mr.u16();
+        CHECK(n > 0 && n < many.size());
+        for (uint16_t i = 0; i < n; ++i)
+        {
+            CHECK(mr.u32() == i);
+            std::string name;
+            mr.str(name);
+            CHECK(name.size() == (i % 2 ? 255u : 10u));
+            mr.u8(); mr.u8(); mr.f32(); mr.f32(); mr.f32(); mr.f32(); mr.f32(); mr.u8(); mr.u32();
+        }
+        CHECK(mr.done());
+    }
 
     b.clear();
     encodeError(b, 0, ErrMalformed, std::string(5000, 'x'));
@@ -281,6 +381,24 @@ void testConfig()
     std::vector<std::string> diags;
     Config c;
     CHECK(parseConfig("", c, diags) && c.listenHost == "127.0.0.1" && c.listenPort == 16700 && c.watchdogTicks == 6);
+    CHECK(c.enterRange == 30.0f && c.spawnFallbackSeconds == 5 && c.spawnBlockedSeconds == 15 && !c.allowRoundRestart);
+
+    Config cv1;
+    diags.clear();
+    CHECK(parseConfig("enterRange 42.5\nspawnFallbackSeconds = 3\nspawnBlockedSeconds 20\nallowRoundRestart 1\n", cv1, diags));
+    CHECK(diags.empty() && cv1.enterRange == 42.5f && cv1.spawnFallbackSeconds == 3 && cv1.spawnBlockedSeconds == 20 &&
+          cv1.allowRoundRestart);
+    const char* badV1[] = { "enterRange 0", "enterRange 0.5", "enterRange 1001", "enterRange -5", "enterRange 1e3",
+                            "enterRange 1.2.3", "enterRange .", "enterRange nan", "enterRange", "spawnFallbackSeconds 0",
+                            "spawnFallbackSeconds 3601", "spawnFallbackSeconds 2.5", "spawnBlockedSeconds x",
+                            "allowRoundRestart 2", "allowRoundRestart yes", "allowRoundRestart" };
+    for (size_t i = 0; i < sizeof(badV1) / sizeof(badV1[0]); ++i)
+    {
+        Config cb;
+        diags.clear();
+        CHECK(!parseConfig(badV1[i], cb, diags));
+        CHECK(cb.enterRange == 30.0f && cb.spawnFallbackSeconds == 5 && cb.spawnBlockedSeconds == 15 && !cb.allowRoundRestart);
+    }
 
     Config c2;
     diags.clear();
@@ -322,18 +440,47 @@ void testSession()
         Channel ch;
         Session s(&ch, 1);
         std::vector<uint8_t> reply;
-        std::vector<uint8_t> f = frame(MsgHello, helloPayload(1, "x"));
+        std::vector<uint8_t> f = frame(MsgHello, helloPayload(0, "x"));   // v0 is no longer accepted
         CHECK(!s.onBytes(f.data(), f.size(), reply));
         CHECK(errorCode(reply) == ErrVersion);
     }
+    {
+        Channel ch;
+        Session s(&ch, 1);
+        std::vector<uint8_t> reply;
+        std::vector<uint8_t> f = frame(MsgHello, helloPayload(2, "x"));
+        CHECK(!s.onBytes(f.data(), f.size(), reply));
+        CHECK(errorCode(reply) == ErrVersion);
+    }
+    // RestartRound is a client message; module-only v1 types are unknown when a client sends them.
+    {
+        Channel ch;
+        Session s(&ch, 4);
+        std::vector<uint8_t> reply;
+        std::vector<uint8_t> h = frame(MsgHello, helloPayload(kVersion, "x"));
+        std::vector<uint8_t> r = frame(MsgRestartRound, restartPayload(99));
+        CHECK(s.onBytes(h.data(), h.size(), reply) && s.onBytes(r.data(), r.size(), reply) && reply.empty());
+        std::deque<Command> q;
+        ch.drainCommands(q);
+        CHECK(q.size() == 2 && q[1].kind == Command::RestartRound && q[1].restartRound.requestId == 99 && q[1].conn == 4);
+    }
+    {
+        Channel ch;
+        Session s(&ch, 1);
+        std::vector<uint8_t> reply;
+        std::vector<uint8_t> r = frame(MsgRestartRound, restartPayload(1));
+        CHECK(!s.onBytes(r.data(), r.size(), reply));   // before Hello
+        CHECK(errorCode(reply) == ErrMalformed);
+    }
     // Unknown and wrong-direction types; Hello twice.
-    const uint16_t badTypes[] = { 0x9999, MsgWelcome, MsgTickState, MsgError, MsgAck, 0 };
+    const uint16_t badTypes[] = { 0x9999, MsgWelcome, MsgTickState, MsgError, MsgAck, 0, MsgSpawnBlocked, MsgVehicleList,
+                                  MsgBotRemoved };
     for (size_t i = 0; i < sizeof(badTypes) / sizeof(badTypes[0]); ++i)
     {
         Channel ch;
         Session s(&ch, 1);
         std::vector<uint8_t> reply;
-        std::vector<uint8_t> h = frame(MsgHello, helloPayload(0, "x"));
+        std::vector<uint8_t> h = frame(MsgHello, helloPayload(kVersion, "x"));
         CHECK(s.onBytes(h.data(), h.size(), reply) && reply.empty());
         std::vector<uint8_t> f = frame(badTypes[i], std::vector<uint8_t>(3, 1));
         CHECK(!s.onBytes(f.data(), f.size(), reply));
@@ -343,14 +490,14 @@ void testSession()
         Channel ch;
         Session s(&ch, 1);
         std::vector<uint8_t> reply;
-        std::vector<uint8_t> h = frame(MsgHello, helloPayload(0, "x"));
+        std::vector<uint8_t> h = frame(MsgHello, helloPayload(kVersion, "x"));
         CHECK(s.onBytes(h.data(), h.size(), reply));
         CHECK(!s.onBytes(h.data(), h.size(), reply));
         CHECK(errorCode(reply) == ErrMalformed);
     }
     // A valid sequence, split at every byte boundary, yields the commands in order.
     {
-        std::vector<uint8_t> stream = frame(MsgHello, helloPayload(0, "x"));
+        std::vector<uint8_t> stream = frame(MsgHello, helloPayload(kVersion, "x"));
         std::vector<uint8_t> cb;
         { Writer w(cb); w.u32(1); w.str("[BOT] t"); w.u8(1); }
         std::vector<uint8_t> f1 = frame(MsgCreateBot, cb);
@@ -371,13 +518,13 @@ void testSession()
         }
     }
     // Malformed payloads of known types close with code 2.
-    const uint16_t types[] = { MsgCreateBot, MsgEnterVehicle, MsgRemoveBot, MsgSetInput };
-    for (size_t i = 0; i < 4; ++i)
+    const uint16_t types[] = { MsgCreateBot, MsgEnterVehicle, MsgRemoveBot, MsgSetInput, MsgRestartRound };
+    for (size_t i = 0; i < 5; ++i)
     {
         Channel ch;
         Session s(&ch, 1);
         std::vector<uint8_t> reply;
-        std::vector<uint8_t> h = frame(MsgHello, helloPayload(0, "x"));
+        std::vector<uint8_t> h = frame(MsgHello, helloPayload(kVersion, "x"));
         s.onBytes(h.data(), h.size(), reply);
         std::vector<uint8_t> f = frame(types[i], std::vector<uint8_t>(1, 0));
         CHECK(!s.onBytes(f.data(), f.size(), reply));
@@ -397,7 +544,7 @@ void testSession()
         Channel ch;
         Session s(&ch, 1);
         std::vector<uint8_t> reply;
-        std::vector<uint8_t> h = frame(MsgHello, helloPayload(0, "x"));
+        std::vector<uint8_t> h = frame(MsgHello, helloPayload(kVersion, "x"));
         s.onBytes(h.data(), h.size(), reply);
         std::vector<uint8_t> f = frame(MsgSetInput, setInputPayload(1, 0, 0, 0, 0));
         bool closed = false;
@@ -433,7 +580,7 @@ void testFuzz()
         bool open = true;
         if (round % 2)
         {
-            std::vector<uint8_t> h = frame(MsgHello, helloPayload(0, "fuzz"));
+            std::vector<uint8_t> h = frame(MsgHello, helloPayload(kVersion, "fuzz"));
             open = s.onBytes(h.data(), h.size(), reply);
         }
         // Random frames with plausible headers, then raw noise.
@@ -443,8 +590,8 @@ void testFuzz()
             for (size_t i = 0; i < payload.size(); ++i)
                 payload[i] = static_cast<uint8_t>(rng());
             const uint16_t types[] = { MsgHello, MsgCreateBot, MsgEnterVehicle, MsgRemoveBot, MsgSetInput,
-                                       static_cast<uint16_t>(rng()) };
-            std::vector<uint8_t> f = frame(types[rng() % 6], payload);
+                                       MsgRestartRound, static_cast<uint16_t>(rng()) };
+            std::vector<uint8_t> f = frame(types[rng() % 7], payload);
             if (rng() % 8 == 0)
                 f[rng() % f.size()] ^= static_cast<uint8_t>(1u << (rng() % 8));
             open = s.onBytes(f.data(), f.size(), reply);
@@ -486,6 +633,25 @@ void testChannel()
     CHECK(ch.takeOutbound(out) && out == std::vector<uint8_t>({ 4, 8 }));
     out.clear();
     CHECK(!ch.takeOutbound(out));
+
+    // VehicleList goes after the TickState; a newer one replaces an unsent one; stale connections drop.
+    std::vector<uint8_t> v1 = { 7 };
+    ch.sendVehicles(5, v1);
+    std::vector<uint8_t> v2 = { 6 };
+    ch.sendVehicles(5, v2);
+    std::vector<uint8_t> v3 = { 5 };
+    ch.sendVehicles(4, v3);
+    std::vector<uint8_t> s3 = { 3 };
+    ch.sendState(5, s3);
+    f = { 2 };
+    ch.sendControl(5, f);
+    CHECK(ch.takeOutbound(out) && out == std::vector<uint8_t>({ 2, 3, 6 }));
+    out.clear();
+    std::vector<uint8_t> v4 = { 1 };
+    ch.sendVehicles(5, v4);
+    ch.setConnection(7);                        // a new connection drops the pending list
+    CHECK(!ch.takeOutbound(out));
+    ch.setConnection(5);
 
     std::vector<uint8_t> big(Channel::kMaxControlBytes + 1);
     ch.sendControl(5, big);

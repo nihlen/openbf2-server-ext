@@ -91,6 +91,11 @@ bool Session::handleFrame(const Frame& frame, std::vector<uint8_t>& reply)
             return fail(reply, ErrMalformed, "malformed SetInput");
         c.kind = Command::SetInput;
         break;
+    case MsgRestartRound:
+        if (!parseRestartRound(frame.payload, c.restartRound))
+            return fail(reply, ErrMalformed, "malformed RestartRound");
+        c.kind = Command::RestartRound;
+        break;
     default:
         return fail(reply, ErrUnknownType, "unexpected message type");
     }
