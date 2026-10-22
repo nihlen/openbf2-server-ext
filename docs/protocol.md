@@ -394,8 +394,9 @@ and the 10-tick catch-up cap. Not part of v0.
     That is not bot-specific.
   - Kick and ban do nothing to a bot. A ModManager ban writes a permanent ban on address `N/A`.
     So `BotRemoved` reason 3 cannot come from an admin.
-  - An admin team switch leaves the module's cached team stale: the bot never respawns. That is a
-    module bug and is being fixed: `TickState`'s team is authoritative.
+  - An admin team switch (`bf2cc switchplayer`, `!sw`, BF2WebAdmin `team`) is followed: the module
+    re-resolves the bot's spawn groups for the new team and checks `EnterVehicle` against the live
+    team (fixed in `b912c22`). `TickState`'s team is authoritative; the sidecar must handle a change.
   - After a kill, the alive flag stays set for `sv.manDownTime` (2 s), because the soldier is
     man-down.
 - GameSpy reports `AIPlayer=1` per bot but `hasBots=0`.
