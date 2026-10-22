@@ -12,11 +12,15 @@ bot's TickState lines. Survives deaths (re-enters) and map changes (recreates th
   python serverext_client.py --fuzz                                      # hostile input
 
 v1 scenarios (--scenario): walk, buttons, blockpad, allblocked. See docs/findings/module-v1.md.
+Q5/Q9 scenarios: q5 (watchdog neutral in flight), q9 (what the server's Python sees). See
+docs/findings/q5-q9.md.
 """
 
 import argparse
+import hashlib
 import math
 import random
+import re
 import socket
 import struct
 import sys
@@ -447,6 +451,8 @@ class Client:
         self.blocked = []         # (time, bot, seconds)
         self.removed = []
         self.results = []
+        self.before_send = None   # called on each TickState before the SetInputs go out
+        self.on_state = None      # called on each TickState after they go out (recording)
 
     def next_req(self):
         self.req += 1
@@ -471,10 +477,14 @@ class Client:
                     self.states[e["id"]] = e
                 else:
                     self.others.append(e)
+            if self.before_send:
+                self.before_send()
             for bot, cmd in list(self.inputs.items()):
                 btn = cmd.get("buttons", 0) | self.pulses.pop(bot, 0)
                 self.c.send(set_input(bot, tick, cmd.get("pitch", 0.0), cmd.get("roll", 0.0), cmd.get("coll", 0.0),
                                       cmd.get("ped", 0.0), btn, cmd.get("look_yaw", 0.0), cmd.get("look_pitch", 0.0)))
+            if self.on_state:
+                self.on_state()
         elif t == VEHICLE_LIST:
             _, vs = parse_vehiclelist(p)
             self.vehicles = {v["id"]: v for v in vs}
@@ -496,6 +506,8 @@ class Client:
         elif t == BOT_REMOVED:
             pid, reason = struct.unpack("<BB", p)
             self.removed.append((pid, reason))
+            self.inputs.pop(pid, None)
+            self.states.pop(pid, None)
             log(f"BotRemoved player {pid} reason {reason}")
         return t
 
@@ -844,7 +856,588 @@ def run_wreck(args):
     return cl.finish()
 
 
-SCENARIOS = {"wreck": run_wreck, "walk": run_walk, "buttons": run_buttons, "blockpad": run_blockpad, "allblocked": run_allblocked}
+# ------------------------------------------------------------------------------------- Q9: the Python view
+
+class Rcon:
+    """ModManager RCON (mm_rcon), the same digest login as testenv/rcon.py."""
+
+    def __init__(self, host, port, password):
+        if port in (4711, 4721):
+            raise SystemExit("refusing RCON port %d (another environment's)" % port)
+        self.s = socket.create_connection((host, port), timeout=10)
+        m = re.search(r"Digest seed: (\S+)", self._until(b"\n\n").decode("latin-1"))
+        if not m:
+            raise RuntimeError("no digest seed in the RCON banner")
+        digest = hashlib.md5((m.group(1) + password).encode("latin-1")).hexdigest()
+        self.s.sendall(b"\x02login " + digest.encode() + b"\n")
+        if "successful" not in self._until(b"\x04").decode("latin-1"):
+            raise RuntimeError("RCON login failed")
+
+    def _until(self, marker):
+        buf = b""
+        while marker not in buf:
+            chunk = self.s.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+        return buf
+
+    def __call__(self, cmd):
+        self.s.sendall(b"\x02" + cmd.encode("latin-1") + b"\n")
+        r = self._until(b"\x04").decode("latin-1").strip("\x04\n ")
+        log(f"rcon {cmd!r} ->\n    " + r.replace("\r", "\n").replace("\n", "\n    "))
+        return r
+
+
+def mark(label):
+    """A section marker, to line the client log up with the mm_webadmin recording and bf2.log."""
+    log(f"===== {label}")
+
+
+def turn_to(cl, bot, target_bot, timeout=12.0):
+    """Points the soldier at target_bot. TickState yaw is the body; standing still, look yaw turns the
+    head first (Q10). So creep forward with a small look gain, then keep creeping with no look input
+    until the body has caught up with the head (yaw steady), and repeat until within 2 degrees."""
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        cl.pump(0.2)
+        e, f = cl.states.get(bot), cl.states.get(target_bot)
+        if not (cl.alive(bot) and cl.alive(target_bot)):
+            break
+        err = wrap180(bearing(e["pos"], f["pos"]) - e["ypr"][0])
+        if abs(err) >= 2:
+            cl.inputs[bot] = dict(coll=0.15, look_yaw=clamp(err / 40.0, -0.15, 0.15))
+            continue
+        # settle: creep without look input until the body yaw stops changing
+        cl.inputs[bot] = dict(coll=0.15)
+        y0 = e["ypr"][0]
+        cl.run_for(0.7)
+        e = cl.states[bot]
+        if abs(wrap180(e["ypr"][0] - y0)) < 0.5 and abs(wrap180(bearing(e["pos"], cl.states[target_bot]["pos"]) - e["ypr"][0])) < 2:
+            break
+    cl.inputs[bot] = {}
+    cl.run_for(0.5)
+
+
+def fire_at(cl, shooter, target, seconds=12.0, settle=0.5):
+    """Faces the target, then fires in bursts (3 ticks on, 3 off, so a semi-automatic weapon fires
+    too) while sweeping the aim +-6 degrees, in case the head still leads the body. Returns True if
+    the target died (Python sees the kill at once; the alive flag drops when the soldier is dead,
+    not man down, about 2 s later). Only point-blank fire hit reliably in testing, so the shooter
+    first walks to within about 1.2 m."""
+    e, f = cl.states.get(shooter), cl.states.get(target)
+    if e and f and flat_dist(e["pos"], f["pos"]) > 1.5:
+        walk_to(cl, shooter, f["pos"], 1.2, timeout=30.0, label="close in")
+    turn_to(cl, shooter, target)
+    cl.run_for(settle)
+    e, f = cl.states.get(shooter), cl.states.get(target)
+    if e and f:
+        log(f"shooter {shooter} -> target {target}: {flat_dist(e['pos'], f['pos']):.1f} m, height "
+            f"{f['pos'][1] - e['pos'][1]:+.1f} m, facing error {wrap180(bearing(e['pos'], f['pos']) - e['ypr'][0]):+.1f}")
+    end = time.time() + seconds
+    n = 0
+    while time.time() < end:
+        if cl.pump(0.2) != TICK_STATE:
+            continue
+        if not cl.alive(target):
+            cl.inputs[shooter] = {}
+            log(f"target {target} died")
+            return True
+        if not cl.alive(shooter):
+            break
+        n += 1
+        phase = n % 120                    # look 0.04 is about 0.2 degrees per tick: +6, -6, back to 0
+        sweep = 0.04 if (phase < 30 or phase >= 90) else -0.04
+        cl.inputs[shooter] = dict(buttons=BTN_FIRE if n % 6 < 3 else 0, look_yaw=sweep)
+    cl.inputs[shooter] = {}
+    cl.run_for(3.0, lambda: not cl.alive(target))
+    return not cl.alive(target)
+
+
+def wait_respawn(cl, bot, timeout=30.0):
+    ok = cl.run_for(timeout, lambda: cl.alive(bot) and not cl.in_vehicle(bot))
+    e = cl.states.get(bot)
+    log(f"bot {bot} {'respawned at %.1f %.1f %.1f team %d' % (tuple(e['pos']) + (e['team'],)) if ok else 'did not respawn'}")
+    return ok
+
+
+def log_team_states(cl, bots):
+    for b in bots:
+        e = cl.states.get(b)
+        log(f"  bot {b}: " + (fmt_entry(e) if e else "no entry"))
+
+
+def run_q9(args):
+    """Drives bots through connect, spawn, enter/seat change, a crash, a team kill, an admin team
+    switch and an enemy kill, kick and ban, a round restart and a map change, with RCON probes of
+    what ModManager reports. Run it with tools/testclient/wa_recorder.py as mm_webadmin's peer."""
+    rc = Rcon(args.host, args.rcon_port, args.rcon_password)
+    cl = Client(args, "serverext testclient q9")
+    mark("create A, B (team 1) and C (team 2)")
+    A = cl.create_bot("[BOT] q9 A", 1)
+    B = cl.create_bot("[BOT] q9 B", 1)
+    C = cl.create_bot("[BOT] q9 C", 2)
+    for b in (A, B, C):
+        cl.check(f"bot {b} spawned", cl.wait_alive(b))
+    cl.run_for(2.0)
+    log_team_states(cl, (A, B, C))
+    mark("RCON views of the bots")
+    rc("exec admin.listPlayers")
+    rc("bf2cc pl")
+    rc("bf2cc si")
+    rc(f"bf2cc getplayerhash {A}")
+
+    mark("A enters the nearest heli, seat 0")
+    kind, data = cl.enter(A, 0, 0)
+    cl.check(f"A entered: {kind} {data}", kind == "ack")
+    cl.run_for(3.0)
+    mark("A presses F2 (seat 1), then F1 (seat 0)")
+    cl.pulses[A] = BTN_POSITION[1]
+    cl.run_for(2.0)
+    log(f"A seat {cl.states[A]['seat']}")
+    cl.pulses[A] = BTN_POSITION[0]
+    cl.run_for(2.0)
+    log(f"A seat {cl.states[A]['seat']}")
+
+    mark("A climbs and crashes the heli with itself in it")
+    cl.inputs[A] = {}
+    cl.run_for(5.0)                       # rotor spin-up
+    y0 = cl.states[A]["pos"][1]
+    ap = Autopilot()
+    r = fly(cl, A, ap, dict(alt=y0 + 30.0), until=lambda e, t: e["pos"][1] - y0 > 25.0, timeout=40.0)
+    log(f"A climb: {r}, {cl.states[A]['pos'][1] - y0:.1f} m above the pad; now collective -1, nose down")
+    cl.before_send = lambda: cl.inputs.__setitem__(A, dict(coll=-1.0, pitch=0.6) if cl.in_vehicle(A) else {})
+    died = cl.run_for(30.0, lambda: not cl.alive(A))
+    cl.before_send = None
+    cl.inputs[A] = {}
+    cl.check("A died in the crash", died)
+    wait_respawn(cl, A)
+    cl.run_for(3.0)
+
+    mark("team kill: B fires at A on the pad")
+    tk = fire_at(cl, B, A)
+    cl.check("B killed A (team kill)", tk)
+    wait_respawn(cl, A)
+    cl.run_for(2.0)
+
+    mark(f"admin team switch: bf2cc switchplayer {B} 3 (now, no move) while B is alive")
+    rc(f"bf2cc switchplayer {B} 3")
+    cl.run_for(3.0)
+    log_team_states(cl, (A, B))
+    rc("bf2cc pl")
+    mark("enemy kill: A (team 1) fires at B (now team 2)")
+    kill = fire_at(cl, A, B)
+    cl.check("A killed B (now an enemy)", kill)
+    mark("where does B respawn after the switch")
+    if not cl.alive(B):
+        wait_respawn(cl, B)
+    cl.run_for(20.0, lambda: cl.alive(B))
+    log_team_states(cl, (A, B))
+    rc("bf2cc pl")
+
+    mark(f"admin.kickPlayer {C}")
+    rc(f"exec admin.kickPlayer {C}")
+    cl.run_for(4.0)
+    cl.check(f"C still exists after the kick (removed: {cl.removed})", C in cl.states and not cl.removed)
+    mark(f"admin.banPlayer {C}")
+    rc(f"exec admin.banPlayer {C}")
+    cl.run_for(4.0)
+    mark(f"iga kick {C}")
+    rc(f"iga kick {C} q9 test")
+    cl.run_for(8.0)
+    log(f"removed so far: {cl.removed}")
+    log_team_states(cl, (A, B, C))
+
+    mark("RestartRound (admin.restartMap)")
+    kind, data = cl.restart()
+    log(f"RestartRound: {kind} {data}")
+    cl.run_for(5.0)
+    log_team_states(cl, (A, B, C))
+    cl.run_for(20.0)
+    log_team_states(cl, (A, B, C))
+    rc("exec admin.listPlayers")
+
+    mark("map change: admin.runNextLevel")
+    rc("exec admin.runNextLevel")
+    cl.run_for(90.0, lambda: len(cl.removed) >= 3)
+    log(f"removed: {cl.removed}")
+    mark("recreate a bot on the new map")
+    for _ in range(30):
+        try:
+            D = cl.create_bot("[BOT] q9 D", 1)
+            break
+        except RuntimeError as ex:
+            log(f"CreateBot: {ex}; retrying")
+            cl.run_for(3.0)
+    else:
+        D = None
+    if D is not None:
+        cl.check("D spawned on the new map", cl.wait_alive(D))
+        cl.run_for(3.0)
+    rc("exec admin.listPlayers")
+    return cl.finish()
+
+
+# ------------------------------------------------------------------------------------- Q5: watchdog neutral
+
+class Autopilot:
+    """Altitude, speed, heading and bank hold for the q5 trials. Signs as in Pilot.station_keep: pitch
+    input + = nose down (pitch angle +), roll input + = bank right (roll angle -), pedals + = yaw right."""
+
+    def __init__(self, att=(0.06, 0.04, 0.02), vel=(1.5, 0.3)):
+        self.att, self.vel = att, vel
+        self.reset()
+
+    def reset(self):
+        self.prev = None
+        self.ip = self.ir = self.ialt = 0.0
+        self.ivf = self.ivr = 0.0
+        self.heading = None
+
+    def step(self, e, tick, alt=None, coll=None, v=0.0, bank=None, heading=None, max_tilt=10.0, idle=False,
+             pitch_cmd=None):
+        yaw, pitch, roll = e["ypr"]
+        vx, vy, vz = e["vel"]
+        y = e["pos"][1]
+        if self.prev is None or tick <= self.prev[0]:
+            dt, dp, dr, dyaw = 1 / 30.0, 0.0, 0.0, 0.0
+        else:
+            dt = (tick - self.prev[0]) / 30.0
+            dp, dr = (pitch - self.prev[1]) / dt, (roll - self.prev[2]) / dt
+            dyaw = wrap180(yaw - self.prev[3]) / dt
+        self.prev = (tick, pitch, roll, yaw)
+        if idle:
+            return 0.0, 0.0, 0.0, 0.0
+        yr = math.radians(yaw)
+        v_fwd = vx * math.sin(yr) + vz * math.cos(yr)
+        v_right = vx * math.cos(yr) - vz * math.sin(yr)
+
+        if coll is None:
+            err = alt - y
+            self.ialt = clamp(self.ialt + err * 0.03 * dt, -0.5, 0.5)
+            coll = clamp(0.33 + 0.08 * err - 0.25 * vy + self.ialt)
+
+        # Speed: forward speed -> pitch, with a position integral (station keeping) - or a commanded
+        # pitch (pitch_cmd, degrees, + = nose down), which is stable where the speed loop is not.
+        kv, kvi = self.vel
+        akp, akd, aki = self.att
+        ev = v_fwd - v
+        self.ivf = clamp(self.ivf + ev * dt, -20.0, 20.0)
+        if pitch_cmd is not None:
+            pitch_des = pitch_cmd
+        else:
+            pitch_des = clamp(0.5 * v - kv * ev - kvi * self.ivf, -max_tilt, max_tilt)
+        if bank is None:
+            self.ivr = clamp(self.ivr + v_right * dt, -20.0, 20.0)
+            roll_des = clamp(kv * v_right + kvi * self.ivr, -max_tilt, max_tilt)
+        else:
+            roll_des = bank
+        ep, er = pitch_des - pitch, roll_des - roll
+        self.ip = clamp(self.ip + ep * aki * dt, -0.5, 0.5)
+        self.ir = clamp(self.ir + er * aki * dt, -0.5, 0.5)
+        cyc_p = clamp(akp * ep - akd * dp + self.ip)
+        cyc_r = clamp(-(akp * er - akd * dr + self.ir))
+
+        if bank is not None:
+            # Coordinated turn rate; bank left (roll +) turns left (yaw decreasing).
+            sp = max(math.hypot(vx, vz), 5.0)
+            r_des = -math.degrees(9.81 * math.tan(math.radians(bank)) / sp)
+            ped = clamp(0.02 * (r_des - dyaw))
+            self.heading = None
+        else:
+            if heading is not None:
+                self.heading = heading
+            elif self.heading is None:
+                self.heading = yaw
+            ped = clamp(0.03 * wrap180(self.heading - yaw) - 0.03 * dyaw)
+        return cyc_p, cyc_r, coll, ped
+
+
+def body_speeds(e):
+    vx, _, vz = e["vel"]
+    yr = math.radians(e["ypr"][0])
+    return vx * math.sin(yr) + vz * math.cos(yr), vx * math.cos(yr) - vz * math.sin(yr)
+
+
+def fly(cl, bot, ap, mode, until=None, timeout=60.0):
+    """Flies with the autopilot; mode is a dict of Autopilot.step arguments or a function (e, t) -> dict.
+    Returns 'ready' when until(e, t) holds, 'lost' if the bot left the vehicle or died, or 'timeout'."""
+    t0 = time.time()
+
+    def ctl():
+        e = cl.states.get(bot)
+        if e and cl.in_vehicle(bot):
+            m = mode(e, time.time() - t0) if callable(mode) else mode
+            cp, cr, c, ped = ap.step(e, cl.tick, **m)
+            cl.inputs[bot] = dict(pitch=cp, roll=cr, coll=c, ped=ped)
+            cl.last_cmd = (cp, cr, c, ped)
+            cl.coll_avg = c if getattr(cl, "coll_avg", None) is None else 0.97 * cl.coll_avg + 0.03 * c
+            if getattr(cl, "fly_log_every", 0) and cl.tick % cl.fly_log_every == 0:
+                vf, vr = body_speeds(e)
+                log(f"  fly t {time.time() - t0:5.1f} y {e['pos'][1]:7.1f} ypr {e['ypr'][0]:6.1f} {e['ypr'][1]:+6.1f} "
+                    f"{e['ypr'][2]:+6.1f} v_fwd {vf:+6.1f} v_right {vr:+5.1f} vy {e['vel'][1]:+5.1f} | cmd p {cp:+.2f} "
+                    f"r {cr:+.2f} c {c:+.2f} y {ped:+.2f}")
+
+    cl.before_send = ctl
+    try:
+        while time.time() - t0 < timeout:
+            cl.pump(0.2)
+            if not cl.in_vehicle(bot):
+                return "lost"
+            if until and until(cl.states[bot], time.time() - t0):
+                return "ready"
+        return "timeout"
+    finally:
+        cl.before_send = None
+
+
+def steady(pred, hold):
+    """until() helper: pred(e, t) continuously true for hold seconds."""
+    since = [None]
+
+    def f(e, t):
+        if pred(e, t):
+            if since[0] is None:
+                since[0] = t
+            return t - since[0] >= hold
+        since[0] = None
+        return False
+    return f
+
+
+class NeutralEmulator:
+    """A candidate server-side watchdog neutral, run by the client after a cut so it can be compared
+    with the module's (cyclic and pedals 0, collective held). For the first watchdog_ticks ticks it
+    repeats the last input, as the module does before the watchdog trips.
+      level: cyclic levels pitch and roll (P-D on the attitude), pedals damp the yaw rate,
+             collective held.
+      hover: level, plus the collective integrates against vertical speed from the held value, so
+             a climb or a descent stops without knowing the hover collective."""
+
+    def __init__(self, mode, last, watchdog_ticks=6):
+        self.mode, self.last, self.wd = mode, last, watchdog_ticks
+        self.n = 0
+        self.prev = None
+        self.ci = last[2]
+
+    def step(self, e, tick):
+        self.n += 1
+        yaw, pitch, roll = e["ypr"]
+        if self.prev is None or tick <= self.prev[0]:
+            dt, dp, dr, dyaw = 1 / 30.0, 0.0, 0.0, 0.0
+        else:
+            dt = (tick - self.prev[0]) / 30.0
+            dp, dr, dyaw = (pitch - self.prev[1]) / dt, (roll - self.prev[2]) / dt, wrap180(yaw - self.prev[3]) / dt
+        self.prev = (tick, pitch, roll, yaw)
+        if self.n <= self.wd:
+            return self.last
+        # pitch input + = nose down (pitch +); roll input + = bank right (roll -); pedals + = yaw right
+        cyc_p = clamp(-0.05 * pitch - 0.05 * dp)
+        cyc_r = clamp(0.05 * roll + 0.05 * dr)
+        ped = clamp(-0.03 * dyaw)
+        coll = self.last[2]
+        if self.mode == "hover":
+            vy = e["vel"][1]
+            self.ci = clamp(self.ci - 0.03 * vy * dt)
+            coll = clamp(self.ci - 0.03 * vy)
+        return cyc_p, cyc_r, coll, ped
+
+
+def cut_and_record(cl, bot, seconds, neutral="module", last=(0.0, 0.0, 0.0, 0.0)):
+    """Stops sending SetInput for the bot (the watchdog trips after watchdogTicks) and records every
+    TickState entry for the bot for `seconds`. With neutral 'level' or 'hover' the client keeps
+    sending, emulating that candidate neutral instead (NeutralEmulator)."""
+    cl.inputs.pop(bot, None)
+    rec = []
+    cl.on_state = lambda: rec.append((cl.tick, dict(cl.states[bot]) if bot in cl.states else None))
+    if neutral != "module":
+        em = NeutralEmulator(neutral, last)
+
+        def ctl():
+            e = cl.states.get(bot)
+            if e and cl.in_vehicle(bot):
+                cp, cr, c, ped = em.step(e, cl.tick)
+                cl.inputs[bot] = dict(pitch=cp, roll=cr, coll=c, ped=ped)
+            else:
+                cl.inputs.pop(bot, None)
+        cl.before_send = ctl
+    cl.run_for(seconds)
+    cl.on_state = None
+    cl.before_send = None
+    return rec
+
+
+def summarize_cut(name, rec, cmd, pad_y, csv, marks=(10.0,)):
+    """Prints the cut's state once a second and a RESULT line at each of `marks` seconds and at the end:
+    altitude change, worst attitude, speed and whether the bot was still alive and seated."""
+    e0 = rec[0][1]
+    t0 = rec[0][0]
+    y0 = e0["pos"][1]
+    vf0, vr0 = body_speeds(e0)
+    log(f"[{name}] cut at tick {t0}: {y0 - pad_y:.1f} m above the pad, last input pitch {cmd[0]:+.2f} roll {cmd[1]:+.2f} "
+        f"coll {cmd[2]:+.2f} ped {cmd[3]:+.2f}; ypr {e0['ypr'][0]:.1f} {e0['ypr'][1]:+.1f} {e0['ypr'][2]:+.1f} "
+        f"v_fwd {vf0:+.1f} v_right {vr0:+.1f} vy {e0['vel'][1]:+.1f}")
+    log(f"[{name}]    t    dAlt   aboveP  pitch    roll   dYaw  v_fwd v_right    vy   speed   hp  fl")
+    lost_at = None
+    rows = []
+    for tick, e in rec:
+        t = (tick - t0) / 30.0
+        if e is None or not (e["flags"] & 1) or not (e["flags"] & 4):
+            if lost_at is None:
+                lost_at = t
+                log(f"[{name}] {t:5.1f} LOST: flags {e['flags'] if e else -1}")
+            if csv:
+                csv.write(f"{name},{t:.3f},,,,,,,,,,{e['flags'] if e else -1}\n")
+            continue
+        if lost_at is not None:
+            continue
+        da = e["pos"][1] - y0
+        vf, vr = body_speeds(e)
+        sp = math.sqrt(sum(c * c for c in e["vel"]))
+        dyaw = wrap180(e["ypr"][0] - e0["ypr"][0])
+        rows.append((t, da, e, sp))
+        if csv:
+            csv.write(f"{name},{t:.3f},{da:.2f},{e['pos'][1] - pad_y:.2f},{e['ypr'][1]:.2f},{e['ypr'][2]:.2f},"
+                      f"{dyaw:.2f},{vf:.2f},{vr:.2f},{e['vel'][1]:.2f},{sp:.2f},{e['health']:.3f},{e['flags']}\n")
+        if (tick - t0) % 30 == 0:
+            log(f"[{name}] {t:5.1f} {da:+7.1f} {e['pos'][1] - pad_y:7.1f} {e['ypr'][1]:+6.1f} {e['ypr'][2]:+7.1f} "
+                f"{dyaw:+6.1f} {vf:+6.1f} {vr:+6.1f} {e['vel'][1]:+6.1f} {sp:6.1f} {e['health']:5.2f} {e['flags']}")
+    end_t = (rec[-1][0] - t0) / 30.0
+    for m in tuple(marks) + (end_t,):
+        part = [r for r in rows if r[0] <= m + 1e-6]
+        if not part:
+            continue
+        t, da, e, sp = part[-1]
+        lost = lost_at is not None and lost_at <= m
+        verdict = f"LOST at {lost_at:.1f} s" if lost else f"alive and seated at {m:.0f} s"
+        log(f"[{name}] RESULT@{m:.0f}s {verdict}; alt change {da:+.1f} m (min {min(r[1] for r in part):+.1f}, max "
+            f"{max(r[1] for r in part):+.1f}); max |pitch| {max(abs(r[2]['ypr'][1]) for r in part):.1f}, max |roll| "
+            f"{max(abs(r[2]['ypr'][2]) for r in part):.1f}; speed {sp:.1f} m/s; health {e0['health']:.2f} -> {e['health']:.2f}")
+    return lost_at is None
+
+
+def run_q5(args):
+    """Cuts the input (watchdog) in several flight states and records the next seconds."""
+    cl = Client(args, "serverext testclient q5")
+    cl.last_cmd = (0.0, 0.0, 0.0, 0.0)
+    cl.fly_log_every = args.q5_fly_log
+    csv = open(args.q5_csv, "a") if args.q5_csv else None
+    if csv:
+        csv.write("trial,t,dalt,above_pad,pitch,roll,dyaw,v_fwd,v_right,vy,speed,health,flags\n")
+    bot = cl.create_bot(args.name, args.team)
+    ap = Autopilot(tuple(float(x) for x in args.q5_att.split(",")), tuple(float(x) for x in args.q5_vel.split(",")))
+    st = dict(pad_y=None)
+    center = (19.0, 0.0, -57.0)    # midway between the dalian_2_v_2 bases
+
+    def mount():
+        """Make sure the bot is seated in a heli and hovering pad + 60 m."""
+        while True:
+            if not cl.in_vehicle(bot):
+                if not cl.wait_alive(bot, 40.0):
+                    raise RuntimeError("bot never spawned")
+                cl.run_for(1.0)
+                kind, data = cl.enter(bot, 0, 0)
+                log(f"EnterVehicle: {kind} {data}")
+                if kind != "ack":
+                    cl.run_for(3.0)
+                    continue
+                cl.run_for(0.5)
+                st["pad_y"] = cl.states[bot]["pos"][1]
+                ap.reset()
+                fly(cl, bot, ap, dict(idle=True), timeout=args.spinup)
+                ap.reset()
+            r = fly(cl, bot, ap, dict(alt=st["pad_y"] + 60.0),
+                    until=steady(lambda e, t: abs(e["pos"][1] - st["pad_y"] - 60.0) < 4.0
+                                 and math.sqrt(sum(c * c for c in e["vel"])) < 2.5, 3.0), timeout=90.0)
+            if r == "ready":
+                st["hover_coll"] = cl.coll_avg     # about the last second; the last command alone can be far off
+                log(f"mount: hovering {cl.states[bot]['pos'][1] - st['pad_y']:.1f} m above the pad, collective {st['hover_coll']:+.2f}")
+                return
+            log(f"mount: {r}; trying again")
+
+    def trial_hover():
+        return "ready"
+
+    def trial_climb():
+        return fly(cl, bot, ap, dict(coll=1.0), until=lambda e, t: t > 3.0, timeout=10.0)
+
+    def trial_descent():
+        r = fly(cl, bot, ap, dict(alt=st["pad_y"] + 110.0),
+                until=steady(lambda e, t: abs(e["pos"][1] - st["pad_y"] - 110.0) < 4.0
+                             and math.sqrt(sum(c * c for c in e["vel"])) < 3.0, 2.0), timeout=45.0)
+        if r != "ready":
+            return r
+        coll = st.get("hover_coll", 0.33) - args.q5_descent_drop
+        return fly(cl, bot, ap, dict(coll=coll), until=lambda e, t: t > 2.0 and e["vel"][1] < -3.0, timeout=15.0)
+
+    def cruise(v_target, until, timeout, bank=None):
+        """Level at pad + 80 m, then ramp the speed up at 1.5 m/s^2 towards the map centre."""
+        r = fly(cl, bot, ap, dict(alt=st["pad_y"] + 80.0),
+                until=steady(lambda e, t: abs(e["pos"][1] - st["pad_y"] - 80.0) < 4.0, 1.0), timeout=40.0)
+        if r != "ready":
+            return r
+        hdg = bearing(cl.states[bot]["pos"], center)
+        ap.heading = hdg
+        return fly(cl, bot, ap, lambda e, t: dict(alt=st["pad_y"] + 80.0, pitch_cmd=v_target, heading=hdg,
+                                                  bank=bank), until=until, timeout=timeout)
+
+    def speed_steady():
+        """until(): forward speed changing by less than 0.5 m/s per second, level, for 3 s."""
+        hist = []
+
+        def f(e, t):
+            hist.append((t, body_speeds(e)[0]))
+            while hist and hist[0][0] < t - 3.0:
+                hist.pop(0)
+            return (t > 8.0 and len(hist) > 30 and abs(hist[-1][1] - hist[0][1]) < 1.5
+                    and abs(e["vel"][1]) < 1.5 and abs(e["pos"][1] - st["pad_y"] - 80.0) < 8.0)
+        return f
+
+    def trial_forward():
+        # args.q5_fwd_pitch degrees nose down gives the cruise speed the trial reports (about 30 m/s).
+        return cruise(args.q5_fwd_pitch, speed_steady(), 60.0)
+
+    def trial_turn():
+        r = cruise(args.q5_turn_pitch, speed_steady(), 50.0)
+        if r != "ready":
+            return r
+        return fly(cl, bot, ap, dict(alt=st["pad_y"] + 80.0, pitch_cmd=args.q5_turn_pitch, bank=args.q5_bank),
+                   until=steady(lambda e, t: abs(e["ypr"][2] - args.q5_bank) < 5.0 and abs(e["vel"][1]) < 2.0, 2.0),
+                   timeout=25.0)
+
+    trials = dict(hover=trial_hover, climb=trial_climb, descent=trial_descent, forward=trial_forward, turn=trial_turn)
+    results = []
+    for rep, neutral, name in [(r, n, t) for r in range(args.q5_repeat) for n in args.q5_neutral.split(",")
+                               for t in args.q5_trials.split(",")]:
+        if True:
+            label = f"{name}/{neutral}#{rep + 1}"
+            for attempt in range(3):
+                mount()
+                mark(f"q5 trial {label}: setting up")
+                r = trials[name]()
+                if r == "ready":
+                    break
+                log(f"[{label}] setup {r}; again")
+            else:
+                cl.check(f"{label}: set up", False)
+                continue
+            cmd = cl.last_cmd
+            mark(f"q5 trial {label}: CUT INPUT")
+            rec = cut_and_record(cl, bot, args.q5_record, neutral, cmd)
+            ok = summarize_cut(label, rec, cmd, st["pad_y"], csv)
+            results.append((label, ok))
+            if not cl.in_vehicle(bot):
+                cl.run_for(2.0)
+            ap.reset()
+    for label, ok in results:
+        log(f"q5 {label}: {'survived' if ok else 'LOST'}")
+    if csv:
+        csv.close()
+    return cl.finish()
+
+
+SCENARIOS = {"wreck": run_wreck, "walk": run_walk, "buttons": run_buttons, "blockpad": run_blockpad, "allblocked": run_allblocked,
+             "q9": run_q9, "q5": run_q5}
 
 
 # ------------------------------------------------------------------------------------- fuzz
@@ -1066,7 +1659,23 @@ def main():
     ap.add_argument("--fuzz-rounds", type=int, default=300)
     ap.add_argument("--expect-restart-refused", action="store_true", help="fuzz: the server has allowRoundRestart 0")
     ap.add_argument("--vehicle-log-every", type=float, default=60.0, help="seconds between VehicleList summaries")
-    ap.add_argument("--scenario", choices=["hover", "walk", "buttons", "blockpad", "allblocked", "wreck"], default="hover")
+    ap.add_argument("--scenario", choices=["hover", "walk", "buttons", "blockpad", "allblocked", "wreck", "q9", "q5"],
+                    default="hover")
+    ap.add_argument("--rcon-port", type=int, default=4723, help="q9: ModManager RCON port")
+    ap.add_argument("--rcon-password", default="", help="q9: ModManager RCON password")
+    ap.add_argument("--q5-trials", default="hover,climb,descent,forward,turn")
+    ap.add_argument("--q5-repeat", type=int, default=1)
+    ap.add_argument("--q5-neutral", default="module",
+                    help="q5: comma list of neutrals after the cut: module (the real watchdog), level, hover")
+    ap.add_argument("--q5-record", type=float, default=20.0, help="q5: seconds recorded after each cut")
+    ap.add_argument("--q5-fwd-pitch", type=float, default=8.0, help="q5: forward trial pitch, degrees nose down")
+    ap.add_argument("--q5-turn-pitch", type=float, default=5.0, help="q5: turn trial pitch, degrees nose down")
+    ap.add_argument("--q5-att", default="0.06,0.04,0.02", help="q5 autopilot attitude kp,kd,ki")
+    ap.add_argument("--q5-vel", default="1.5,0.3", help="q5 autopilot speed kv,kvi")
+    ap.add_argument("--q5-bank", type=float, default=30.0, help="q5: turn trial bank angle, degrees (+ = left)")
+    ap.add_argument("--q5-csv", default="", help="q5: append every recorded tick to this CSV")
+    ap.add_argument("--q5-descent-drop", type=float, default=0.12, help="q5: descent collective below the hover's")
+    ap.add_argument("--q5-fly-log", type=int, default=0, help="q5: log the autopilot every N ticks (0 = off)")
     ap.add_argument("--max-bots", type=int, default=12, help="blockpad/allblocked: bots to add at most")
     ap.add_argument("--restart", choices=["none", "refused", "allowed"], default="none",
                     help="allblocked: send RestartRound after SpawnBlocked and expect this outcome")
