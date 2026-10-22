@@ -598,7 +598,11 @@ evidence in `module-v1.md`.
   `restartRound()` (what `admin.restartMap` runs) and `getGameStatus()`. OpenBF2 branch
   `serverext/r1`, commit `540fa88`.
 
-## v2 (approved 2026-10-22, not implemented yet)
+## v2 (approved 2026-10-22, implemented 2026-10-23)
+
+Implemented and tested: `docs/findings/module-v2.md` (OpenBF2 `74e18d9`, module `5090e56`); all 11
+items pass on WSL and items 1, 2, 6, 8 and 11 also in Docker. Guided missiles and every client path
+(human chat, human spots) are not exercised yet.
 
 Approved by the author on 2026-10-22, all items. Sources: the v1 sidecar (`bf2-bots/docs/serverext-backend.md`),
 the play mission and `docs/findings/q5-q9.md` (man-down flag). The damage event uses the same engine
@@ -627,11 +631,243 @@ damage observer (R5) as the admin channel draft.
 Items 4-8 come from the play mission (`bf2-bots/docs/serverext-missions.md`). Items 4 and 5 unblock TV
 fights and a gunner bot. Item 8 overlaps the admin channel's events (`docs/admin-channel-draft.md`).
 
+### Wire format (protocol version 2)
+
+The module accepts only version 2. Layouts as implemented; they were written before the code.
+
+Framing, strings, error codes and the v1 messages are unchanged unless listed. The module accepts
+only version 2; a v1 `Hello` is `Error` 1 and close.
+
+Optional player ids carry a presence bit in the message's flags. No id value can mean "none",
+because the engine gives bots ids counting down from 255 (the first bot is 255). The first draft
+of these layouts used 255 for "none" and was changed before the runs below.
+
+#### Connections (item 3)
+
+- Up to `maxConnections` (serverext.cfg, 1..8, default 4) sidecar connections at once. Another
+  connection beyond that is accepted and closed at once, with no frame, as in v1.
+- Each connection has its own `Hello`, request ids, bots, `TickState`, `VehicleList` and events. A bot
+  belongs to the connection that created it: only that connection can drive, enter, teleport, spot
+  with or remove it, and it is removed when that connection closes (after the watchdog period, as in
+  v1).
+- **Handover is out of scope in v2.** It adds a second owner state and an authority question
+  (which connection's `SetInput` wins during the hand), and the motivating case (a test needing a
+  second client) is covered by several connections. Other connections' bots appear in `TickState`
+  like any other player (flag bit 1 clear), and only when in a vehicle, as in v1.
+- `RestartRound`'s 60 s limit is server-wide.
+
+#### `0x0002 Welcome`
+
+| Type | Field |
+|---|---|
+| `u16` | protocol version, 2 |
+| `f32` | tick rate in Hz |
+| `u32` | current tick number |
+| string | map name |
+| string | game mode |
+| `f32` | `enterRange`, metres (item 2) |
+| `f32` | `projectileRange`, metres |
+| `u8` | features: bit 0 `allowTeleport`, bit 1 `allowRoundRestart` |
+
+#### `0x0301 TickState`
+
+Header unchanged (`u32` tick, `f64` time, `u8` N). Each entry is the v1 entry (60 bytes) followed by:
+
+| Type | Field |
+|---|---|
+| `u8` | camera view mode of an own bot (item 1): 1 inside, 2 nose, 3 chase, 4 front chase, 5 fly-by, 6 trace, 7 extern trace, 0 none; 255 for other players or a dead own bot |
+| `u8` | weapon count W: 0 for other players, else the bot's active weapon slots that hold a weapon (at most 3) |
+| W × weapon | item 4 |
+
+New entry flag bits: bit 3 **man-down** (item 10: alive flag set, `IPlayer::getIsManDown`), bit 4
+**spotted**: the entry's team's enemies spotted this player's root object within the last 12 s
+(item 6; 12 s is the client's minimap marker lifetime, `Menu/Bf2MenuMapNode.cpp:842`).
+
+Weapon:
+
+| Type | Field |
+|---|---|
+| `u8` | slot: 0 fire (`PIFire`), 1 alt fire, 2 flares (`PlayerControlObject::addWeapon` by fire input) |
+| string | weapon template name |
+| `i16` | rounds in the loaded magazine (`IWeaponObject::getAmmoInMag(0)`), -1 for no ammo component or infinite |
+| `i16` | magazines left including the loaded one (`getCurrentNrOfMags`), -1 when unknown |
+| `u8` | flags: bit 0 reloading (`isReloading`); other bits 0 |
+| `f32` | reload time left as a fraction 0..1 (`getReloadTimeLeftInPercent`), 0 when not reloading |
+| `f32` | heat 0..1 (`getHeat`), -1 when the weapon does not use heat |
+
+The weapons come from the seat's (or soldier's) `IPlayerControlObject::getActiveWeapon(0..2)`, then
+`IWeaponObject` (`IID_IWeaponObject`): no engine change.
+
+#### `0x0303 ProjectileList` (module → sidecar, item 5)
+
+Sent after `TickState` on every tick on which the connection has a projectile to report, and once
+with N = 0 after the last one goes. Latest wins, like `TickState`.
+
+| Type | Field |
+|---|---|
+| `u32` | tick, as in `TickState` |
+| `u8` | N (at most 64) |
+| N × entry | |
+
+Entry:
+
+| Type | Field |
+|---|---|
+| `u32` | projectile id: its networkable id, or the engine object id plus 0x10000 when it has none |
+| string | projectile template name |
+| `u8` | owner player id, valid only with flag bit 2 |
+| `u8` | owner team |
+| `u8` | flags: bit 0 guided (has a seek component), bit 1 fired by an own bot of this connection, bit 2 the owner id is valid |
+| `u32` | networkable id of the guided target's root object, 0 if none |
+| 3 × `f32` | position |
+| 3 × `f32` | velocity |
+| `f32` | time to live, seconds |
+
+Which projectiles: those with a networkable id, a seek component or a detonation component
+(`IID_IProjectileDetonationComp`): missiles, rockets, grenades and explosive cannon shells. Ordinary
+bullets have none of the three on the dedicated server (no networkable: `GenericProjectile.cpp:1357-1359`)
+and are not reported. Measured on dalian: the Hydra and S-8 rockets have no networkable id and no
+seek component, only the detonation component, so a networkable-or-guided filter (the first
+implementation) reported no rockets at all; the AH-1Z gunner's 20 mm `AHE_AH1Z_Gun_Projectile`
+detonates and is reported. The module tracks at most 256 projectiles at once. A projectile is reported to a connection while it is active and within
+`projectileRange` (default 1000 m, 10..5000) of one of that connection's live bots, or was fired by
+one of them. The module applies **no perception filter**: entries are raw, like enemy `TickState`
+entries, and the sidecar's perception filter decides what the bot may know.
+
+#### `0x0304 Damage` (module → sidecar, item 8)
+
+A control frame, never dropped while the connection lives.
+
+| Type | Field |
+|---|---|
+| `u32` | tick: the number of the first `TickState` whose state includes this damage (it can be off by one, because damage is applied both before and after the module's handler within a server tick) |
+| `u8` | flags: bit 0 the victim is an own bot or the vehicle an own bot is in (or an own bot this damage killed), bit 1 the attacker is an own bot, bit 2 the victim's hit points reached 0, bit 3 this damage killed a player, bit 4 the victim player id is valid, bit 5 the attacker id is valid |
+| `u8` | victim player id (bit 4): the soldier's player, or for a vehicle the first occupant, or the occupant this damage killed |
+| `u32` | victim root object's networkable id, 0 if none |
+| string | victim template name |
+| `u8` | attacker player id (bit 5) |
+| string | weapon template name, empty if none |
+| string | projectile (source) template name, empty if none |
+| `f32` | amount (hit points) |
+| `f32` | hit points before |
+| `f32` | hit points after |
+| `f32` | maximum hit points |
+| 3 × `f32` | position the engine passed (see the R5 position caveat) |
+
+**Module filter ("what a player would see"):** a connection gets a `Damage` only when bit 0 or bit 1
+is set: damage to its own bots (the health bar) and damage they deal (hit markers). Amounts are raw
+hit points; any further narrowing (a hit marker without numbers) is the sidecar's.
+
+#### `0x0305 Kill` (module → sidecar, item 8)
+
+Every kill on the server, to every connection: the kill feed every player sees.
+
+| Type | Field |
+|---|---|
+| `u32` | tick |
+| `u8` | victim player id |
+| `u8` | victim team |
+| `u8` | attacker player id, valid only with flag bit 3 (none for a crash) |
+| `u8` | attacker team, 0 if none |
+| string | weapon template name, empty if none |
+| `u8` | flags: bit 0 victim is an own bot, bit 1 attacker is an own bot, bit 2 team kill, bit 3 the attacker id is valid |
+
+#### `0x0306 Chat` (module → sidecar, item 7)
+
+| Type | Field |
+|---|---|
+| `u32` | tick |
+| `u8` | flags: bit 0 the sender is a player (else the server) |
+| `u8` | sender player id, valid with flag bit 0 |
+| `u8` | sender team, 0 if none |
+| `u8` | channel, the engine's number: 0 Global, 1 Team, 12 ServerMessage, 13 ServerTeamMessage, ... (`GameServer::handleStringReceivedEvent`) |
+| string | text, control bytes replaced, at most 255 bytes |
+
+Source: the module's `ECNetwork` listener for `StringReceivedEvent` (id 11), the same event
+`GameServer` relays; no engine change. Filter: channels 0 (Global) and 12 (ServerMessage,
+`game.sayAll`) go to every connection; channel 1 (Team) only to connections with a bot on the
+sender's team, and channel 13 (ServerTeamMessage, `game.sayTeam`) only to connections with a bot on
+the team the event's flags carry (`GameServer::sayTeam` puts it there), with that team in the team
+field. Every other channel (squad, commander, local, ...) is not forwarded.
+
+#### `0x0307 RoundState` (module → sidecar, item 7)
+
+Sent after `Welcome` and whenever a field other than the time changes.
+
+| Type | Field |
+|---|---|
+| `u32` | tick |
+| `u8` | game status (`IGameLogic::getGameStatus`: 1 playing, 2 end game, 3 pre game, ...), 255 if none |
+| `u8` | begin-round state: 0 announce, 1 waiting for players, 2 pre-round countdown, 3 running, 255 if none |
+| `f32` | seconds to the next state change, -1 if none |
+
+#### `0x0109 Teleport` (sidecar → module, item 9)
+
+| Type | Field |
+|---|---|
+| `u32` | request id |
+| `u8` | player id (a bot of this connection) |
+| 3 × `f32` | position |
+| `f32` | yaw, degrees |
+
+Reply `Ack` or `Error`. `Error` 6 unless `allowTeleport 1` (default 0). The bot must be alive
+(`Error` 6). Non-finite or out-of-world (|x|, |z| > 8192, y outside -1000..10000) values are `Error`
+7. The module moves the bot's root object (its vehicle when seated) with
+`setAbsoluteTransformation` to a level attitude at that yaw, then resets its physics node (speeds
+zero) and wakes it. On foot the yaw does not stick: the soldier's facing comes from its own look
+state, so a sidecar turns it with look yaw.
+
+#### `0x010A Spot` (sidecar → module, item 6)
+
+| Type | Field |
+|---|---|
+| `u32` | request id |
+| `u8` | player id (a bot of this connection) |
+| `u32` | target: networkable id of a root object, as `TickState` and `VehicleList` give |
+
+Reply `Ack` or `Error`. The bot must be alive and not man-down (`Error` 6); the target must exist
+(`Error` 5) and be an enemy: a root object whose team, or whose occupant's team, is the other team
+(`Error` 5). At most one spot per bot per second (`Error` 6). The module sends what a human's Q +
+click sends: `IGame::sendSpottedMessage(bot, target, x/z, type)` (type: the target template's `IPlayerControlObjectTemplate::getVehicleType`, 0 for a soldier; a human client passes what its commo rose chose, which the module cannot know) and the "spotted" radio
+line to the team. It does not check that the bot can see the target: that is the sidecar's
+perception filter.
+
+### Watchdog in v2
+
+In seat 0 of a vehicle whose template's vehicle category is `VCHelicopter`, the module flies
+level-and-hold every tick after the watchdog trips (`src/Neutral.h`, gains in
+`docs/findings/module-v2.md`). Other vehicles and seats keep v1's neutral; on foot all axes are 0.
+It levels and holds height, not position: expect 6-10 m/s of drift.
+
+### Notes for the sidecar (from the implementation)
+
+- No player id value means "none": bots count down from 255. Optional ids have a presence bit.
+- Projectiles: rockets (Hydra, S-8) have no networkable id or seek component; the module also
+  reports anything with a detonation component, so cannon shells appear. Filter by template.
+- Spotting: the server keeps no spotted state; the module keeps its own 12 s table. A spotted enemy
+  soldier on foot is not visible, because `TickState` lists other players only in vehicles.
+- Death can be invisible: with `sv.spawnTime` ≤ `sv.manDownTime` (2 and 2 in netsky), the alive flag
+  never drops. Treat "man-down bit dropped and the bot jumped to a spawn" as a death. The module's
+  own death handling (zeroing stored axes) is skipped then.
+- `Damage` position is the projectile's start, the explosion centre, or 0/0/0 for bleeds, not the
+  hit point. `Damage` is sent only when a connection's bot is involved; `Kill` for every kill.
+- Teleport zeroes speeds; on foot it does not keep yaw (turn with look yaw).
+- Rocket pods fire once per press: pulse the trigger (3 ticks on, 3 off).
+- `reload_left` reads 0 on the first reloading tick.
+- The selected weapon is the active one per fire input; a seat with two weapons on one input shows
+  only the active one.
+- Bots only: `RoundState` stays begin-round 1. Server chat is channels 12 and 13; human chat 0 and 1.
+- `Welcome` also carries `projectileRange` and a feature byte (teleport, round restart allowed).
+- Handing bots between connections is out of scope; each bot belongs to the connection that made it.
+
 ## Later
 
 - The admin channel for BF2WebAdmin: approved 2026-10-22 as `docs/admin-channel-draft.md` draft 2
   (its own contract, not bound to `mm_webadmin`). It shares R5 with v2 item 8.
 - R3 stepped time and a `Step` message.
+- `SetTargetDirection`, to guide a TV or wire missile from a gunner bot. The server steers it from
+  the virtual `IWeaponObject::setTargetDirection` (`GameEvents/TargetDirectionEvent.cpp`), so it needs
+  no engine change. Launching one from the AH-1Z gunner seat did not work yet (findings/module-v2.md).
 - Hooks that can veto or change actions (damage, team selection).
 
 ## Open questions
