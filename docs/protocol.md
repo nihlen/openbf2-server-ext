@@ -167,7 +167,7 @@ after a couple of seconds.
 The module creates the player (R1), then sets its team, a valid kit and its team's on-foot spawn
 group (`IServerExtension::findSpawnGroup`, R1). The engine spawns it on the pad on a later tick,
 once a round is running; no human needs to be present. `TickState`'s alive flag shows when that has happened. Never use the in-heli
-enter-on-spawn group: R1b stops the crash there, but that path is untested.
+enter-on-spawn group as the home group; in v1 it is only a fallback (see Blocked spawns).
 
 A bot that dies, including at the end of every round, stays a bot: the engine respawns it on the
 pad without a `BotRemoved`. `TickState` shows it alive and on foot, and the sidecar sends
@@ -485,8 +485,13 @@ blocked, the round has to be restarted.
   means the team has none, as during a level load.
 - The module owns the fallback. If a bot waiting to spawn has not spawned within
   `spawnFallbackSeconds` (default 5) of its group becoming its target, the module moves it to the
-  team's next active group without enter-on-spawn, nearest to the original group's points first,
-  and cycles through them. After a successful spawn the bot's target goes back to its home group
+  team's next active group, nearest to the original group's points first, and cycles through them.
+  Groups without enter-on-spawn come first. The team's enter-on-spawn groups come last: on
+  `dalian_2_v_2` each base has only the pad group and the in-heli point, so the in-heli point is
+  the only fallback there. For an AI-flagged bot, that point takes the R1b-guarded
+  `BFfindEntryPoint` path and puts it in the nearest free seat within 15 m, as a human spawning
+  there would be. That path is untested. The v1 module worker must exercise it first. If it
+  crashes or misbehaves, enter-on-spawn groups stay excluded and the worker reports why. After a successful spawn the bot's target goes back to its home group
   (the first `findSpawnGroup` result), so the next death tries the pad first.
 - **`0x0107 SpawnBlocked`** (module → sidecar): `u8` player id, `u16` seconds waiting. Sent when a
   bot has not spawned for `spawnBlockedSeconds` (default 15) with every group tried, then every 10 s
