@@ -431,26 +431,100 @@ to an empty server ticking on `dalian_2_v_2` for over 5 minutes, in both WSL and
 - The end-to-end check: start the local OpenBF2 server with the module on `dalian_2_v_2`, start
   the bot sidecar, and confirm a bot spawns, enters the heli and holds a hover for 60 seconds.
 
-## Proposed for v1
+## v1 (approved 2026-10-22, not implemented yet)
 
-Found by the bf2-bots sidecar (`bf2-bots/docs/serverext-backend.md`, branch `serverext-sidecar`).
-Not approved yet.
+Changes on top of v0. The protocol version becomes 1, and the module and sidecar move together:
+the module accepts only version 1. Sources: the bf2-bots sidecar's findings
+(`bf2-bots/docs/serverext-backend.md`) and the author's guidance on blocked spawns.
 
-1. **Vehicle template name**, for example in the `EnterVehicle` `Ack` or per `TickState` entry. The
-   sidecar needs the heli type for gains, camera views and weapons, and today it only gets it from
-   configuration. Wire change.
-2. **Skip destroyed vehicles** in the `EnterVehicle(0)` search. Twice it picked the bot's own burning
-   wreck. Module behaviour only.
-3. **A blocked spawn is not brief.** A wreck resting on the pad blocked `CreateBot` with `Error` 6 for
-   132 s, until a map restart. Either say why in the error message, or fall back to another of the
-   team's groups. Module behaviour, possibly a new error code.
-4. **Buttons** (already under Later), which the sidecar needs for camera views and weapons.
+### Vehicles
+
+**`0x0302 VehicleList`** (module → sidecar), sent on the first tick after `Welcome` and then once a
+second (every 30 ticks), after that tick's `TickState`.
+
+| Type | Field |
+|---|---|
+| `u32` | tick number, as in `TickState` |
+| `u16` | number of entries N |
+| N × entry | one per vehicle on the map: a root object with seats that is not a soldier |
+
+Entry:
+
+| Type | Field |
+|---|---|
+| `u32` | networkable id, as in `TickState` and `EnterVehicle` |
+| string | template name, for example `ahe_ah1z` |
+| `u8` | team, 0 if neutral or empty |
+| `u8` | flags: bit 0 destroyed (hit points at or below 0) |
+| 3 × `f32` | position x, y, z |
+| `f32` | yaw, degrees |
+| `f32` | health, 0..1, or -1 with no armour component |
+| `u8` | number of seats |
+| `u32` | bitmask of occupied seats, bit 0 = seat 0 (pilot) |
+
+- This is the sidecar's only source for a vehicle's type and for empty vehicles. Enemy vehicles
+  are raw, like enemy `TickState` entries, and go through the perception filter.
+- Walking every registered object costs about 4 ms. The module must keep its own vehicle set
+  (for example, rebuilt after a level load and updated as vehicles spawn and are destroyed), so
+  that p99 per-tick cost stays under 1 ms.
+
+### Entering vehicles
+
+- Both forms of `EnterVehicle` skip destroyed vehicles: id 0 never picks one, and an explicit id is
+  `Error` 5.
+- Both forms require the bot within `enterRange` metres of the vehicle (`serverext.cfg`, default
+  30). A bot that spawned elsewhere walks there first (see On foot).
+
+### Blocked spawns
+
+A wreck, or a healthy heli out of place, can block a spawn group's points. Usually another of
+the team's points is free, and the bot can spawn there and walk to the heli. If every point is
+blocked, the round has to be restarted.
+
+- `CreateBot` succeeds whenever the team has any spawn group, active or not. `Error` 6 now only
+  means the team has none, as during a level load.
+- The module owns the fallback. If a bot waiting to spawn has not spawned within
+  `spawnFallbackSeconds` (default 5) of its group becoming its target, the module moves it to the
+  team's next active group without enter-on-spawn, nearest to the original group's points first,
+  and cycles through them. After a successful spawn the bot's target goes back to its home group
+  (the first `findSpawnGroup` result), so the next death tries the pad first.
+- **`0x0107 SpawnBlocked`** (module → sidecar): `u8` player id, `u16` seconds waiting. Sent when a
+  bot has not spawned for `spawnBlockedSeconds` (default 15) with every group tried, then every 10 s
+  while still waiting.
+- **`0x0108 RestartRound`** (sidecar → module): `u32` request id. Restarts the round as
+  `admin.restartMap` does. It is allowed only if `serverext.cfg` has `allowRoundRestart 1` (default
+  0), and at most once per 60 s. Otherwise it is `Error` 6. Reply: `Ack`. The sidecar sends it only
+  after `SpawnBlocked`, never on its own initiative.
+
+### On foot
+
+- The bot must walk from a fallback spawn point to its heli. v1 defines what the `SetInput` axes do
+  on foot, and adds two look axes, because a soldier turns by looking.
+- `SetInput` gains two `f32` fields after pedals: look yaw and look pitch, -1..1, in the slots the
+  soldier uses for mouse look. In a vehicle they are written as well, and are 0 when unused.
+- Q10: the module worker establishes, from source, which slots move, strafe and turn a soldier,
+  what range and units the look axes have, and whether they need the same quantization. The
+  answer is recorded here before the sidecar uses it.
+
+### Buttons
+
+- `SetInput`'s `u32` bitmask is live in v1. Each bit sets one button slot to 1 for that tick, with
+  its mapping bit.
+- Q11: the module worker proposes the bit table from `Input.h` and the `PlayerAction` button table:
+  at least fire, alt fire, the camera-view key, and the weapon selection keys. `PIUse` stays
+  excluded: entering goes through `EnterVehicle`, and the AI `PIUse` path (R1b) is untested. An
+  exit-vehicle button is included only if it does not reach that path.
+- Bits that are not in the table are ignored and logged once.
+
+### Engine
+
+- `IServerExtension` gains, appended, whatever the fallback needs to list a team's spawn groups and
+  each group's position. The OpenBF2 branch is `serverext/r1`.
 
 ## Later
 
 - v1 admin channel for BF2WebAdmin: the existing `mm_webadmin` events and commands, carried by the
   module instead of Python. Separate endpoint and authentication, because it is not loopback.
-- Buttons: fire, alt fire, seat and camera keys through the `SetInput` bitmask.
 - R3 stepped time and a `Step` message.
 - Hooks that can veto or change actions (damage, team selection).
 
@@ -467,6 +541,8 @@ Not approved yet.
 | Q7 | Does `sv.numPlayersNeededToStart 0` start a round with only bots | Answered: bots spawn with 0 or 2; 0 also starts the timer and tickets |
 | Q8 | Does unrecovered retail code use EventManager category 7 | Open; needs IDA/Ghidra. If yes, use R0 |
 | Q9 | How the netsky and `mm_webadmin` Python treat `ai=1`, `connected=0` players | Open |
+| Q10 | Which slots move, strafe and turn a soldier, and the look axes' range | Open, v1 |
+| Q11 | Button bit table | Open, v1 |
 
 Still unexercised at runtime: the three R1b guards, the enter-on-spawn path for a bot, yaw and roll
 input, any client connection, and the Docker host. The `[FRONTIER]` comment at `SpawnPoint.cpp:211-214` is stale: the bodies below it are
