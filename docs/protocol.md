@@ -597,9 +597,11 @@ evidence in `module-v1.md`.
   `restartRound()` (what `admin.restartMap` runs) and `getGameStatus()`. OpenBF2 branch
   `serverext/r1`, commit `540fa88`.
 
-## Proposed for v2
+## v2 (approved 2026-10-22, not implemented yet)
 
-From the v1 sidecar (`bf2-bots/docs/serverext-backend.md`). Not approved.
+Approved by the author on 2026-10-22, all items. Sources: the v1 sidecar (`bf2-bots/docs/serverext-backend.md`),
+the play mission and `docs/findings/q5-q9.md` (man-down flag). The damage event uses the same engine
+damage observer (R5) as the admin channel draft.
 
 1. Each own bot's camera view mode in `TickState`, so the sidecar can verify a view change. Today
    it is visible only in the module's log, and latest-wins can drop a one-tick press.
@@ -617,6 +619,7 @@ From the v1 sidecar (`bf2-bots/docs/serverext-backend.md`). Not approved.
 8. Damage events (victim, attacker, weapon, amount), filtered to what a player would see (hit
    markers, kill messages).
 9. Teleport, for test drills on test servers only, behind a `serverext.cfg` switch.
+10. A man-down bit in `TickState` entry flags: the alive flag stays set for `sv.manDownTime` after a kill.
 
 Items 4-8 come from the play mission (`bf2-bots/docs/serverext-missions.md`). Items 4 and 5 unblock TV
 fights and a gunner bot. Item 8 overlaps the admin channel's events (`docs/admin-channel-draft.md`).

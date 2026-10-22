@@ -1,142 +1,174 @@
-# Admin channel: draft for the author
+# Admin channel: proposal (draft 2)
 
-Status: **draft, not approved.** Nothing implements it. When it is approved, it moves into
-`protocol.md` as its own section. Until then, no worker builds against it.
+Status: **draft, not approved.** It replaces draft 1, which kept `mm_webadmin.py`'s text protocol.
+The author has decided that the BF2WebAdmin C# side may change as much as needed, and that the
+author keeps deployments from running `mm_webadmin.py` and the native channel at the same time.
+Evidence for the engine side: `docs/findings/admin-channel-a1-a4.md`. Inventory of today's
+protocol and its problems: draft 1, in git history (`5fc2a6d`).
 
-## Goal
+## Principles
 
-Carry what BF2WebAdmin gets today from `mm_webadmin.py`, natively, through the module. BF2WebAdmin
-gets one new backend that maps the native messages onto its existing `GameReader`/`GameWriter`
-events, so its game modules (`Heli2v2Module` and the rest) do not change. `mm_webadmin.py` stays
-supported for retail and BF2Hub servers. The native channel is for OpenBF2 servers only.
+1. **Typed and id-based.**
+   - Players are referred to by player id. Vehicles, objects and projectiles are referred to by
+     networkable id.
+   - Nothing travels as text to be parsed. That ends console grid ids, `findId()`, `\b`-joined
+     rcon output, `"%.1f"` position strings and Windows-1252.
+2. **State, not only events.**
+   - The module already builds a per-tick world snapshot for the bot channel. WebAdmin subscribes
+     to the parts it wants, at the rate it wants, up to 30 Hz.
+   - Events carry full context: ids, templates, positions, vehicles.
+3. **Nothing blocks the game thread.** The game thread only reads and queues; all I/O happens on
+   the I/O thread. The per-tick cost is measured and stays under the bot channel's budget
+   (p99 < 1 ms).
+4. **Resynchronise by snapshot.**
+   - On every connect, the module sends a full snapshot, then events with sequence numbers.
+   - WebAdmin detects a gap from the numbers and asks for a new snapshot.
+   - The connection is never silently left inconsistent.
+5. **Decisions inside a tick run in the module.**
+   - Vetoing damage or refusing a team switch must be decided within the tick, so it can't wait
+     for a network round trip to WebAdmin.
+   - Instead, WebAdmin pushes **policies** (rules). The module evaluates them locally and reports
+     what it did.
+6. **One protocol family.**
+   - The same framing, error handling and codec style as the bot channel, with its own version.
+   - Golden-byte tests are shared by the C++ and C# codecs, as they are today for the bot channel.
 
-## What exists today
-
-Inventory of `mm_webadmin.py` v0.5 and the C# side. The deployed netsky copies are byte-identical
-to the repo's `examples/docker-compose/bf2/server-1/server/admin/modules/mm_webadmin.py`.
-
-- **Transport:** the game server dials out over TCP to WebAdmin on port 4300. Messages are
-  tab-separated lines in Windows-1252; commands are space-separated. WebAdmin re-triggers the
-  connection through ModManager rcon (`wa connect`/`wa connectprivate`).
-- **24 events:** game state, control points, player connect, spawn, team, score, revive, kill and
-  death, disconnect, vehicle enter, exit and destroy, chat, rcon responses, and a position stream
-  at 4 Hz with TV-missile positions.
-- **13 commands:** rcon, rconresponse, pm, position, rotation, damage, rank, medal, gameevent,
-  hudevent, score, team, timerinterval. Kick, ban, chat and map changes all go through `rcon`.
-
-Problems the native channel should fix:
-
-1. **No authentication.** Any private IP is accepted, and a connected peer can run any console
-   command. Player IPs and CD-key hashes travel in clear text.
-2. **Blocking work on the game thread:**
-   - connect, with a 5 s timeout, and `gethostbyname`;
-   - `findId()`, which calls `object.listObjectsOfTemplate` plus two rcon calls per match, and
-     runs on every vehicle entry and every missile update.
-3. **No backpressure.** Every queue on both sides is unbounded.
-4. **Bugs:** `medal` always fails; roadkills are never reported; `gameevent`/`hudevent` with a 0
-   argument are skipped; exit and destroy send placeholder ids; and a partial line over 128 bytes
-   drops the connection.
-
-## Proposed design
+## Transport and security
 
 **Connection**
-- The module dials out to `adminConnect host:port` (`serverext.cfg`), as today. That keeps the
-  central WebAdmin behind its existing firewall rules.
-- Connect, DNS and reconnect with backoff all run on the I/O thread. The main thread never blocks.
-- No rcon re-trigger is needed: the module reconnects by itself. After each connect it replays the
-  current state (game status, players, vehicles), as `sendReconnectMessage` does today.
+- The module dials out to WebAdmin (`adminConnect host:port` in `serverext.cfg`). One central
+  WebAdmin serves many game servers, as today.
+- Connecting and reconnecting with backoff happen on the I/O thread. The old rcon-triggered
+  reconnect (`wa connect`) is gone.
 
 **Authentication**
-- A pre-shared key in `serverext.cfg` (`adminKey`), never on the wire.
-- WebAdmin sends a random challenge, and the module answers with HMAC-SHA256(key, challenge ‖
-  server id). Nothing else is accepted before that.
-- TLS is optional and later. Without it, the stream is still readable on the network, so player
-  IPs and CD-key hashes are sent only when the setting `adminSendIdentity 1` is on.
+- Mutual HMAC-SHA256 challenge-response with a key per server (`adminKey`). Both sides prove they
+  hold the key.
+- The server's identity is a configured server id, not its source IP.
 
-**Wire format**
-- The same framing as the bot channel: a binary header and a length limit.
-- Message types are in their own range (0x1000 and up), with their own version number.
-- UTF-8 strings. Positions are `f32`, not `"%.1f"` strings.
-- Bounded queues: if WebAdmin falls behind, position frames are dropped (latest wins), and events
-  are kept up to a limit that, when reached, closes the connection with a reason.
+**Encryption**
+- Player IPs and CD-key hashes are personal data. Either:
+  - use TLS 1.3 with a pinned WebAdmin certificate, or
+  - accept HMAC alone on a private network or WireGuard link that already protects the traffic (B1).
+- Until that's settled, IPs and hashes are sent only with `adminSendIdentity 1`.
 
-**Events**
-- The same 24 as today, with real ids where today's messages send placeholders, and the roadkill
-  case fixed.
-- Positions come from the module's own per-tick snapshot, at a rate WebAdmin chooses (up to 30 Hz).
-  They cover players, vehicles and projectiles by template, with no `findId()`.
+**Capabilities**
+- `serverext.cfg` can turn off powerful commands per server: raw console, object spawn and delete,
+  and policies. A leaked key then can't do more than the server allows.
 
-**Commands**
-- The same 13 as today, made with typed engine calls where an interface exists: position,
-  rotation, damage, team, score, and the game and HUD events.
-- `rcon` still runs console commands, through the console singleton, so kick, ban, map changes and
-  the RconScripts keep working.
-- New: `RconResponse` is correlated by request id with no 10 000 wrap, and gets typed queries such
-  as "list objects of template" with object ids, replacing `findId()`.
+## Messages (outline; byte layouts once approved)
 
-**Where the events come from: one engine change, R4**
-- Most events reach the server's scripts only through the Python host's event dispatch, the 42
-  retail events at `PythonHost.cpp:1882`. The module cannot see them without an engine hook.
-- Proposed R4 (`[CHOSEN, not recovered]`): one listener interface on `IServerExtension`, called
-  from the Python host's dispatch with the event id and typed arguments, before or after Python
-  sees them. One engine site covers all 42 events. Retail Python behaviour is unchanged.
-- Rejected alternatives:
-  - injecting a C extension into CPython 2.3 the way BF2Hub does, because that ABI is fragile;
-  - hooking engine internals by address, because it breaks on OpenBF2 updates.
+### Session
 
-**Later, not in the first version**
-- Hooks that can veto or change an action, such as damage, team selection or spawn: base
-  protection that cancels damage, refusing team stacking. These need their own engine hooks on
-  `IGameLogic`, and their own approval.
+| Message | Content |
+|---|---|
+| `Hello` / `Challenge` / `Auth` / `Welcome` | Version, server id and nonces, then the server info: name, ports, max players, the map list for every mode, current map and mode, team names, tickets and game state |
+| `Snapshot` | Every player, vehicle, control point and tracked projectile, plus game state and tickets (fields below) |
+| `RequestSnapshot` | WebAdmin to module, after a sequence gap or at any time |
 
-## Answers so far
+### State in the snapshot and the streams
 
-Read-only investigation, 2026-10-22: `docs/findings/admin-channel-a1-a4.md`.
+| Entity | Fields |
+|---|---|
+| Player | id, name, team, squad, bot flag, profile id, IP and CD-key hash (only with `adminSendIdentity`), ping, score, kills, deaths, team kills, alive or man-down or dead, vehicle id and seat |
+| Vehicle | networkable id, template, team, position, rotation, velocity, health, destroyed, occupied seats |
+| Control point | id, template, team, capture state |
+| Projectile | id, template, owner player, position, velocity (only templates WebAdmin subscribes to, e.g. TV missiles) |
+| Game | state (all six, including Paused), tickets for both teams, round time |
 
-- **A1, mostly yes.**
-  - All 42 script events pass through `PythonHost::handleEvent` (`PythonHost.cpp:799`), but their
-    arguments are already Python tuples there. The typed arguments carry what mm_webadmin sends:
-    weapon template, vehicle (root via parents), control point (team and flag via `IControlPoint`)
-    and positions.
-  - The CD-key hash, team names and tickets need small methods appended to `IServerExtension`.
-  - Game state is not a script event. It comes as EventManager `ECGameLogic` id 1, which the
-    module can already hear.
-- **R4, refined.**
-  - One observer call at the top of `handleEvent`, before Python's handlers run.
-  - An engine-side decoder in `PythonHost.cpp` turns the tuple back into typed values (player,
-    object, int, float, string).
-  - Appended to `IServerExtension`: `IScriptEventListener` and `setScriptEventListener`.
-  - Cost is one branch per event with no listener set. Calls can nest, so the listener only copies
-    into the module's queue.
-- **Commands.**
-  - `rcon` goes through the `"MainConsole"` singleton, whose `executeLine` returns the output.
-  - `position`, `rotation`, `damage`, `team` and `score` have typed paths.
-  - `gameevent`, `hudevent`, `medal`, `rank` and `pm` each need an appended engine method.
-- **A4, yes:** no game module changes. The work is an adapter that feeds the same tab-separated
-  lines into `GameReader.QueueMessage`, plus a new `IGameWriter`. Modules rely on four details the
-  backend must keep:
-  - rcon output joined with ``;
-  - rcon commands run in strict order;
-  - `RootVehicleId` equal to the console grid id;
-  - Windows-1252 text.
-- **Existing mm_webadmin bugs found on the way:**
-  - `gameStatePaused` can never fire, because Python never receives Paused (`PythonHost.cpp:863-877`).
-  - Every `playerKilled` sends the attacker's vehicle position as the victim's.
-  - Suicides probably never produce `playerKilledSelf` (inferred, not run).
+**`Subscribe(stream, rateHz, filter)`**
+- The streams are player states, vehicles, projectiles (filtered by template) and tickets.
+- Each is a plain snapshot of the subscribed entities at the chosen rate (B3).
+
+### Events (sequence-numbered)
+
+| Event | Notes |
+|---|---|
+| GameState, RoundStart, RoundEnd | including Paused, which Python never sees; RoundEnd carries tickets and the winner |
+| PlayerConnect, PlayerDisconnect | with the reason (left, kicked, timed out) |
+| Spawn, Death, Revive | Revive carries the medic and the revived player |
+| TeamChange | from any source: player, admin or autobalance. The module detects the change itself, because the engine doesn't always raise an event |
+| ScoreChange | detected by the module from any source |
+| Kill | attacker, victim, weapon template, both positions, both vehicles, and the kind: kill, team kill, suicide, roadkill or crash (no attacker). Fixes today's missing crash reports and the wrong victim position |
+| Damage | victim (player or object), attacker, weapon or projectile template, amount, health before and after, hit position. Needs R5 |
+| EnterVehicle, ExitVehicle, VehicleDestroyed | with real ids and the seat, and the attacker where known |
+| ControlPoint | captured or neutralised, the new team |
+| Chat | channel, player, text, flags |
+| ProjectileFired, ProjectileHit | for subscribed templates |
+| Kick, Ban | notices |
+| Bot | created, removed and team changes for bot-channel bots, so WebAdmin can tell them apart |
+
+### Commands (each with a request id and a typed result)
+
+| Command | Notes |
+|---|---|
+| `Console` | executes a line and returns its output. Runs in order. Can be turned off |
+| `Say` | to all, a team or one player |
+| `Teleport` | a player's root vehicle or any object id: position and rotation |
+| `SetHealth`, `KillPlayer` | |
+| `SetTeam` | optionally killing the player |
+| `SetScore` | score, kills, deaths |
+| `Rank`, `Medal` | |
+| `GameEvent`, `HudEvent` | including the 0 values today's Python skips |
+| `Kick`, `Ban` | For a bot these map to `RemoveBot`, or are refused, never to the address `N/A` ban |
+| `Map` | restart, next, or set map and mode |
+| `ListObjects` | template filter; returns ids, templates, positions, rotations and health. Replaces `listObjectsOfTemplate` parsing |
+| `SpawnObject`, `DeleteObject` | template, position, rotation; for map modules. Can be turned off |
+| `Subscribe`, `Unsubscribe` | streams |
+| `SetPolicy`, `ClearPolicy` | phase 3 |
+
+### Policies (phase 3)
+
+| Policy | Effect |
+|---|---|
+| Damage | zones with no damage (base protection), multipliers per weapon or vehicle, friendly-fire rules |
+| Team | refuse a team switch that would stack teams |
+| Spawn | per team, group or vehicle |
+
+The module reports every action it takes as an event. Policies need engine veto hooks (R6), each
+designed and approved on its own.
+
+## Engine changes (OpenBF2 branch `serverext/r1`, each `[CHOSEN, not recovered]`)
+
+| Id | Change | Notes |
+|---|---|---|
+| R4 | Script-event observer | One call at the top of `PythonHost::handleEvent`, with an engine-side decoder to typed arguments. Covers every retail script event in one place |
+| R5 | Damage observer | Read-only, at the point where damage is applied. **The bot channel's approved v2 damage event needs the same hook**, so it is built once for both |
+| — | Appended `IServerExtension` methods | CD-key hash, team names, tickets, round time, game and HUD events, medal, rank, player message, and object spawn and delete if no typed path exists |
+| R6 | Veto hooks | Phase 3 only |
+
+## The C# side
+
+- **A new backend in BF2WebAdmin:**
+  - a listener with the new protocol and authentication;
+  - a C# codec with the shared golden-byte tests;
+  - events and state fed straight into its domain model, with no text lines.
+- **Game modules change where they relied on the text protocol.** Heli2v2's `listObjectsOfTemplate`
+  parsing becomes `ListObjects`. `RootVehicleId` becomes the networkable id. Rcon `\b` parsing and
+  ordered raw console strings become typed commands where one exists.
+- **The `mm_webadmin` backend stays** for retail and BF2Hub servers, unless the author retires
+  them (B2).
+
+## Phases
+
+1. **Engine and module.**
+   - R4, R5 (shared with bot v2) and the getters.
+   - The admin channel's session, authentication, snapshot, events, streams and the core commands.
+   - A Python reference client with a fuzz mode, as for the bot channel.
+   - Verified on the WSL and Docker test servers.
+2. **BF2WebAdmin.**
+   - The C# codec and backend, and the module refactors.
+   - Tested end to end with the netsky 2v2 setup. That needs the BF2WebAdmin local test
+     environment recreated, which waits for the author's go-ahead.
+3. **Policies and veto hooks.**
+4. **TLS,** if B1 chooses it.
 
 ## Open questions
 
-| Id | Question |
-|---|---|
-| A2 | Should the module dial out (as proposed) or listen for WebAdmin? Dialling out matches today's deployment. |
-| A3 | Is HMAC with a pre-shared key enough, or is TLS needed in the first version? |
-| A5 | What happens when `mm_webadmin.py` and the native channel are both active? Proposal: the module refuses to start the admin channel if `mm_webadmin` is loaded, so events are never sent twice. |
-
-## Order of work, once approved
-
-1. Investigation only, no code: A1, A4, and the R4 design against the current source.
-2. R4 in OpenBF2 (branch `serverext/r1`), plus the module's admin channel with a test client and a
-   fuzz mode.
-3. A BF2WebAdmin backend, tested against a local BF2WebAdmin with the netsky 2v2 setup. The
-   BF2WebAdmin local test containers no longer exist, so that environment must be recreated
-   first. That is the author's environment, so it waits for the author's go-ahead.
+| Id | Question | Recommendation |
+|---|---|---|
+| B1 | Is TLS needed in phase 1, or do the deployments already run over a private network? | TLS if any game server reaches WebAdmin over the internet |
+| B2 | Keep the `mm_webadmin` backend for retail and BF2Hub servers? | Keep it until every server runs OpenBF2 |
+| B3 | Stream encoding: plain snapshots at the chosen rate, or deltas? | Plain. 64 players at 30 Hz is about 80 KB/s; add deltas only if that is too much |
+| B4 | Should WebAdmin create and remove bots (for example an in-game `!bot` command), through the bot channel's sidecar? | Later, after the bot work settles |
+| B5 | Is raw console allowed by default? | Yes, but it can be turned off per server |
