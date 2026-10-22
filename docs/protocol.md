@@ -406,7 +406,11 @@ to an empty server ticking on `dalian_2_v_2` for over 5 minutes, in both WSL and
 - **WSL (default):** `testenv/build-linux.sh`, `prepare-content.sh`, `run-wsl.sh`. One build
   serves both `bf2` and `libserverext.so`. The bot channel on WSL loopback is reachable from
   Windows at `127.0.0.1` through TCP localhost forwarding.
-- **Docker (production shape):** `testenv/build-bullseye.sh`, `run-docker.sh`. Image and container
+- **Docker (production shape), verified for v1** (`docs/findings/docker-v1.md`): `testenv/build-bullseye.sh`
+  builds `bf2`, `libdice_py.so` and the module with Debian 11's toolchain; `run-docker.sh build` bakes
+  the module, `openbf2.con` and `serverext.cfg` into the image. In Docker the module logs to
+  `docker logs` (stderr); `/volume/bf2.log` holds only the status screen and is deleted with the
+  container. Image and container
   `serverext-testenv`, FROM the netsky image. The image has glibc 2.31, so `bf2`, `libdice_py.so`
   and `libserverext.so` must be built in Debian 11; the WSL build will not run there. Set
   `PUBLISH_IP=127.0.0.1` to keep it off the LAN.
@@ -419,8 +423,9 @@ to an empty server ticking on `dalian_2_v_2` for over 5 minutes, in both WSL and
 - Port 16567 is reserved for the author's sessions.
 - The BF2WebAdmin local test environment uses `16569/udp`, gamespy `29901/udp`, RCON
   `127.0.0.1:4721` and WebAdmin `4300`. Do not reuse those either.
-- This project: game `16571/udp`, gamespy `29903/udp`, RCON `127.0.0.1:4723`, bot channel
-  `127.0.0.1:16700`. The server also binds VoIP UDP 55124 and 55126, so two WSL test servers at
+- This project: game `16571/udp`, gamespy `29903/udp`, RCON `127.0.0.1:4723`, bot channel an unused
+  port in `127.0.0.1:16700-16709`. On the author's machine 16700 is held by a stale `wslrelay`, so
+  WSL runs use 16701 and Docker uses 16702. The server also binds VoIP UDP 55124 and 55126, so two WSL test servers at
   once collide.
 
 ### Checks
@@ -621,7 +626,7 @@ fights and a gunner bot. Item 8 overlaps the admin channel's events (`docs/admin
 | Q11 | Button bit table | Answered ([Buttons](#buttons)) |
 
 Still unexercised at runtime: the three R1b guards, the enter-on-spawn path for a bot, yaw and roll
-input, any client connection, and the Docker host. The `[FRONTIER]` comment at `SpawnPoint.cpp:211-214` is stale: the bodies below it are
+input and any client connection. The `[FRONTIER]` comment at `SpawnPoint.cpp:211-214` is stale: the bodies below it are
 implemented.
 
 ## Changing this contract
