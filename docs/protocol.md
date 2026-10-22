@@ -431,8 +431,9 @@ to an empty server ticking on `dalian_2_v_2` for over 5 minutes, in both WSL and
 - The end-to-end check: start the local OpenBF2 server with the module on `dalian_2_v_2`, start
   the bot sidecar, and confirm a bot spawns, enters the heli and holds a hover for 60 seconds.
 
-## v1 (approved 2026-10-22, not implemented yet)
+## v1 (approved and implemented 2026-10-22)
 
+Implemented and tested: `docs/findings/module-v1.md` (OpenBF2 `540fa88`, module `64a7bb3`).
 Changes on top of v0. The protocol version becomes 1, and the module and sidecar move together:
 the module accepts only version 1. Sources: the bf2-bots sidecar's findings
 (`bf2-bots/docs/serverext-backend.md`) and the author's guidance on blocked spawns.
@@ -462,11 +463,18 @@ Entry:
 | `u8` | number of seats |
 | `u32` | bitmask of occupied seats, bit 0 = seat 0 (pilot) |
 
+- "Vehicle" excludes cameras: every player's free camera is a root seat object too. This applies to
+  `VehicleList`, both forms of `EnterVehicle` and the in-vehicle flag in `TickState`.
+- The engine pools vehicle objects. A cleared wreck, or a heli waiting for its spawner, sits at
+  0/0/0 with no armour component (health -1, not flagged destroyed) until it is placed again. All
+  helis are in that state briefly during a level load. The sidecar ignores entries with health -1.
+- Team is 0 for every empty heli, including those on a base's pad, so only position tells whose
+  heli it is.
 - This is the sidecar's only source for a vehicle's type and for empty vehicles. Enemy vehicles
   are raw, like enemy `TickState` entries, and go through the perception filter.
-- Walking every registered object costs about 4 ms. The module must keep its own vehicle set
-  (for example, rebuilt after a level load and updated as vehicles spawn and are destroyed), so
-  that p99 per-tick cost stays under 1 ms.
+- The module keeps its own vehicle set: a full walk at load, then 500 registered objects per tick,
+  so new vehicles appear within about a second. Per-tick cost is p50 70-80 µs and p99 110-150 µs;
+  only ticks that create a bot reach 2-3 ms.
 
 ### Entering vehicles
 
@@ -483,6 +491,13 @@ blocked, the round has to be restarted.
 
 - `CreateBot` succeeds whenever the team has any spawn group, active or not. `Error` 6 now only
   means the team has none, as during a level load.
+- Tested on `dalian_2_v_2`: with the pad full, a bot falls back to the in-heli point after 5 s and is
+  seated in the nearest free seat through the R1b-guarded path. With every group blocked,
+  `SpawnBlocked` follows and `RestartRound` clears it.
+- Timers run only while the round is playing and the bot's respawn delay is over
+  (`IServerExtension::getGameStatus`), so an end-of-round wait never counts as blocked.
+- After a round restart, the engine can spawn two bots on one pad point in the same tick. That is
+  retail behaviour.
 - The module owns the fallback. If a bot waiting to spawn has not spawned within
   `spawnFallbackSeconds` (default 5) of its group becoming its target, the module moves it to the
   team's next active group, nearest to the original group's points first, and cycles through them.
@@ -503,28 +518,57 @@ blocked, the round has to be restarted.
 
 ### On foot
 
-- The bot must walk from a fallback spawn point to its heli. v1 defines what the `SetInput` axes do
-  on foot, and adds two look axes, because a soldier turns by looking.
-- `SetInput` gains two `f32` fields after pedals: look yaw and look pitch, -1..1, in the slots the
-  soldier uses for mouse look. In a vehicle they are written as well, and are 0 when unused.
-- Q10: the module worker establishes, from source, which slots move, strafe and turn a soldier,
-  what range and units the look axes have, and whether they need the same quantization. The
-  answer is recorded here before the sidecar uses it.
+- `SetInput` has two more `f32` fields after pedals: look yaw (`PIMouseLookX` = 4) and look pitch
+  (`PIMouseLookY` = 5), -1..1, validated, clamped and quantized like the other axes. The message is
+  33 bytes.
+- On foot (Q10, answered, `module-v1.md`):
+
+  | Field | Soldier effect | Sign (measured) |
+  |---|---|---|
+  | collective | walk forward and back | + forward |
+  | pedals | strafe | + right |
+  | cyclic pitch, roll | nothing | |
+  | look yaw | turn, about 5° per tick per unit (150°/s at 1.0) | + right (yaw increases) |
+  | look pitch | look up and down, clamped to ±85° | not measured |
+
+- Standing still, the first 40° of a turn moves only the head, and the body follows slowly. Turn
+  while creeping forward to point the body.
+- In a pilot seat the look axes are ignored.
+- Quantization is the contract's choice for human parity. Bot input bypasses the engine's wire
+  codec (`GameServer.cpp:3512`).
 
 ### Buttons
 
-- `SetInput`'s `u32` bitmask is live in v1. Each bit sets one button slot to 1 for that tick, with
-  its mapping bit.
-- Q11: the module worker proposes the bit table from `Input.h` and the `PlayerAction` button table:
-  at least fire, alt fire, the camera-view key, and the weapon selection keys. `PIUse` stays
-  excluded: entering goes through `EnterVehicle`, and the AI `PIUse` path (R1b) is untested. An
-  exit-vehicle button is included only if it does not reach that path.
-- Bits that are not in the table are ignored and logged once.
+`SetInput`'s bitmask is live. A set bit presses the button for the one tick in which that
+`SetInput` is applied; a tick without a new `SetInput` presses nothing. Q11 is answered, with
+evidence in `module-v1.md`.
+
+| Bit | Button | Notes |
+|---|---|---|
+| 0 | fire (`PIFire`) | held while set |
+| 1 | alt fire | |
+| 2 | flares | |
+| 3 | jump (`PIAction`) | on foot |
+| 4 | sprint | |
+| 5 | crouch | while held |
+| 6 | prone | toggles |
+| 7 | reload | |
+| 8 | cycle camera view | cycles every tick while held, so send it for one tick |
+| 9-12 | camera views 1-4 | idempotent |
+| 13-21 | weapon select 1-9 | gas mask and night vision flip every tick while held |
+| 22 | next weapon | |
+| 23 | fire mode | |
+| 24-31 | change to seat 1-8 (F1-F8) | never into an occupied seat |
+
+- There is no exit-vehicle button. The only exit key is `PIUse`, whose enter half takes the
+  untested AI courier path, so it stays excluded. `PIMouseLook` is excluded too: holding it in a
+  pilot seat zeroes the cyclic.
 
 ### Engine
 
-- `IServerExtension` gains, appended, whatever the fallback needs to list a team's spawn groups and
-  each group's position. The OpenBF2 branch is `serverext/r1`.
+- `IServerExtension` gained, appended: `listSpawnGroups(team, SpawnGroupInfo*, capacity)`,
+  `restartRound()` (what `admin.restartMap` runs) and `getGameStatus()`. OpenBF2 branch
+  `serverext/r1`, commit `540fa88`.
 
 ## Later
 
@@ -546,8 +590,8 @@ blocked, the round has to be restarted.
 | Q7 | Does `sv.numPlayersNeededToStart 0` start a round with only bots | Answered: bots spawn with 0 or 2; 0 also starts the timer and tickets |
 | Q8 | Does unrecovered retail code use EventManager category 7 | Open; needs IDA/Ghidra. If yes, use R0 |
 | Q9 | How the netsky and `mm_webadmin` Python treat `ai=1`, `connected=0` players | Open |
-| Q10 | Which slots move, strafe and turn a soldier, and the look axes' range | Open, v1 |
-| Q11 | Button bit table | Open, v1 |
+| Q10 | Which slots move, strafe and turn a soldier, and the look axes' range | Answered ([On foot](#on-foot)); look pitch sign unmeasured |
+| Q11 | Button bit table | Answered ([Buttons](#buttons)) |
 
 Still unexercised at runtime: the three R1b guards, the enter-on-spawn path for a bot, yaw and roll
 input, any client connection, and the Docker host. The `[FRONTIER]` comment at `SpawnPoint.cpp:211-214` is stale: the bodies below it are
