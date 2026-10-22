@@ -204,6 +204,26 @@ bool parseRestartRound(const std::vector<uint8_t>& p, RestartRoundMsg& out)
     return r.done();
 }
 
+bool parseTeleport(const std::vector<uint8_t>& p, TeleportMsg& out)
+{
+    Reader r(p.data(), p.size());
+    out.requestId = r.u32();
+    out.playerId = r.u8();
+    for (int k = 0; k < 3; ++k)
+        out.pos[k] = r.f32();
+    out.yaw = r.f32();
+    return r.done();
+}
+
+bool parseSpot(const std::vector<uint8_t>& p, SpotMsg& out)
+{
+    Reader r(p.data(), p.size());
+    out.requestId = r.u32();
+    out.playerId = r.u8();
+    out.targetId = r.u32();
+    return r.done();
+}
+
 bool isClientMessage(uint16_t type)
 {
     switch (type)
@@ -214,14 +234,20 @@ bool isClientMessage(uint16_t type)
     case MsgRemoveBot:
     case MsgSetInput:
     case MsgRestartRound:
+    case MsgTeleport:
+    case MsgSpot:
         return true;
     default:
         return false;
     }
 }
 
+namespace {
+std::string cut(const std::string& s, size_t n) { return s.size() > n ? s.substr(0, n) : s; }
+}
+
 void encodeWelcome(std::vector<uint8_t>& out, float tickRate, uint32_t tick, const std::string& map,
-                   const std::string& mode)
+                   const std::string& mode, float enterRange, float projectileRange, uint8_t features)
 {
     Writer w(out);
     w.begin(MsgWelcome);
@@ -230,6 +256,99 @@ void encodeWelcome(std::vector<uint8_t>& out, float tickRate, uint32_t tick, con
     w.u32(tick);
     w.str(map);
     w.str(mode);
+    w.f32(enterRange);
+    w.f32(projectileRange);
+    w.u8(features);
+    w.finish();
+}
+
+void encodeProjectileList(std::vector<uint8_t>& out, uint32_t tick, const std::vector<ProjectileEntry>& entries)
+{
+    const size_t n = entries.size() > kMaxProjectiles ? kMaxProjectiles : entries.size();
+    Writer w(out);
+    w.begin(MsgProjectileList);
+    w.u32(tick);
+    w.u8(static_cast<uint8_t>(n));
+    for (size_t i = 0; i < n; ++i)
+    {
+        const ProjectileEntry& e = entries[i];
+        w.u32(e.id);
+        w.str(cut(e.templateName, 255));
+        w.u8(e.owner);
+        w.u8(e.team);
+        w.u8(e.flags);
+        w.u32(e.targetId);
+        for (int k = 0; k < 3; ++k) w.f32(e.pos[k]);
+        for (int k = 0; k < 3; ++k) w.f32(e.vel[k]);
+        w.f32(e.timeToLive);
+    }
+    w.finish();
+}
+
+void encodeDamage(std::vector<uint8_t>& out, const DamageEvent& e)
+{
+    Writer w(out);
+    w.begin(MsgDamage);
+    w.u32(e.tick);
+    w.u8(e.flags);
+    w.u8(e.victim);
+    w.u32(e.victimRootId);
+    w.str(cut(e.victimTemplate, 255));
+    w.u8(e.attacker);
+    w.str(cut(e.weaponTemplate, 255));
+    w.str(cut(e.sourceTemplate, 255));
+    w.f32(e.amount);
+    w.f32(e.before);
+    w.f32(e.after);
+    w.f32(e.max);
+    for (int k = 0; k < 3; ++k) w.f32(e.pos[k]);
+    w.finish();
+}
+
+void encodeKill(std::vector<uint8_t>& out, const KillEvent& e)
+{
+    Writer w(out);
+    w.begin(MsgKill);
+    w.u32(e.tick);
+    w.u8(e.victim);
+    w.u8(e.victimTeam);
+    w.u8(e.attacker);
+    w.u8(e.attackerTeam);
+    w.str(cut(e.weaponTemplate, 255));
+    w.u8(e.flags);
+    w.finish();
+}
+
+void encodeChat(std::vector<uint8_t>& out, uint32_t tick, uint8_t flags, uint8_t sender, uint8_t team, uint8_t channel,
+                const std::string& text)
+{
+    std::string t = cut(text, 255);
+    for (size_t i = 0; i < t.size(); ++i)
+    {
+        const unsigned char c = static_cast<unsigned char>(t[i]);
+        if (c < 0x20 || c == 0x7F)
+            t[i] = '?';
+    }
+    Writer w(out);
+    w.begin(MsgChat);
+    w.u32(tick);
+    w.u8(flags);
+    w.u8(sender);
+    w.u8(team);
+    w.u8(channel);
+    w.str(t);
+    w.finish();
+}
+
+void encodeRoundState(std::vector<uint8_t>& out, uint32_t tick, uint8_t gameStatus, uint8_t beginRoundState,
+                      float timeToNextChange)
+{
+    Writer w(out);
+    w.begin(MsgRoundState);
+    w.u32(tick);
+    w.u8(gameStatus);
+    w.u8(beginRoundState);
+    w.f32(timeToNextChange);
     w.finish();
 }
 
@@ -280,7 +399,22 @@ void encodeError(std::vector<uint8_t>& out, uint32_t requestId, uint16_t code, c
 
 void encodeTickState(std::vector<uint8_t>& out, uint32_t tick, double time, const std::vector<StateEntry>& entries)
 {
-    const size_t n = entries.size() > 255 ? 255 : entries.size();
+    // Keep the payload within kMaxPayload: entries that would pass it are dropped from the end.
+    size_t n = 0;
+    size_t bytes = 4 + 8 + 1;
+    while (n < entries.size() && n < 255)
+    {
+        const StateEntry& e = entries[n];
+        size_t size = 60 + 2;
+        const int wc = e.weaponCount > kMaxWeapons ? kMaxWeapons : e.weaponCount;
+        for (int k = 0; k < wc; ++k)
+            size += 1 + 2 + (e.weapons[k].templateName.size() > 255 ? 255 : e.weapons[k].templateName.size()) + 2 + 2 +
+                    1 + 4 + 4;
+        if (bytes + size > kMaxPayload)
+            break;
+        bytes += size;
+        ++n;
+    }
     Writer w(out);
     w.begin(MsgTickState);
     w.u32(tick);
@@ -299,6 +433,20 @@ void encodeTickState(std::vector<uint8_t>& out, uint32_t tick, double time, cons
         for (int k = 0; k < 3; ++k) w.f32(e.vel[k]);
         for (int k = 0; k < 3; ++k) w.f32(e.angVel[k]);
         w.f32(e.health);
+        w.u8(e.viewMode);
+        const uint8_t wc = e.weaponCount > kMaxWeapons ? kMaxWeapons : e.weaponCount;
+        w.u8(wc);
+        for (int k = 0; k < wc; ++k)
+        {
+            const WeaponState& ws = e.weapons[k];
+            w.u8(ws.slot);
+            w.str(cut(ws.templateName, 255));
+            w.u16(static_cast<uint16_t>(ws.ammoInMag));
+            w.u16(static_cast<uint16_t>(ws.mags));
+            w.u8(ws.flags);
+            w.f32(ws.reloadLeft);
+            w.f32(ws.heat);
+        }
     }
     w.finish();
 }

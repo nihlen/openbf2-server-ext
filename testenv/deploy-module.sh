@@ -9,6 +9,8 @@
 #   WATCHDOG_TICKS  watchdogTicks (6)
 #   ENTER_RANGE, SPAWN_FALLBACK_SECONDS, SPAWN_BLOCKED_SECONDS, ALLOW_ROUND_RESTART
 #                   the v1 keys; written only when set (the module's defaults are 30, 5, 15 and 0)
+#   MAX_CONNECTIONS, ALLOW_TELEPORT, PROJECTILE_RANGE
+#                   the v2 keys; written only when set (defaults 4, 0 and 1000)
 #
 # Writes mods/bf2/openbf2.con ("openbf2.addModDll serverext"), copies the module beside bf2 in
 # bin/amd-64 (dlopen searches $ORIGIN, not the working directory) and writes serverext.cfg in the
@@ -28,5 +30,8 @@ printf '# openbf2-server-ext bot channel (docs/protocol.md)\nbotListen %s\nwatch
 [ -n "${SPAWN_FALLBACK_SECONDS:-}" ] && echo "spawnFallbackSeconds $SPAWN_FALLBACK_SECONDS" >> "$RUN/serverext.cfg"
 [ -n "${SPAWN_BLOCKED_SECONDS:-}" ] && echo "spawnBlockedSeconds $SPAWN_BLOCKED_SECONDS" >> "$RUN/serverext.cfg"
 [ -n "${ALLOW_ROUND_RESTART:-}" ] && echo "allowRoundRestart $ALLOW_ROUND_RESTART" >> "$RUN/serverext.cfg"
+[ -n "${MAX_CONNECTIONS:-}" ] && echo "maxConnections $MAX_CONNECTIONS" >> "$RUN/serverext.cfg"
+[ -n "${ALLOW_TELEPORT:-}" ] && echo "allowTeleport $ALLOW_TELEPORT" >> "$RUN/serverext.cfg"
+[ -n "${PROJECTILE_RANGE:-}" ] && echo "projectileRange $PROJECTILE_RANGE" >> "$RUN/serverext.cfg"
 md5sum "$RUN/bin/amd-64/libserverext.so"
 cat "$RUN/mods/bf2/openbf2.con" "$RUN/serverext.cfg"

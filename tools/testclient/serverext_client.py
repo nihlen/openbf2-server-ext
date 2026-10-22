@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Test client for the openbf2-server-ext bot channel (docs/protocol.md v1).
+"""Test client for the openbf2-server-ext bot channel (docs/protocol.md v2; layouts in docs/findings/module-v2.md).
 
 Python 3 standard library only, so it runs unchanged on Windows and in WSL with no build step.
 
@@ -12,6 +12,8 @@ bot's TickState lines. Survives deaths (re-enters) and map changes (recreates th
   python serverext_client.py --fuzz                                      # hostile input
 
 v1 scenarios (--scenario): walk, buttons, blockpad, allblocked. See docs/findings/module-v1.md.
+v2 scenarios: view, weapons, multiconn, projectiles, damage, spot, round, teleport, soak2; the watchdog
+neutral is q5 with --q5-neutral module. See docs/findings/module-v2.md.
 Q5/Q9 scenarios: q5 (watchdog neutral in flight), q9 (what the server's Python sees). See
 docs/findings/q5-q9.md.
 """
@@ -29,12 +31,16 @@ import time
 HELLO, WELCOME = 0x0001, 0x0002
 CREATE_BOT, BOT_CREATED, ENTER_VEHICLE, REMOVE_BOT, ACK, BOT_REMOVED = 0x0101, 0x0102, 0x0103, 0x0104, 0x0105, 0x0106
 SPAWN_BLOCKED, RESTART_ROUND = 0x0107, 0x0108
+TELEPORT, SPOT = 0x0109, 0x010A
 SET_INPUT, TICK_STATE, VEHICLE_LIST, ERROR = 0x0201, 0x0301, 0x0302, 0xFFFF
+PROJECTILE_LIST, DAMAGE, KILL, CHAT, ROUND_STATE = 0x0303, 0x0304, 0x0305, 0x0306, 0x0307
 NAMES = {HELLO: "Hello", WELCOME: "Welcome", CREATE_BOT: "CreateBot", BOT_CREATED: "BotCreated",
          ENTER_VEHICLE: "EnterVehicle", REMOVE_BOT: "RemoveBot", ACK: "Ack", BOT_REMOVED: "BotRemoved",
          SPAWN_BLOCKED: "SpawnBlocked", RESTART_ROUND: "RestartRound", SET_INPUT: "SetInput",
-         TICK_STATE: "TickState", VEHICLE_LIST: "VehicleList", ERROR: "Error"}
-PROTOCOL_VERSION = 1
+         TICK_STATE: "TickState", VEHICLE_LIST: "VehicleList", ERROR: "Error", TELEPORT: "Teleport", SPOT: "Spot",
+         PROJECTILE_LIST: "ProjectileList", DAMAGE: "Damage", KILL: "Kill", CHAT: "Chat", ROUND_STATE: "RoundState"}
+PROTOCOL_VERSION = 2
+F_ALIVE, F_OWN, F_VEHICLE, F_MANDOWN, F_SPOTTED = 1, 2, 4, 8, 16
 ENTRY = struct.Struct("<BBBBI3f3f3f3ff")
 VEHICLE_TAIL = struct.Struct("<BB3fffBI")   # after the u32 id and the template string
 
@@ -121,15 +127,82 @@ def parse_error(p):
 
 
 def parse_tickstate(p):
+    """v2: each entry is the v1 60 bytes, then u8 view mode, u8 weapon count and the weapons."""
     r = Reader(p)
     tick, t, n = r.take("<I"), r.take("<d"), r.take("<B")
     entries = []
     for _ in range(n):
         v = ENTRY.unpack_from(p, r.p)
         r.p += ENTRY.size
+        view, wc = r.take("<B"), r.take("<B")
+        weapons = []
+        for _ in range(wc):
+            slot = r.take("<B")
+            name = r.str()
+            ammo, mags, wflags, reload_left, heat = r.take("<hhBff")
+            weapons.append(dict(slot=slot, name=name, ammo=ammo, mags=mags, reloading=bool(wflags & 1),
+                                reload_left=reload_left, heat=heat))
         entries.append(dict(id=v[0], flags=v[1], team=v[2], seat=v[3], root=v[4], pos=v[5:8], ypr=v[8:11],
-                            vel=v[11:14], angvel=v[14:17], health=v[17]))
+                            vel=v[11:14], angvel=v[14:17], health=v[17], view=view, weapons=weapons))
+    if r.p != len(p):
+        raise ValueError(f"TickState: {len(p) - r.p} trailing bytes")
     return tick, t, entries
+
+
+def parse_projectiles(p):
+    r = Reader(p)
+    tick, n = r.take("<I"), r.take("<B")
+    out = []
+    for _ in range(n):
+        pid = r.take("<I")
+        name = r.str()
+        owner, team, flags, target = r.take("<BBBI")
+        v = r.take("<7f")
+        out.append(dict(id=pid, name=name, owner=owner if flags & 4 else None, team=team, guided=bool(flags & 1), own=bool(flags & 2),
+                        target=target, pos=v[0:3], vel=v[3:6], ttl=v[6]))
+    return tick, out
+
+
+def parse_damage(p):
+    r = Reader(p)
+    tick, flags, victim, root = r.take("<IBBI")
+    vt = r.str()
+    attacker = r.take("<B")
+    weapon, source = r.str(), r.str()
+    amount, before, after, mx, x, y, z = r.take("<7f")
+    victim = victim if flags & 16 else None
+    attacker = attacker if flags & 32 else None
+    return dict(tick=tick, flags=flags, victim=victim, root=root, victim_template=vt, attacker=attacker, weapon=weapon,
+                source=source, amount=amount, before=before, after=after, max=mx, pos=(x, y, z))
+
+
+def parse_kill(p):
+    r = Reader(p)
+    tick, victim, vteam, attacker, ateam = r.take("<IBBBB")
+    weapon = r.str()
+    flags = r.take("<B")
+    attacker = attacker if flags & 8 else None
+    return dict(tick=tick, victim=victim, victim_team=vteam, attacker=attacker, attacker_team=ateam, weapon=weapon,
+                flags=flags)
+
+
+def parse_chat(p):
+    r = Reader(p)
+    tick, flags, sender, team, channel = r.take("<IBBBB")
+    return dict(tick=tick, sender=sender if flags & 1 else None, team=team, channel=channel, text=r.str())
+
+
+def parse_roundstate(p):
+    tick, status, brs, left = struct.unpack("<IBBf", p)
+    return dict(tick=tick, status=status, begin_round=brs, left=left)
+
+
+def teleport_frame(rid, pid, pos, yaw):
+    return frame(TELEPORT, struct.pack("<IB4f", rid, pid, pos[0], pos[1], pos[2], yaw))
+
+
+def spot_frame(rid, pid, target):
+    return frame(SPOT, struct.pack("<IBI", rid, pid, target))
 
 
 def set_input(pid, tick, pitch, roll, coll, pedals, buttons=0, look_yaw=0.0, look_pitch=0.0):
@@ -165,7 +238,11 @@ def hello(c, name="testclient", version=PROTOCOL_VERSION):
         if t == WELCOME:
             r = Reader(p)
             v, rate, tick, m, mode = r.take("<H"), r.take("<f"), r.take("<I"), r.str(), r.str()
-            log(f"Welcome: protocol {v}, {rate:.0f} Hz, tick {tick}, map '{m}', mode '{mode}'")
+            enter_range, proj_range, features = r.take("<ffB")
+            log(f"Welcome: protocol {v}, {rate:.0f} Hz, tick {tick}, map '{m}', mode '{mode}', enterRange {enter_range:.1f} m, "
+                f"projectileRange {proj_range:.0f} m, features 0x{features:02x}")
+            c.welcome = dict(version=v, tick=tick, map=m, mode=mode, enter_range=enter_range, projectile_range=proj_range,
+                             teleport=bool(features & 1), restart=bool(features & 2))
             return tick
         if t == ERROR:
             raise RuntimeError("Hello refused: %r" % (parse_error(p),))
@@ -453,6 +530,14 @@ class Client:
         self.results = []
         self.before_send = None   # called on each TickState before the SetInputs go out
         self.on_state = None      # called on each TickState after they go out (recording)
+        self.welcome = self.c.welcome
+        self.projectiles = []     # latest ProjectileList entries
+        self.pl_count = 0
+        self.projectile_seen = {} # id -> first entry seen
+        self.damages = []         # v2 events, in arrival order
+        self.kills = []
+        self.chats = []
+        self.rounds = []
 
     def next_req(self):
         self.req += 1
@@ -489,6 +574,21 @@ class Client:
             _, vs = parse_vehiclelist(p)
             self.vehicles = {v["id"]: v for v in vs}
             self.vl_count += 1
+        elif t == PROJECTILE_LIST:
+            _, self.projectiles = parse_projectiles(p)
+            self.pl_count += 1
+            for e in self.projectiles:
+                self.projectile_seen.setdefault(e["id"], e)
+        elif t == DAMAGE:
+            self.damages.append(parse_damage(p))
+        elif t == KILL:
+            self.kills.append(parse_kill(p))
+        elif t == CHAT:
+            self.chats.append(parse_chat(p))
+            log(f"Chat: {self.chats[-1]}")
+        elif t == ROUND_STATE:
+            self.rounds.append(parse_roundstate(p))
+            log(f"RoundState: {self.rounds[-1]}")
         elif t == BOT_CREATED:
             rid, pid = struct.unpack("<IB", p)
             self.replies[rid] = ("created", pid)
@@ -543,6 +643,16 @@ class Client:
 
     def restart(self):
         rid = self.send_req(RESTART_ROUND, b"")
+        return self.wait_reply(rid)
+
+    def teleport(self, bot, pos, yaw):
+        rid = self.next_req()
+        self.c.send(teleport_frame(rid, bot, pos, yaw))
+        return self.wait_reply(rid)
+
+    def spot(self, bot, target):
+        rid = self.next_req()
+        self.c.send(spot_frame(rid, bot, target))
         return self.wait_reply(rid)
 
     def alive(self, bot):
@@ -1569,6 +1679,595 @@ SCENARIOS = {"wreck": run_wreck, "walk": run_walk, "buttons": run_buttons, "bloc
              "q9": run_q9, "q5": run_q5, "teamswitch": run_teamswitch}
 
 
+# ------------------------------------------------------------------------------------- v2 scenarios
+# docs/findings/module-v2.md. Every shot in these scenarios goes into empty ground or the sea away
+# from both bases, or between two bots of this client; nothing else is ever targeted.
+
+MAP_CENTER = (19.0, 0.0, -57.0)     # midway between the dalian_2_v_2 bases
+
+
+def ensure_boarded(cl, bot, team, label, seat=0, vehicle_id=None, spinup=5.0):
+    """Waits until the bot is alive, then boards the nearest usable heli (or vehicle_id) in seat.
+    Returns True when seated."""
+    for attempt in range(4):
+        if cl.in_vehicle(bot) and cl.states[bot]["seat"] == seat:
+            return True
+        if not cl.wait_alive(bot, 40.0):
+            log(f"{label}: bot {bot} never spawned")
+            return False
+        cl.run_for(1.0, lambda: cl.vl_count > 0)
+        if vehicle_id is None:
+            kind, data = board(cl, bot, team, label) if seat == 0 else ("error", "no seat")
+        else:
+            v = cl.vehicles.get(vehicle_id)
+            e = cl.states.get(bot)
+            if v and e and flat_dist(v["pos"], e["pos"]) > 7.0:
+                walk_to(cl, bot, v["pos"], 7.0, label=label)
+            kind, data = cl.enter(bot, vehicle_id, seat)
+        log(f"{label}: EnterVehicle -> {kind} {data}")
+        if kind == "ack":
+            cl.inputs[bot] = {}
+            cl.run_for(spinup)
+            return True
+        cl.run_for(3.0)
+    return False
+
+
+def fly_bots(cl, plans, seconds, until=None):
+    """Flies several bots at once. plans: bot -> (Autopilot, mode dict or f(e, t) -> dict, buttons f(t) or None).
+    Returns 'ready' when until() holds, else 'timeout'."""
+    t0 = time.time()
+
+    def ctl():
+        t = time.time() - t0
+        for bot, (ap, mode, buttons) in plans.items():
+            e = cl.states.get(bot)
+            if not (e and cl.in_vehicle(bot)):
+                cl.inputs[bot] = {}
+                continue
+            m = mode(e, t) if callable(mode) else mode
+            cp, cr, c, ped = ap.step(e, cl.tick, **m)
+            cl.inputs[bot] = dict(pitch=cp, roll=cr, coll=c, ped=ped, buttons=buttons(t) if buttons else 0)
+
+    cl.before_send = ctl
+    try:
+        end = t0 + seconds
+        while time.time() < end:
+            cl.pump(0.2)
+            if until and until():
+                return "ready"
+        return "timeout"
+    finally:
+        cl.before_send = None
+        for bot in plans:
+            cl.inputs[bot] = {}
+
+
+def climb_to(cl, bot, ap, alt, label, heading=None, timeout=60.0):
+    r = fly(cl, bot, ap, dict(alt=alt, heading=heading),
+            until=steady(lambda e, t: abs(e["pos"][1] - alt) < 4.0 and math.sqrt(sum(c * c for c in e["vel"])) < 3.0, 2.0),
+            timeout=timeout)
+    log(f"{label}: climb to {alt:.0f}: {r}")
+    return r == "ready"
+
+
+def seaward(pos):
+    """Heading from the map centre through pos, i.e. away from the other base."""
+    return bearing(MAP_CENTER, pos)
+
+
+def run_view(args):
+    """Items 1 and 2: Welcome carries enterRange; TickState's view mode follows every camera key."""
+    cl = Client(args, "serverext testclient view")
+    w = cl.welcome
+    cl.check(f"Welcome v2: enterRange {w['enter_range']:.1f} m, projectileRange {w['projectile_range']:.0f} m, "
+             f"teleport {w['teleport']}, restart {w['restart']}", w["version"] == 2 and w["enter_range"] > 0)
+    if args.enter_range:
+        cl.check(f"Welcome enterRange equals serverext.cfg ({args.enter_range})", abs(w["enter_range"] - args.enter_range) < 0.01)
+    bot = cl.create_bot(args.name, args.team)
+    cl.check("bot spawned", cl.wait_alive(bot))
+    cl.run_for(1.0)
+    e = cl.states[bot]
+    log(f"on foot: view mode {e['view']}, weapons {[w['name'] for w in e['weapons']]}")
+    if not cl.check("boarded a heli", ensure_boarded(cl, bot, args.team, "view", spinup=1.0)):
+        return cl.finish()
+    cl.check(f"in the pilot seat the view mode starts at 1 (inside), got {cl.states[bot]['view']}", cl.states[bot]["view"] == 1)
+    # Expected modes from module-v1.md (Q11): toggle cycles 1 -> 2 -> 3, then mode keys 1/2/3/4 give 1/3/4/5.
+    steps = [("toggle camera", BTN_TOGGLE_CAMERA, 2), ("toggle camera", BTN_TOGGLE_CAMERA, 3),
+             ("camera mode 1", BTN_CAMERA_MODE[0], 1), ("camera mode 2", BTN_CAMERA_MODE[1], 3),
+             ("camera mode 3", BTN_CAMERA_MODE[2], 4), ("camera mode 4", BTN_CAMERA_MODE[3], 5),
+             ("camera mode 1", BTN_CAMERA_MODE[0], 1)]
+    for label, b, want in steps:
+        cl.pulses[bot] = b
+        sent = cl.tick
+        cl.run_for(1.0)
+        got = cl.states[bot]["view"]
+        cl.check(f"{label} (pulse after tick {sent}): TickState view mode {got}, want {want}", got == want)
+    return cl.finish()
+
+
+def run_weapons(args):
+    """Items 4 and 5: weapon state of a pilot (rockets), then rockets fired nose-down into empty ground
+    seaward of the base: rounds drop, the magazine reloads, ProjectileList shows the rockets as own. With
+    --tv, a second bot in the gunner seat fires the guided missile the same way."""
+    cl = Client(args, "serverext testclient weapons")
+    pilot = cl.create_bot(args.name, args.team)
+    gunner = cl.create_bot(args.name + " gunner", args.team) if args.tv else None
+    cl.check("pilot spawned", cl.wait_alive(pilot))
+    e = cl.states[pilot]
+    cl.check(f"on foot the bot has weapons: {[(w['slot'], w['name'], w['ammo'], w['mags']) for w in e['weapons']]}",
+             len(e["weapons"]) > 0)
+    if not cl.check("pilot boarded", ensure_boarded(cl, pilot, args.team, "pilot")):
+        return cl.finish()
+    heli = cl.states[pilot]["root"]
+    if gunner is not None:
+        cl.check("gunner boarded seat 1", ensure_boarded(cl, gunner, args.team, "gunner", seat=1, vehicle_id=heli, spinup=0.5))
+    ws = cl.states[pilot]["weapons"]
+    log(f"pilot weapons: {ws}")
+    if gunner is not None:
+        log(f"gunner weapons: {cl.states[gunner]['weapons'] if gunner in cl.states else None}")
+        cl.pulses[gunner] = BTN_WEAPON[1]     # the gunner's second weapon: the guided missile
+        cl.run_for(1.0)
+        log(f"gunner weapons after weapon select 2: {cl.states[gunner]['weapons'] if gunner in cl.states else None}")
+    cl.check("the pilot seat reports at least one weapon", len(ws) > 0)
+    # Select weapon 1 (rockets) for one tick.
+    cl.pulses[pilot] = BTN_WEAPON[0]
+    cl.run_for(1.0)
+    w0 = next((w for w in cl.states[pilot]["weapons"] if w["slot"] == 0), None)
+    if not cl.check(f"slot 0 weapon after weapon select 1: {w0}", w0 is not None):
+        return cl.finish()
+    pad = cl.states[pilot]["pos"]
+    hdg = seaward(pad)
+    ap = Autopilot()
+    if not climb_to(cl, pilot, ap, pad[1] + 45.0, "weapons", heading=hdg):
+        return cl.finish()
+    ammo0 = next(w for w in cl.states[pilot]["weapons"] if w["slot"] == 0)
+    log(f"before firing: {ammo0}, heading {cl.states[pilot]['ypr'][0]:.0f} (seaward {hdg:.0f})")
+    seen_before = set(cl.projectile_seen)
+    # Nose 15 degrees down, hold altitude, fire for 4 s.
+    track = []
+
+    def rec():
+        w = next((w for w in cl.states[pilot]["weapons"] if w["slot"] == 0), None) if pilot in cl.states else None
+        if w:
+            track.append((time.time(), w["ammo"], w["mags"], w["reloading"], w["reload_left"]))
+    cl.on_state = rec
+    # The pods fire once per press: pulse the trigger, 3 ticks on, 3 off.
+    plans = {pilot: (ap, lambda e, t: dict(alt=pad[1] + 45.0, pitch_cmd=15.0, heading=hdg),
+                     lambda t: BTN_FIRE if 1.5 < t < 5.5 and cl.tick % 6 < 3 else 0)}
+    if gunner is not None:
+        # Fire, then alt fire, a few pulses each: whichever slot holds the missile launches it.
+        plans[gunner] = (Autopilot(), dict(idle=True),
+                         lambda t: BTN_FIRE if 1.0 < t < 3.0 else (BTN_ALT_FIRE if 3.5 < t < 5.0 else 0))
+    fly_bots(cl, plans, 7.0)
+    # Level off and hover while the rockets land and the magazine reloads.
+    fly_bots(cl, {pilot: (ap, dict(alt=pad[1] + 45.0, heading=hdg), None)}, 14.0)
+    cl.on_state = None
+    new = [p for i, p in cl.projectile_seen.items() if i not in seen_before]
+    own = [p for p in new if p["own"]]
+    names = sorted(set(p["name"] for p in new))
+    log(f"projectiles seen: {len(new)} new ({len(own)} own), templates {names}, ProjectileLists {cl.pl_count}")
+    for p in new[:5]:
+        log(f"  {p}")
+    cl.check("ProjectileList reported the bot's rockets as own projectiles", len(own) > 0)
+    cl.check("every new projectile is owned by one of this client's bots",
+             all(p["owner"] in (pilot, gunner) for p in new))
+    if new:
+        p = new[0]
+        cl.check(f"projectile has a template, team {p['team']}, speed {math.sqrt(sum(v * v for v in p['vel'])):.0f} m/s",
+                 p["name"] != "" and p["team"] == args.team)
+    if gunner is not None:
+        guided = [p for p in new if p["guided"]]
+        cl.check(f"the gunner's missile is reported as guided ({len(guided)}: {sorted(set(p['name'] for p in guided))})", guided)
+    ammos = [a for _, a, _, _, _ in track]
+    if ammos:
+        log(f"slot 0 rounds over the run: first {ammos[0]}, min {min(ammos)}, last {ammos[-1]}; mags {track[0][2]} -> {track[-1][2]}")
+        cl.check("rounds in the magazine dropped while firing", min(ammos) < ammos[0])
+        reloads = [r for r in track if r[3]]
+        if reloads:
+            lefts = [round(r[4], 2) for r in reloads]
+            log(f"reload_left over the reload ({len(lefts)} ticks): {lefts[:5]} ... {lefts[-5:]}")
+            peak = lefts.index(max(lefts))
+            cl.check(f"reloading reported, reload_left falling from {max(lefts):.2f} to {lefts[-1]:.2f}",
+                     max(lefts) > 0.5 and lefts[-1] < 0.2 and all(a >= b for a, b in zip(lefts[peak:], lefts[peak + 1:])))
+            cl.check("magazine count dropped after the reload", track[-1][2] < track[0][2] or track[-1][1] > min(ammos))
+        else:
+            log("no reload during the run (the magazine was not emptied)")
+    cl.check(f"ProjectileList went empty again (last list has {len(cl.projectiles)})", len(cl.projectiles) == 0)
+    return cl.finish()
+
+
+def run_damage(args):
+    """Items 8 and 10, between this client's own bots only. Needs allowTeleport 1.
+    1. Rifle at an occupied heli: B (team 2) sits in its pad's heli; A (team 1) is teleported 15 m in
+       front of it and fires. Damage events carry both own flags and the heli's hit points.
+    2. Rockets at a soldier: A pilots team 1's heli, turned seaward where it stands; C (team 2, on foot)
+       is teleported 20 m ahead of its nose. A fires rockets: Damage and Kill with A as attacker, and
+       C's man-down bit while its alive flag is still set.
+    3. With --crash, A crashes the heli: Damage and Kill without an attacker."""
+    cl = Client(args, "serverext testclient damage")
+    a = cl.create_bot(args.name + " A", 1)
+    b = cl.create_bot(args.name + " B", 2)
+    cl.check("A and B spawned", cl.wait_alive(a) and cl.wait_alive(b))
+
+    # 1. Rifle at B's heli.
+    if cl.check("B boarded its pad's heli", ensure_boarded(cl, b, 2, "B", spinup=1.0)):
+        eb = cl.states[b]
+        yb = math.radians(eb["ypr"][0])
+        stand = (eb["pos"][0] + 15.0 * math.sin(yb), eb["pos"][1] + 1.0, eb["pos"][2] + 15.0 * math.cos(yb))
+        kind, data = cl.teleport(a, stand, eb["ypr"][0] + 180.0)
+        cl.check(f"A teleported 15 m in front of B's heli: {kind} {data}", kind == "ack")
+        cl.run_for(1.5)
+        e = cl.states[a]
+        log(f"A -> B's heli: {flat_dist(e['pos'], eb['pos']):.1f} m, facing error "
+            f"{wrap180(bearing(e['pos'], eb['pos']) - e['ypr'][0]):+.1f}, A's weapons {e['weapons']}")
+        n0 = len(cl.damages)
+        n = [0]
+
+        def burst():
+            n[0] += 1
+            cl.inputs[a] = dict(buttons=BTN_FIRE if n[0] % 6 < 3 else 0)
+        cl.before_send = burst
+        cl.run_for(8.0)
+        cl.before_send = None
+        cl.inputs[a] = {}
+        cl.run_for(1.0)
+        hits = [d for d in cl.damages[n0:] if d["root"] == eb["root"]]
+        log(f"Damage events on B's heli: {len(hits)}; first {hits[0] if hits else None}")
+        if cl.check("Damage events for B's heli arrived", hits):
+            d = hits[0]
+            cl.check(f"Damage on the heli: flags 0x{d['flags']:02x} (victim own, attacker own), victim player {d['victim']}, "
+                     f"attacker {d['attacker']}, weapon '{d['weapon']}', {d['before']:.1f} -> {d['after']:.1f} of {d['max']:.1f}",
+                     d["flags"] & 3 == 3 and d["victim"] == b and d["attacker"] == a and d["weapon"] != ""
+                     and d["before"] > d["after"])
+            cl.check(f"the last hit's 'after' matches TickState health ({hits[-1]['after'] / hits[-1]['max']:.3f} vs "
+                     f"{cl.states[b]['health']:.3f})", abs(hits[-1]["after"] / hits[-1]["max"] - cl.states[b]["health"]) < 0.02)
+
+    # 2. Rockets at C.
+    c = cl.create_bot(args.name + " C", 2)
+    cl.check("C spawned", cl.wait_alive(c))
+    cl.remove(a)
+    a = cl.create_bot(args.name + " A", 1)
+    if not cl.check("A boarded team 1's heli", ensure_boarded(cl, a, 1, "A")):
+        return cl.finish()
+    e = cl.states[a]
+    hdg = seaward(e["pos"])
+    kind, data = cl.teleport(a, (e["pos"][0], e["pos"][1] + 0.5, e["pos"][2]), hdg)
+    cl.check(f"A's heli turned seaward ({hdg:.0f}) where it stands: {kind} {data}", kind == "ack")
+    cl.run_for(2.0)
+    flags_seen = []
+    cl.on_state = lambda: flags_seen.append((time.time(), cl.states[c]["flags"], cl.states[c]["pos"])) if c in cl.states else None
+    n0, k0 = len(cl.damages), len(cl.kills)
+    cl.pulses[a] = BTN_WEAPON[0]
+    cl.run_for(0.5)
+    for gap in (args.damage_gap, args.damage_gap * 0.7, args.damage_gap * 0.5):
+        if not cl.alive(c) or cl.states[c]["flags"] & F_MANDOWN:
+            break
+        e = cl.states[a]
+        yr = math.radians(e["ypr"][0])
+        target = (e["pos"][0] + gap * math.sin(yr), e["pos"][1] + 0.5, e["pos"][2] + gap * math.cos(yr))
+        kind, data = cl.teleport(c, target, e["ypr"][0] + 180.0)
+        cl.check(f"C teleported {gap:.0f} m ahead of A's nose: {kind} {data}", kind == "ack")
+        cl.run_for(1.5)
+        f = cl.states[c]
+        w = next((w for w in e["weapons"] if w["slot"] == 0), None)
+        log(f"A -> C: {flat_dist(e['pos'], f['pos']):.1f} m, height {f['pos'][1] - e['pos'][1]:+.1f}, rockets {w}")
+        t0 = time.time()
+        # The pod fires once per press: pulse the trigger, 3 ticks on, 3 off.
+        cl.before_send = lambda: cl.inputs.__setitem__(
+            a, dict(buttons=BTN_FIRE if (time.time() - t0 < 3.0 and cl.tick % 6 < 3 and cl.alive(c)
+                                         and not (cl.states[c]["flags"] & F_MANDOWN)) else 0))
+        cl.run_for(6.0, lambda: not cl.alive(c) or cl.states[c]["flags"] & F_MANDOWN)
+        cl.before_send = None
+        cl.inputs[a] = {}
+    cl.run_for(args.mandown_wait, lambda: not cl.alive(c) or (flags_seen and not flags_seen[-1][1] & F_MANDOWN
+                                                              and any(fl & F_MANDOWN for _, fl, _ in flags_seen)))
+    cl.run_for(1.0)
+    cl.on_state = None
+    dmg = [d for d in cl.damages[n0:] if d["victim"] == c]
+    kills = [k for k in cl.kills[k0:] if k["victim"] == c]
+    log(f"Damage events with victim C: {len(dmg)}; first {dmg[0] if dmg else None}; kills {kills}")
+    cl.check("C was killed by the rockets", kills)
+    if cl.check("Damage events for C arrived", dmg):
+        d = dmg[0]
+        cl.check(f"Damage on C: flags 0x{d['flags']:02x}, attacker {d['attacker']}, weapon '{d['weapon']}', source "
+                 f"'{d['source']}', {d['before']:.1f} -> {d['after']:.1f} of {d['max']:.1f}",
+                 d["flags"] & 3 == 3 and d["attacker"] == a and d["before"] > d["after"])
+    if kills:
+        k = kills[0]
+        cl.check(f"Kill: attacker {k['attacker']} team {k['attacker_team']}, weapon '{k['weapon']}', flags 0x{k['flags']:02x}",
+                 k["attacker"] == a and k["flags"] & 3 == 3 and not k["flags"] & 4)
+    md = [(t, fl, pos) for t, fl, pos in flags_seen if fl & F_MANDOWN]
+    if md:
+        # With sv.spawnTime <= sv.manDownTime the engine kills and respawns the bot in one tick, so the
+        # alive flag may never read 0: the end of man-down is the bit dropping, at a spawn point.
+        t_md, _, pos_md = md[0]
+        after = [(t, fl, pos) for t, fl, pos in flags_seen if t > md[-1][0]]
+        end = after[0] if after else None
+        moved = flat_dist(end[2], pos_md) if end else 0.0
+        cl.check(f"C's man-down bit was set with the alive flag, for {(end[0] - t_md) if end else -1:.1f} s",
+                 all(fl & F_ALIVE for _, fl, _ in md) and end is not None)
+        if end:
+            log(f"after man-down: flags 0x{end[1]:02x}, moved {moved:.0f} m (alive 0 seen: "
+                f"{any(not fl & F_ALIVE for _, fl, _ in after)})")
+            cl.check(f"then C died and respawned: alive flag cleared, or moved {moved:.0f} m to a spawn point in the same tick",
+                     any(not fl & F_ALIVE for _, fl, _ in after) or moved > 30.0)
+    else:
+        cl.check(f"C's man-down bit seen (flags seen {sorted(set(fl for _, fl, _ in flags_seen))})", False)
+
+    # 3. A crash.
+    if args.crash:
+        cl.run_for(1.0)
+        if ensure_boarded(cl, a, 1, "crash"):
+            n0 = len(cl.kills)
+            died = crash(cl, a, "crash")
+            cl.run_for(1.0)
+            k = [k for k in cl.kills[n0:] if k["victim"] == a]
+            cl.check(f"crash: Kill with no attacker {k[:1]}", died and k and k[0]["attacker"] is None)
+            cd = [d for d in cl.damages if d["victim"] == a and d["attacker"] is None]
+            cl.check(f"crash: Damage with no attacker ({len(cd)}), victim-own flag", cd and cd[-1]["flags"] & 1)
+    return cl.finish()
+
+
+def run_spot(args):
+    """Item 6: A spots B (other team); B's entry carries the spotted bit for about 12 s. Refusals: an own
+    team target, a second spot within a second, an unknown id. Needs allowTeleport 1 to bring B close."""
+    cl = Client(args, "serverext testclient spot")
+    a = cl.create_bot(args.name + " A", 1)
+    b = cl.create_bot(args.name + " B", 2)
+    a2 = cl.create_bot(args.name + " A2", 1)
+    cl.check("bots spawned", cl.wait_alive(a) and cl.wait_alive(b) and cl.wait_alive(a2))
+    cl.run_for(1.0)
+    ea = cl.states[a]
+    kind, data = cl.teleport(b, (ea["pos"][0] + 25.0, ea["pos"][1] + 1.0, ea["pos"][2]), 270.0)
+    cl.check(f"teleport B 25 m from A: {kind}", kind == "ack")
+    cl.run_for(2.0)
+    eb = cl.states[b]
+    cl.check(f"B not spotted before (flags 0x{eb['flags']:02x})", not eb["flags"] & F_SPOTTED)
+    kind, data = cl.spot(a, eb["root"])
+    cl.check(f"A spots B (root {eb['root']}): {kind} {data}", kind == "ack")
+    t0 = time.time()
+    got = cl.run_for(2.0, lambda: cl.states[b]["flags"] & F_SPOTTED)
+    cl.check(f"B's TickState entry has the spotted bit after {time.time() - t0:.2f} s", got)
+    kind, data = cl.spot(a, eb["root"])
+    cl.check(f"a second spot within a second is refused: {kind} {data}", kind == "error" and data[0] == 6)
+    cl.run_for(1.1)
+    kind, data = cl.spot(a, cl.states[a2]["root"])
+    cl.check(f"spotting a teammate is refused: {kind} {data}", kind == "error" and data[0] == 5)
+    cl.run_for(1.1)
+    kind, data = cl.spot(a, 65000)
+    cl.check(f"spotting an unknown id is refused: {kind} {data}", kind == "error" and data[0] == 5)
+    cl.check("A's own entry is not spotted", not cl.states[a]["flags"] & F_SPOTTED)
+    t_clear = time.time()
+    cleared = cl.run_for(16.0, lambda: not cl.states[b]["flags"] & F_SPOTTED)
+    cl.check(f"the spotted bit cleared {time.time() - t0:.1f} s after the spot", cleared and 10.0 < time.time() - t0 < 15.0)
+    return cl.finish()
+
+
+def run_round(args):
+    """Item 7: RoundState after Welcome and on a round restart; server chat (game.sayAll / sayTeam
+    over RCON) arrives as Chat. Needs --rcon-password and allowRoundRestart 1."""
+    cl = Client(args, "serverext testclient round")
+    cl.run_for(1.0, lambda: cl.rounds)
+    cl.check(f"RoundState after Welcome: {cl.rounds[:1]}", cl.rounds)
+    bot = cl.create_bot(args.name, 1)
+    cl.wait_alive(bot)
+    rc = Rcon("127.0.0.1", args.rcon_port, args.rcon_password)
+    rc('exec game.sayAll "rdy"')
+    rc('exec game.sayTeam 1 "go"')
+    rc('exec game.sayTeam 2 "other team only"')
+    cl.run_for(2.0, lambda: len(cl.chats) >= 2)
+    texts = [(c["channel"], c["team"], c["text"]) for c in cl.chats]
+    cl.check(f"Chat: sayAll 'rdy' on channel 12: {texts}", any(c[0] == 12 and c[2] == "rdy" for c in texts))
+    cl.check("Chat: sayTeam 1 'go' on channel 13, team 1", any(c[0] == 13 and c[1] == 1 and c[2] == "go" for c in texts))
+    cl.check("Chat: team 2's message not sent (no bot on team 2)", not any(c[2] == "other team only" for c in texts))
+    n = len(cl.rounds)
+    kind, data = cl.restart()
+    cl.check(f"RestartRound: {kind} {data}", kind == "ack")
+    cl.run_for(8.0)
+    changes = cl.rounds[n:]
+    cl.check(f"RoundState changes after the restart: {[(r['status'], r['begin_round']) for r in changes]}", changes)
+    return cl.finish()
+
+
+def run_teleport(args):
+    """Item 9: teleport on foot and in a heli; values out of range are Error 7. With
+    --expect-teleport-refused the server has allowTeleport 0 and every Teleport is Error 6."""
+    cl = Client(args, "serverext testclient teleport")
+    bot = cl.create_bot(args.name, args.team)
+    cl.check("bot spawned", cl.wait_alive(bot))
+    cl.run_for(1.0)
+    e = cl.states[bot]
+    if args.expect_teleport_refused or not cl.welcome["teleport"]:
+        kind, data = cl.teleport(bot, e["pos"], 0.0)
+        cl.check(f"Teleport refused with allowTeleport 0: {kind} {data}", kind == "error" and data[0] == 6)
+        return cl.finish()
+    target = (e["pos"][0] + 40.0, e["pos"][1] + 2.0, e["pos"][2] + 10.0)
+    kind, data = cl.teleport(bot, target, 90.0)
+    cl.check(f"teleport on foot: {kind} {data}", kind == "ack")
+    cl.run_for(1.5)
+    e = cl.states[bot]
+    cl.check(f"on foot: now {flat_dist(e['pos'], target):.2f} m from the target (horizontal)", flat_dist(e["pos"], target) < 1.5)
+    for label, pos, yaw in [("NaN", (float("nan"), 0, 0), 0.0), ("inf yaw", e["pos"], float("inf")),
+                            ("x 9000", (9000.0, 100.0, 0.0), 0.0), ("y -2000", (0.0, -2000.0, 0.0), 0.0)]:
+        kind, data = cl.teleport(bot, pos, yaw)
+        cl.check(f"teleport {label}: {kind} {data}", kind == "error" and data[0] == 7)
+    kind, data = cl.teleport(200, e["pos"], 0.0)
+    cl.check(f"teleport a foreign player: {kind} {data}", kind == "error" and data[0] == 4)
+    # Walk back is not needed: board the nearest heli from the spawn instead.
+    cl.remove(bot)
+    bot = cl.create_bot(args.name, args.team)
+    if not cl.check("boarded a heli", ensure_boarded(cl, bot, args.team, "teleport")):
+        return cl.finish()
+    e = cl.states[bot]
+    up = (e["pos"][0], e["pos"][1] + 120.0, e["pos"][2])
+    hdg = seaward(e["pos"])
+    kind, data = cl.teleport(bot, up, hdg)
+    cl.check(f"teleport the heli 120 m up, yaw {hdg:.0f}: {kind} {data}", kind == "ack")
+    cl.run_for(0.3)
+    e = cl.states[bot]
+    hspeed = math.hypot(e["vel"][0], e["vel"][2])
+    cl.check(f"heli at {e['pos'][1] - up[1]:+.1f} m from the target height, yaw {e['ypr'][0]:.1f}, pitch {e['ypr'][1]:.1f}, "
+             f"roll {e['ypr'][2]:.1f}, horizontal speed {hspeed:.1f} m/s, vertical {e['vel'][1]:+.1f} m/s (falling from "
+             f"rest), still seat {e['seat']}",
+             abs(e["pos"][1] - up[1]) < 5.0 and abs(wrap180(e["ypr"][0] - hdg)) < 3.0 and abs(e["ypr"][1]) < 3.0 and
+             hspeed < 3.0 and cl.in_vehicle(bot))
+    # Hover there, then land back with the watchdog: stop sending and let the neutral hold it.
+    ap = Autopilot()
+    climb_to(cl, bot, ap, up[1], "teleport hover", heading=hdg, timeout=20.0)
+    return cl.finish()
+
+
+def run_multiconn(args):
+    """Item 3: several connections, each with its own bot. Foreign bots are refused (Error 4), the
+    connection after maxConnections is closed without a frame, and closing one connection removes only
+    its bots."""
+    a = Client(args, "serverext testclient conn A")
+    b = Client(args, "serverext testclient conn B")
+    ba = a.create_bot(args.name + " A", 1)
+    bb = b.create_bot(args.name + " B", 2)
+    a.check("A's bot spawned", a.wait_alive(ba))
+    b.check("B's bot spawned", b.wait_alive(bb))
+    a.run_for(0.5)
+    b.run_for(0.5)
+    a.check(f"A's TickState has its bot as own and not B's on-foot bot ({sorted(a.states)})", ba in a.states and bb not in a.states)
+    b.check(f"B's TickState has its bot as own ({sorted(b.states)})", bb in b.states and ba not in b.states)
+    # B tries to drive, enter with, teleport, spot with and remove A's bot.
+    b.c.send(set_input(ba, b.tick or 0, 0, 0, 0, 0))
+    b.run_for(1.0, lambda: 0 in b.replies)
+    kind, data = b.replies.pop(0, ("timeout", None))
+    b.check(f"B SetInput for A's bot: {kind} {data}", kind == "error" and data[0] == 4)
+    kind, data = b.enter(ba, 0, 0)
+    b.check(f"B EnterVehicle with A's bot: {kind} {data}", kind == "error" and data[0] == 4)
+    rid = b.next_req()
+    b.c.send(frame(REMOVE_BOT, struct.pack("<IB", rid, ba)))
+    kind, data = b.wait_reply(rid)
+    b.check(f"B RemoveBot of A's bot: {kind} {data}", kind == "error" and data[0] == 4)
+    kind, data = b.spot(ba, 1)
+    b.check(f"B Spot with A's bot: {kind} {data}", kind == "error" and data[0] == 4)
+    a.run_for(0.5)
+    a.check("A's bot still exists", ba in a.states)
+    # Fill the remaining connection slots; one more is closed without a frame.
+    extra = []
+    for i in range(args.max_connections - 2):
+        c = Conn(args.host, args.port)
+        hello(c, f"conn extra {i}")
+        extra.append(c)
+    over = Conn(args.host, args.port)
+    try:
+        f = over.recv_frame(timeout=2.0)
+        a.check(f"connection {args.max_connections + 1} closed: still open after 2 s ({f!r})", False)
+    except (ConnectionError, OSError):
+        a.check(f"connection {args.max_connections + 1} closed by the server with no frame", True)
+    over.close()
+    for c in extra:
+        c.close()
+    # A's connection closes; its bot goes after the watchdog period, B's stays.
+    a.c.close()
+    b.run_for(2.0)
+    b.check("B's bot still alive after A disconnected", b.alive(bb))
+    c = Client(args, "serverext testclient conn C")
+    bc = c.create_bot(args.name + " C", 1)
+    c.check(f"a new connection gets its own bot ({bc})", c.wait_alive(bc))
+    t0 = b.tick
+    b.run_for(1.0)
+    b.check(f"B's connection still gets TickStates (tick {t0} -> {b.tick})", b.tick and t0 and b.tick > t0)
+    return max(finish_counts("connection A", a.results), b.finish(), c.finish())
+
+
+def finish_counts(label, results):
+    bad = sum(1 for _, ok in results if not ok)
+    print(f"{label}: {len(results) - bad}/{len(results)} checks passed", flush=True)
+    return 1 if bad else 0
+
+
+def run_soak2(args):
+    """10-minute soak with two bots and all v2 state: A (team 1) and B (team 2) hover over their pads;
+    every 30 s A spots B (B is within range once both climb), every 45 s both cycle their camera views,
+    every 60 s A fires a one-tick rocket seaward. Prints a per-minute summary."""
+    cl = Client(args, "serverext testclient soak2")
+    a = cl.create_bot(args.name + " A", 1)
+    b = cl.create_bot(args.name + " B", 2)
+    aps = {a: Autopilot(), b: Autopilot()}
+    teams = {a: 1, b: 2}
+    pads = {}
+    heads = {}
+    stats = dict(ts=0, gaps=0, last=None, deaths=0, boards=0, spots=0, spot_err=0)
+    t_end = time.time() + args.soak_seconds
+    t_next_min = time.time() + 60
+    t_spot = time.time() + 30
+    t_view = time.time() + 45
+    t_fire = time.time() + 60
+
+    def on_state():
+        stats["ts"] += 1
+        if stats["last"] is not None and cl.tick != stats["last"] + 1:
+            stats["gaps"] += 1
+        stats["last"] = cl.tick
+
+    def ctl():
+        now = time.time()
+        for bot, ap in aps.items():
+            e = cl.states.get(bot)
+            if not (e and cl.in_vehicle(bot) and bot in pads):
+                continue
+            buttons = 0
+            if bot == a and t_fire_now[0]:
+                buttons |= BTN_FIRE
+            cp, cr, c, ped = ap.step(e, cl.tick, alt=pads[bot] + 30.0, heading=heads[bot])
+            cl.inputs[bot] = dict(pitch=cp, roll=cr, coll=c, ped=ped, buttons=buttons)
+        t_fire_now[0] = False
+
+    t_fire_now = [False]
+    cl.on_state = on_state
+    while time.time() < t_end:
+        for bot in (a, b):
+            if not cl.in_vehicle(bot):
+                cl.before_send = None
+                cl.inputs[bot] = {}
+                if bot in pads:
+                    stats["deaths"] += 1
+                    pads.pop(bot)
+                if ensure_boarded(cl, bot, teams[bot], f"soak bot {bot}"):
+                    stats["boards"] += 1
+                    pads[bot] = cl.states[bot]["pos"][1]
+                    heads[bot] = seaward(cl.states[bot]["pos"])
+                    aps[bot].reset()
+                    cl.pulses[bot] = BTN_WEAPON[0]
+        cl.before_send = ctl
+        cl.pump(0.2)
+        now = time.time()
+        if now > t_spot and cl.alive(a) and cl.alive(b):
+            t_spot = now + 30
+            kind, data = cl.spot(a, cl.states[b]["root"])
+            stats["spots" if kind == "ack" else "spot_err"] += 1
+        if now > t_view:
+            t_view = now + 45
+            for bot in (a, b):
+                cl.pulses[bot] = BTN_TOGGLE_CAMERA
+        if now > t_fire and a in pads:
+            t_fire = now + 60
+            t_fire_now[0] = True
+        if now > t_next_min:
+            t_next_min = now + 60
+            ea, eb = cl.states.get(a), cl.states.get(b)
+            log(f"soak: {stats}; damages {len(cl.damages)} kills {len(cl.kills)} projectiles {len(cl.projectile_seen)} "
+                f"chats {len(cl.chats)} rounds {len(cl.rounds)}; A {fmt_entry(ea) if ea else '-'} view {ea['view'] if ea else '-'} "
+                f"weapons {[(w['slot'], w['ammo'], w['mags']) for w in ea['weapons']] if ea else '-'}; "
+                f"B {fmt_entry(eb) if eb else '-'}")
+    cl.before_send = None
+    cl.on_state = None
+    log(f"soak done: {stats}; damages {len(cl.damages)} kills {len(cl.kills)} projectiles seen {len(cl.projectile_seen)}")
+    cl.check(f"soak: {stats['ts']} TickStates in {args.soak_seconds:.0f} s, {stats['gaps']} gaps",
+             stats["ts"] > 25 * args.soak_seconds)
+    cl.check(f"soak: spots acked {stats['spots']}, refused {stats['spot_err']}", stats["spots"] > 0)
+    return cl.finish()
+
+
+SCENARIOS_V2 = {"view": run_view, "weapons": run_weapons, "damage": run_damage, "spot": run_spot, "round": run_round,
+                "teleport": run_teleport, "multiconn": run_multiconn, "soak2": run_soak2}
+
+
 # ------------------------------------------------------------------------------------- fuzz
 
 def expect_error(c, label, want_code=None, timeout=3.0):
@@ -1605,7 +2304,17 @@ def run_fuzz(args):
     case("SetInput before Hello", set_input(1, 0, 0, 0, 0, 0), 2, hello_first=False)
     case("RestartRound before Hello", frame(RESTART_ROUND, struct.pack("<I", 1)), 2, hello_first=False)
     case("Hello version 0 (v0 client)", frame(HELLO, struct.pack("<H", 0) + pstr("x")), 1, hello_first=False)
-    case("Hello version 2", frame(HELLO, struct.pack("<H", 2) + pstr("x")), 1, hello_first=False)
+    case("Hello version 1 (v1 client)", frame(HELLO, struct.pack("<H", 1) + pstr("x")), 1, hello_first=False)
+    case("Hello version 3", frame(HELLO, struct.pack("<H", 3) + pstr("x")), 1, hello_first=False)
+    case("Teleport before Hello", teleport_frame(1, 255, (0, 0, 0), 0), 2, hello_first=False)
+    case("Spot before Hello", spot_frame(1, 255, 1), 2, hello_first=False)
+    case("short Teleport (20 bytes)", frame(TELEPORT, b"\x00" * 20), 2)
+    case("long Teleport (22 bytes)", frame(TELEPORT, b"\x00" * 22), 2)
+    case("short Spot (8 bytes)", frame(SPOT, b"\x00" * 8), 2)
+    case("long Spot (10 bytes)", frame(SPOT, b"\x00" * 10), 2)
+    case("empty Teleport", frame(TELEPORT, b""), 2)
+    for mt in (PROJECTILE_LIST, DAMAGE, KILL, CHAT, ROUND_STATE):
+        case(f"module-only type {NAMES[mt]}", frame(mt, b"\x00" * 10), 3)
     case("unknown type 0x7777", frame(0x7777, b"abc"), 3)
     case("module-only type Welcome", frame(WELCOME, b""), 3)
     case("oversize length 65537", struct.pack("<IHH", 65537, SET_INPUT, 0), 2)
@@ -1652,25 +2361,36 @@ def run_fuzz(args):
         Conn(H, P).close()
     results.append(("100 connect-and-close", True))
 
-    # A second concurrent connection is refused; per-request errors keep the connection.
+    # maxConnections concurrent connections are served; one more is refused. Per-request errors keep
+    # the connection.
+    time.sleep(1.0)    # let the module see the quick closes above (module-v1/q5-q9: a race in the test)
     c = Conn(H, P)
     hello(c, "fuzz-main")
+    others = []
+    for i in range(args.max_connections - 1):
+        o = Conn(H, P)
+        hello(o, f"fuzz-extra-{i}")
+        others.append(o)
+    results.append((f"{args.max_connections} concurrent connections each got a Welcome", True))
     c2 = Conn(H, P)
     try:
         got = c2.recv_frame(timeout=2.0)
-        results.append((f"second connection: still open after 2 s ({got!r})", False))
+        results.append((f"connection {args.max_connections + 1}: still open after 2 s ({got!r})", False))
     except (ConnectionError, OSError):
-        results.append(("second connection: closed by the server", True))
+        results.append((f"connection {args.max_connections + 1}: closed by the server", True))
     c2.close()
+    for o in others:
+        o.close()
 
     def want_error(label, payload, code):
+        codes = code if isinstance(code, tuple) else (code,)
         c.send(payload)
         end = time.time() + 3
         while time.time() < end:
             f = c.recv_frame(timeout=1)
             if f and f[0] == ERROR:
                 got = parse_error(f[1])
-                results.append((f"{label}: Error code {got[1]} '{got[2]}', connection kept", got[1] == code))
+                results.append((f"{label}: Error code {got[1]} '{got[2]}', connection kept", got[1] in codes))
                 return
         results.append((f"{label}: no Error", False))
 
@@ -1681,6 +2401,9 @@ def run_fuzz(args):
     want_error("RemoveBot foreign player", frame(REMOVE_BOT, struct.pack("<IB", 53, 1)), 4)
     if args.expect_restart_refused:
         want_error("RestartRound with allowRoundRestart 0", frame(RESTART_ROUND, struct.pack("<I", 54)), 6)
+    tp_refused = args.expect_teleport_refused
+    want_error("Teleport foreign player", teleport_frame(55, 1, (0, 50, 0), 0), 6 if tp_refused else 4)
+    want_error("Spot foreign player", spot_frame(56, 1, 1), 4)
 
     # A real bot: NaN, inf and out-of-range inputs, buttons, bad vehicle ids.
     c.send(frame(CREATE_BOT, struct.pack("<I", 60) + pstr("[BOT] fuzz") + b"\x02"))
@@ -1705,6 +2428,12 @@ def run_fuzz(args):
         want_error("EnterVehicle id 70000", frame(ENTER_VEHICLE, struct.pack("<IBIB", 61, bot, 70000, 0)), 5)
         want_error("EnterVehicle id 65535", frame(ENTER_VEHICLE, struct.pack("<IBIB", 62, bot, 65535, 0)), 5)
         want_error("EnterVehicle seat 200", frame(ENTER_VEHICLE, struct.pack("<IBIB", 63, bot, 0, 200)), 5)
+        nan = float("nan")
+        want_error("Teleport NaN x", teleport_frame(64, bot, (nan, 0, 0), 0), 6 if tp_refused else 7)
+        want_error("Teleport -inf yaw", teleport_frame(65, bot, (0, 50, 0), float("-inf")), 6 if tp_refused else 7)
+        want_error("Teleport x 1e9", teleport_frame(66, bot, (1e9, 50, 0), 0), 6 if tp_refused else 7)
+        want_error("Spot target 0", spot_frame(67, bot, 0), (5, 6))
+        want_error("Spot target 70000", spot_frame(68, bot, 70000), (5, 6))
         # Flood: many SetInputs in one burst (latest wins; the queue bound may close the connection).
         burst = set_input(bot, 0, 0.1, 0, 0, 0) * 20000
         try:
@@ -1788,7 +2517,8 @@ def main():
     ap.add_argument("--fuzz-rounds", type=int, default=300)
     ap.add_argument("--expect-restart-refused", action="store_true", help="fuzz: the server has allowRoundRestart 0")
     ap.add_argument("--vehicle-log-every", type=float, default=60.0, help="seconds between VehicleList summaries")
-    ap.add_argument("--scenario", choices=["hover", "walk", "buttons", "blockpad", "allblocked", "wreck", "q9", "q5", "teamswitch"],
+    ap.add_argument("--scenario", choices=["hover", "walk", "buttons", "blockpad", "allblocked", "wreck", "q9", "q5", "teamswitch",
+                                           "view", "weapons", "damage", "spot", "round", "teleport", "multiconn", "soak2"],
                     default="hover")
     ap.add_argument("--rcon-port", type=int, default=4723, help="q9: ModManager RCON port")
     ap.add_argument("--rcon-password", default="", help="q9: ModManager RCON password")
@@ -1812,10 +2542,21 @@ def main():
     ap.add_argument("--wreck-climb", type=float, default=10.0, help="wreck: metres to climb before the crash")
     ap.add_argument("--wreck-pitch", type=float, default=-0.3, help="wreck: cyclic pitch during the climb")
     ap.add_argument("--spawn-wait", type=float, default=25.0, help="blockpad/allblocked: seconds to wait for a spawn")
+    ap.add_argument("--enter-range", type=float, default=0.0, help="view: the server's enterRange to compare with Welcome")
+    ap.add_argument("--tv", action="store_true", help="weapons: a second bot in the gunner seat fires its missile")
+    ap.add_argument("--mandown-wait", type=float, default=20.0, help="damage: seconds to wait for a man-down bot to die")
+    ap.add_argument("--damage-switch", action="store_true", help="damage: put B on team 2 with an admin switch, not a teleport")
+    ap.add_argument("--damage-gap", type=float, default=20.0, help="damage: metres from A's heli nose to C")
+    ap.add_argument("--crash", action="store_true", help="damage: also crash a heli (Damage and Kill without attacker)")
+    ap.add_argument("--max-connections", type=int, default=4, help="multiconn/fuzz: the server's maxConnections")
+    ap.add_argument("--expect-teleport-refused", action="store_true", help="teleport/fuzz: the server has allowTeleport 0")
+    ap.add_argument("--soak-seconds", type=float, default=600.0)
     args = ap.parse_args()
     try:
         if args.fuzz:
             return run_fuzz(args)
+        if args.scenario in SCENARIOS_V2:
+            return SCENARIOS_V2[args.scenario](args)
         if args.scenario != "hover":
             return SCENARIOS[args.scenario](args)
         return run_bot(args)

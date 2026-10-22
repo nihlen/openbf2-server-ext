@@ -174,16 +174,46 @@ bool parseConfig(const std::string& text, Config& out, std::vector<std::string>&
                 out.spawnBlockedSeconds = seconds;
             }
         }
-        else if (key == "allowRoundRestart")
+        else if (key == "allowRoundRestart" || key == "allowTeleport")
         {
             if (value != "0" && value != "1")
             {
-                diagnostics.push_back(std::string(where) + "allowRoundRestart must be 0 or 1, got '" + value + "'");
+                diagnostics.push_back(std::string(where) + key + " must be 0 or 1, got '" + value + "'");
+                ok = false;
+            }
+            else if (key == "allowRoundRestart")
+            {
+                out.allowRoundRestart = value == "1";
+            }
+            else
+            {
+                out.allowTeleport = value == "1";
+            }
+        }
+        else if (key == "maxConnections")
+        {
+            int n = 0;
+            if (!parseInt(value, 1, 8, n))
+            {
+                diagnostics.push_back(std::string(where) + "maxConnections must be 1..8, got '" + value + "'");
                 ok = false;
             }
             else
             {
-                out.allowRoundRestart = value == "1";
+                out.maxConnections = n;
+            }
+        }
+        else if (key == "projectileRange")
+        {
+            float range = 0;
+            if (!parseFloat(value, 10.0, 5000.0, range))
+            {
+                diagnostics.push_back(std::string(where) + "projectileRange must be 10..5000 metres, got '" + value + "'");
+                ok = false;
+            }
+            else
+            {
+                out.projectileRange = range;
             }
         }
         else

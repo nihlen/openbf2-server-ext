@@ -4,8 +4,8 @@ A native module for the OpenBF2 dedicated server that gives out-of-process tools
 interface to the running game: per-tick state, bot players driven by external input, and later the
 admin events and commands that BF2WebAdmin uses today through `mm_webadmin.py`.
 
-Status: protocol v1 implemented for Linux x86-64 (`libserverext.so`) and tested on a WSL server;
-see [docs/findings/module-v1.md](docs/findings/module-v1.md) (and module-v0.md for v0). Start with
+Status: protocol v2 implemented for Linux x86-64 (`libserverext.so`) and tested on a WSL server;
+see [docs/findings/module-v2.md](docs/findings/module-v2.md) (module-v1.md and module-v0.md for earlier versions). Start with
 the contract in [docs/protocol.md](docs/protocol.md).
 
 ## Layout and build
@@ -14,7 +14,7 @@ the contract in [docs/protocol.md](docs/protocol.md).
 |---|---|
 | `src/` | The module. `Protocol`, `Config`, `Channel` and `Session` are engine-free; `Module.cpp` is the engine side; `IoThread_posix.cpp` is the socket thread. |
 | `tests/` | Unit tests for the engine-free layer (framing, parsing, hostile input, config, queues). |
-| `tools/testclient/` | `serverext_client.py`, a Python 3 stdlib test client: hover flight, `--fuzz`, and the v1 scenarios (`--scenario` walk, buttons, blockpad, allblocked, wreck). |
+| `tools/testclient/` | `serverext_client.py`, a Python 3 stdlib test client: hover flight, `--fuzz`, the v1 scenarios (`--scenario` walk, buttons, blockpad, allblocked, wreck) and the v2 scenarios (view, weapons, damage, spot, round, teleport, multiconn, soak2; the watchdog neutral is q5). |
 | `testenv/` | WSL and Docker test-server scripts; `deploy-module.sh` installs the module into a run directory. |
 | `probe/` | The superseded `[TEMP]` R1 smoke probe, kept as the evidence behind `docs/findings/r1-smoke.md`. |
 

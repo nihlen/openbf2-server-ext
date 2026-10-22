@@ -15,6 +15,7 @@
 #include <sys/socket.h>
 #include <thread>
 #include <unistd.h>
+#include <vector>
 
 #include "Session.h"
 
@@ -40,8 +41,8 @@ std::string errnoText(const char* what)
 class IoThread
 {
 public:
-    IoThread(Channel* channel, int listenFd)
-        : m_channel(channel), m_listen(listenFd), m_client(-1), m_conn(0), m_session(0), m_writePos(0),
+    IoThread(Channel* channel, int listenFd, int maxConnections)
+        : m_channel(channel), m_listen(listenFd), m_maxConnections(maxConnections), m_nextConn(0),
           m_buffer(kReadChunk) {}
 
     void run()
@@ -51,22 +52,31 @@ public:
     }
 
 private:
+    struct Client
+    {
+        int fd;
+        uint32_t conn;
+        Session* session;
+        std::vector<uint8_t> write;
+        size_t writePos;
+
+        bool pendingWrite() const { return writePos < write.size(); }
+    };
+
     void step()
     {
-        pollfd fds[3];
-        int n = 0;
-        fds[n].fd = m_channel->wakeReadFd(); fds[n].events = POLLIN; fds[n].revents = 0; ++n;
-        fds[n].fd = m_listen; fds[n].events = POLLIN; fds[n].revents = 0; ++n;
-        const int clientIndex = n;
-        if (m_client >= 0)
+        std::vector<pollfd> fds(2 + m_clients.size());
+        fds[0].fd = m_channel->wakeReadFd(); fds[0].events = POLLIN; fds[0].revents = 0;
+        fds[1].fd = m_listen; fds[1].events = POLLIN; fds[1].revents = 0;
+        for (size_t i = 0; i < m_clients.size(); ++i)
         {
-            fds[n].fd = m_client;
-            fds[n].events = POLLIN | (pendingWrite() ? POLLOUT : 0);
-            fds[n].revents = 0;
-            ++n;
+            Client& c = m_clients[i];
+            fds[2 + i].fd = c.fd;
+            fds[2 + i].events = POLLIN | (c.pendingWrite() ? POLLOUT : 0);
+            fds[2 + i].revents = 0;
         }
 
-        const int r = ::poll(fds, n, kPollMs);
+        const int r = ::poll(&fds[0], fds.size(), kPollMs);
         if (r < 0 && errno != EINTR)
             ::usleep(10000);   // should not happen; never spin
 
@@ -77,20 +87,29 @@ private:
         }
         flushLogs();
 
+        // A closed client gets fd -1 and is swept below, so the indices into fds stay valid.
+        const size_t polled = m_clients.size();
+        for (size_t i = 0; i < polled; ++i)
+        {
+            Client& c = m_clients[i];
+            if (c.fd >= 0 && (fds[2 + i].revents & (POLLIN | POLLHUP | POLLERR)))
+                readClient(c);
+            if (c.fd >= 0 && m_channel->controlOverflow(c.conn))
+                closeClient(c, "the sidecar is not reading; outbound control queue exceeded 8 MiB", 0, 0);
+            if (c.fd >= 0)
+                writeClient(c);
+        }
+        for (size_t i = 0; i < m_clients.size();)
+        {
+            if (m_clients[i].fd < 0)
+                m_clients.erase(m_clients.begin() + i);
+            else
+                ++i;
+        }
+
         if (fds[1].revents & POLLIN)
             acceptClient();
-
-        if (m_client >= 0 && clientIndex < n && (fds[clientIndex].revents & (POLLIN | POLLHUP | POLLERR)))
-            readClient();
-
-        if (m_client >= 0 && m_channel->controlOverflow())
-            closeClient("the sidecar is not reading; outbound control queue exceeded 8 MiB", 0, 0);
-
-        if (m_client >= 0)
-            writeClient();
     }
-
-    bool pendingWrite() const { return m_writePos < m_write.size(); }
 
     void acceptClient()
     {
@@ -101,118 +120,122 @@ private:
             return;
         char addr[32];
         ::inet_ntop(AF_INET, &peer.sin_addr, addr, sizeof(addr));
-        if (m_client >= 0)
+        if (static_cast<int>(m_clients.size()) >= m_maxConnections)
         {
-            log(std::string("refused a second connection from ") + addr + "; one sidecar at a time in v0");
+            char line[128];
+            std::snprintf(line, sizeof(line), "refused a connection from %s: %d already open (maxConnections)", addr,
+                          m_maxConnections);
+            log(line);
             ::close(fd);
             return;
         }
         setNonBlocking(fd);
         int one = 1;
         ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-        m_client = fd;
-        ++m_conn;
-        m_session = new Session(m_channel, m_conn);
-        m_write.clear();
-        m_writePos = 0;
-        m_channel->setConnection(m_conn);
+        Client c;
+        c.fd = fd;
+        c.conn = ++m_nextConn;
+        c.session = new Session(m_channel, c.conn);
+        c.writePos = 0;
+        m_clients.push_back(c);
+        m_channel->openConnection(c.conn);
         char line[96];
-        std::snprintf(line, sizeof(line), "connection %u from %s:%u", m_conn, addr, ntohs(peer.sin_port));
+        std::snprintf(line, sizeof(line), "connection %u from %s:%u", c.conn, addr, ntohs(peer.sin_port));
         log(line);
-        Command c;
-        c.kind = Command::Connected;
-        c.conn = m_conn;
-        m_channel->pushCommand(c);
+        Command cmd;
+        cmd.kind = Command::Connected;
+        cmd.conn = c.conn;
+        m_channel->pushCommand(cmd);
     }
 
-    void readClient()
+    void readClient(Client& c)
     {
         size_t total = 0;
-        while (m_client >= 0 && total < kMaxReadPerWake)
+        while (c.fd >= 0 && total < kMaxReadPerWake)
         {
-            const ssize_t got = ::recv(m_client, &m_buffer[0], m_buffer.size(), 0);
+            const ssize_t got = ::recv(c.fd, &m_buffer[0], m_buffer.size(), 0);
             if (got > 0)
             {
                 total += static_cast<size_t>(got);
                 std::vector<uint8_t> reply;
-                if (!m_session->onBytes(&m_buffer[0], static_cast<size_t>(got), reply))
+                if (!c.session->onBytes(&m_buffer[0], static_cast<size_t>(got), reply))
                 {
-                    closeClient(m_session->closeReason(), reply.empty() ? 0 : &reply[0], reply.size());
+                    closeClient(c, c.session->closeReason(), reply.empty() ? 0 : &reply[0], reply.size());
                     return;
                 }
                 continue;
             }
             if (got == 0)
             {
-                closeClient("the sidecar closed the connection", 0, 0);
+                closeClient(c, "the sidecar closed the connection", 0, 0);
                 return;
             }
             if (errno == EINTR)
                 continue;
             if (errno != EAGAIN && errno != EWOULDBLOCK)
-                closeClient(errnoText("recv"), 0, 0);
+                closeClient(c, errnoText("recv"), 0, 0);
             return;
         }
     }
 
-    void writeClient()
+    void writeClient(Client& c)
     {
-        if (!pendingWrite())
+        if (!c.pendingWrite())
         {
-            m_write.clear();
-            m_writePos = 0;
-            if (!m_channel->takeOutbound(m_write))
+            c.write.clear();
+            c.writePos = 0;
+            if (!m_channel->takeOutbound(c.conn, c.write))
                 return;
         }
-        while (pendingWrite())
+        while (c.pendingWrite())
         {
-            const ssize_t sent = ::send(m_client, &m_write[m_writePos], m_write.size() - m_writePos, MSG_NOSIGNAL);
+            const ssize_t sent = ::send(c.fd, &c.write[c.writePos], c.write.size() - c.writePos, MSG_NOSIGNAL);
             if (sent > 0)
             {
-                m_writePos += static_cast<size_t>(sent);
+                c.writePos += static_cast<size_t>(sent);
                 continue;
             }
             if (sent < 0 && errno == EINTR)
                 continue;
             if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
                 return;
-            closeClient(errnoText("send"), 0, 0);
+            closeClient(c, errnoText("send"), 0, 0);
             return;
         }
     }
 
     // Sends what is left of the current frame plus an optional Error frame, best effort and without
     // blocking, then closes and tells the main thread.
-    void closeClient(const std::string& reason, const uint8_t* finalFrame, size_t finalSize)
+    void closeClient(Client& c, const std::string& reason, const uint8_t* finalFrame, size_t finalSize)
     {
         if (finalSize)
         {
-            m_write.insert(m_write.end(), finalFrame, finalFrame + finalSize);
-            while (pendingWrite())
+            c.write.insert(c.write.end(), finalFrame, finalFrame + finalSize);
+            while (c.pendingWrite())
             {
-                const ssize_t sent = ::send(m_client, &m_write[m_writePos], m_write.size() - m_writePos,
+                const ssize_t sent = ::send(c.fd, &c.write[c.writePos], c.write.size() - c.writePos,
                                             MSG_NOSIGNAL | MSG_DONTWAIT);
                 if (sent <= 0)
                     break;
-                m_writePos += static_cast<size_t>(sent);
+                c.writePos += static_cast<size_t>(sent);
             }
         }
-        ::shutdown(m_client, SHUT_RDWR);
-        ::close(m_client);
-        m_client = -1;
+        ::shutdown(c.fd, SHUT_RDWR);
+        ::close(c.fd);
+        c.fd = -1;
         char line[64];
-        std::snprintf(line, sizeof(line), "connection %u closed after %llu frames: ", m_conn,
-                      static_cast<unsigned long long>(m_session ? m_session->frames() : 0));
+        std::snprintf(line, sizeof(line), "connection %u closed after %llu frames: ", c.conn,
+                      static_cast<unsigned long long>(c.session ? c.session->frames() : 0));
         log(line + reason);
-        delete m_session;
-        m_session = 0;
-        m_write.clear();
-        m_writePos = 0;
-        m_channel->setConnection(0);
-        Command c;
-        c.kind = Command::Disconnected;
-        c.conn = m_conn;
-        m_channel->pushCommand(c);
+        delete c.session;
+        c.session = 0;
+        c.write.clear();
+        c.writePos = 0;
+        m_channel->closeConnection(c.conn);
+        Command cmd;
+        cmd.kind = Command::Disconnected;
+        cmd.conn = c.conn;
+        m_channel->pushCommand(cmd);
     }
 
     void log(const std::string& line) { m_channel->log(line); }
@@ -231,11 +254,9 @@ private:
 
     Channel* m_channel;
     int m_listen;
-    int m_client;
-    uint32_t m_conn;
-    Session* m_session;
-    std::vector<uint8_t> m_write;
-    size_t m_writePos;
+    int m_maxConnections;
+    uint32_t m_nextConn;
+    std::vector<Client> m_clients;
     std::vector<uint8_t> m_buffer;
     std::deque<std::string> m_logs;
 };
@@ -273,7 +294,7 @@ bool startIoThread(const Config& config, Channel* channel, std::string& error)
         ::close(fd);
         return false;
     }
-    if (::listen(fd, 4) != 0)
+    if (::listen(fd, 8) != 0)
     {
         error = errnoText("listen");
         ::close(fd);
@@ -283,7 +304,7 @@ bool startIoThread(const Config& config, Channel* channel, std::string& error)
 
     // Lives for the process: the loader has no unload path, and a joinable std::thread destroyed at
     // exit would call std::terminate.
-    IoThread* io = new IoThread(channel, fd);
+    IoThread* io = new IoThread(channel, fd, config.maxConnections);
     try
     {
         std::thread t(&IoThread::run, io);

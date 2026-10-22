@@ -96,6 +96,16 @@ bool Session::handleFrame(const Frame& frame, std::vector<uint8_t>& reply)
             return fail(reply, ErrMalformed, "malformed RestartRound");
         c.kind = Command::RestartRound;
         break;
+    case MsgTeleport:
+        if (!parseTeleport(frame.payload, c.teleport))
+            return fail(reply, ErrMalformed, "malformed Teleport");
+        c.kind = Command::Teleport;
+        break;
+    case MsgSpot:
+        if (!parseSpot(frame.payload, c.spot))
+            return fail(reply, ErrMalformed, "malformed Spot");
+        c.kind = Command::Spot;
+        break;
     default:
         return fail(reply, ErrUnknownType, "unexpected message type");
     }
