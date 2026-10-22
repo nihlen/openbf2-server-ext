@@ -307,9 +307,10 @@ Codes: 1 version mismatch, 2 malformed frame, 3 unknown message type, 4 unknown 
   stands still until the sidecar sends input.
 - Q5, answered (`docs/findings/q5-q9.md`): holding collective is safe only from a hover. On the Z-10 it
   crashed the heli within about 10 s from a full-collective climb, a steep descent and a 32° banked
-  turn, because zero cyclic holds the current attitude. Proposed, not approved: in a heli, level the
-  attitude (P-D on pitch and roll, pedals damp yaw rate) and hold vertical speed at 0 (PI on
-  collective). All five tested states survived with it. It is a module change with no wire change.
+  turn, because zero cyclic holds the current attitude. Approved by the author on 2026-10-22 (v2 item
+  11): in a heli, level the attitude (P-D on pitch and roll, pedals damp yaw rate) and hold vertical
+  speed at 0 (PI on collective). All five tested states survived with it. It is a module change with
+  no wire change.
 - On disconnect, bots are neutralised immediately and removed after the watchdog period, without
   `BotRemoved`.
 
@@ -620,14 +621,16 @@ damage observer (R5) as the admin channel draft.
    markers, kill messages).
 9. Teleport, for test drills on test servers only, behind a `serverext.cfg` switch.
 10. A man-down bit in `TickState` entry flags: the alive flag stays set for `sv.manDownTime` after a kill.
+11. Watchdog neutral in a heli: level the attitude and hold vertical speed at 0 ([Watchdog](#watchdog)).
+    No wire change.
 
 Items 4-8 come from the play mission (`bf2-bots/docs/serverext-missions.md`). Items 4 and 5 unblock TV
 fights and a gunner bot. Item 8 overlaps the admin channel's events (`docs/admin-channel-draft.md`).
 
 ## Later
 
-- v1 admin channel for BF2WebAdmin: the existing `mm_webadmin` events and commands, carried by the
-  module instead of Python. Separate endpoint and authentication, because it is not loopback.
+- The admin channel for BF2WebAdmin: approved 2026-10-22 as `docs/admin-channel-draft.md` draft 2
+  (its own contract, not bound to `mm_webadmin`). It shares R5 with v2 item 8.
 - R3 stepped time and a `Step` message.
 - Hooks that can veto or change actions (damage, team selection).
 
@@ -639,7 +642,7 @@ fights and a gunner bot. Item 8 overlaps the admin channel's events (`docs/admin
 | Q2 | Engine native rotation convention and the conversion | Answered ([Conventions](#conventions)) |
 | Q3 | How to spawn a bot into a heli seat; AI flags on the 2v2 spawn points | Answered: pad spawn, then `EnterVehicle`; needs R1b |
 | Q4 | Does writing raw axes match the client ControlMap path, including signs | Server side answered (mapping bits, quantization); client ControlMap stage open |
-| Q5 | Safest neutral input for the watchdog | Answered: held collective is unsafe outside a hover; level-and-hold proposed ([Watchdog](#watchdog)) |
+| Q5 | Safest neutral input for the watchdog | Answered: held collective is unsafe outside a hover; level-and-hold approved as v2 item 11 ([Watchdog](#watchdog)) |
 | Q6 | Can a Windows client join a server in WSL (UDP forwarding) | Answered: use the WSL VM's IP, or Docker |
 | Q7 | Does `sv.numPlayersNeededToStart 0` start a round with only bots | Answered: bots spawn either way, but the round never runs without two humans; this tree floors the setting at 2 |
 | Q8 | Does unrecovered retail code use EventManager category 7 | Open; needs IDA/Ghidra. If yes, use R0 |

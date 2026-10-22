@@ -1,6 +1,8 @@
 # Admin channel: proposal (draft 2)
 
-Status: **draft, not approved.** It replaces draft 1, which kept `mm_webadmin.py`'s text protocol.
+Status: **approved by the author on 2026-10-22**, with the decisions in [Decisions](#decisions). Byte
+layouts are written in phase 1 and reviewed before the C# side starts. It replaces draft 1, which kept
+`mm_webadmin.py`'s text protocol.
 The author has decided that the BF2WebAdmin C# side may change as much as needed, and that the
 author keeps deployments from running `mm_webadmin.py` and the native channel at the same time.
 Evidence for the engine side: `docs/findings/admin-channel-a1-a4.md`. Inventory of today's
@@ -46,11 +48,16 @@ protocol and its problems: draft 1, in git history (`5fc2a6d`).
   hold the key.
 - The server's identity is a configured server id, not its source IP.
 
-**Encryption**
-- Player IPs and CD-key hashes are personal data. Either:
-  - use TLS 1.3 with a pinned WebAdmin certificate, or
-  - accept HMAC alone on a private network or WireGuard link that already protects the traffic (B1).
-- Until that's settled, IPs and hashes are sent only with `adminSendIdentity 1`.
+**Encryption** (B1: the game servers reach WebAdmin over the internet)
+- TLS 1.3, in the module, with OpenSSL (the distro's `libssl3`, linked dynamically; the Docker image
+  installs it). The module's I/O thread drives a non-blocking `SSL` object on the existing socket.
+- WebAdmin presents a dedicated self-signed certificate on the game-server port, generated once.
+  .NET wraps the accepted socket in `SslStream`.
+- Each server pins it: `adminCertSha256 <hex>` in `serverext.cfg`, the SHA-256 of the certificate's
+  public key (SPKI). No CA store, hostnames or renewals; rotating the key means updating the pin.
+- The HMAC challenge runs inside TLS and still authenticates the server to WebAdmin.
+- `adminTls 0` exists only for loopback tests. With TLS, IPs and CD-key hashes are sent by default;
+  `adminSendIdentity 0` withholds them.
 
 **Capabilities**
 - `serverext.cfg` can turn off powerful commands per server: raw console, object spawn and delete,
@@ -78,7 +85,8 @@ protocol and its problems: draft 1, in git history (`5fc2a6d`).
 
 **`Subscribe(stream, rateHz, filter)`**
 - The streams are player states, vehicles, projectiles (filtered by template) and tickets.
-- Each is a plain snapshot of the subscribed entities at the chosen rate (B3).
+- Each is a plain snapshot of the subscribed entities at the chosen rate (B3). Positions and
+  rotations are float32; WebAdmin picks low rates (1-5 Hz) where it doesn't animate.
 
 ### Events (sequence-numbered)
 
@@ -146,29 +154,42 @@ designed and approved on its own.
 - **Game modules change where they relied on the text protocol.** Heli2v2's `listObjectsOfTemplate`
   parsing becomes `ListObjects`. `RootVehicleId` becomes the networkable id. Rcon `\b` parsing and
   ordered raw console strings become typed commands where one exists.
-- **The `mm_webadmin` backend stays** for retail and BF2Hub servers, unless the author retires
-  them (B2).
+- **The `mm_webadmin` backend is replaced, not kept** (B2). Until the new backend is ready, the
+  author runs an old WebAdmin Docker image for the existing servers. The author makes sure no
+  server runs `mm_webadmin.py` and the native channel at the same time.
 
 ## Phases
 
 1. **Engine and module.**
    - R4, R5 (shared with bot v2) and the getters.
-   - The admin channel's session, authentication, snapshot, events, streams and the core commands.
+   - The admin channel's session, authentication and TLS, snapshot, events, streams and the core
+     commands. The byte layouts go into this document for review before phase 2.
    - A Python reference client with a fuzz mode, as for the bot channel.
    - Verified on the WSL and Docker test servers.
 2. **BF2WebAdmin.**
    - The C# codec and backend, and the module refactors.
-   - Tested end to end with the netsky 2v2 setup. That needs the BF2WebAdmin local test
-     environment recreated, which waits for the author's go-ahead.
+   - Tested end to end with the netsky 2v2 setup in the BF2WebAdmin local test environment
+     (`C:\Data\Projects\DotNet\BF2WebAdmin-localtest`; workers may start it with its scripts).
+     Its BF2 container must run OpenBF2 with the module instead of `mm_webadmin.py`.
 3. **Policies and veto hooks.**
-4. **TLS,** if B1 chooses it.
 
-## Open questions
+TLS is part of phase 1 (B1).
 
-| Id | Question | Recommendation |
+## Decisions
+
+| Id | Question | Decision (2026-10-22) |
 |---|---|---|
-| B1 | Is TLS needed in phase 1, or do the deployments already run over a private network? | TLS if any game server reaches WebAdmin over the internet |
-| B2 | Keep the `mm_webadmin` backend for retail and BF2Hub servers? | Keep it until every server runs OpenBF2 |
-| B3 | Stream encoding: plain snapshots at the chosen rate, or deltas? | Plain. 64 players at 30 Hz is about 80 KB/s; add deltas only if that is too much |
-| B4 | Should WebAdmin create and remove bots (for example an in-game `!bot` command), through the bot channel's sidecar? | Later, after the bot work settles |
-| B5 | Is raw console allowed by default? | Yes, but it can be turned off per server |
+| B1 | TLS | Needed: servers reach WebAdmin over the internet. TLS 1.3 in the module with OpenSSL and a pinned self-signed WebAdmin certificate, in phase 1 |
+| B2 | Keep the `mm_webadmin` backend | No. It is replaced; the author runs an old WebAdmin image meanwhile |
+| B3 | Plain snapshots or deltas | Plain, at a per-stream rate. Deltas can come later without changing events or commands (below) |
+| B4 | Bot management from WebAdmin | Maybe, later. The channel must not rule it out; no messages yet |
+| B5 | Raw console by default | Yes, with a per-server switch to turn it off |
+
+**Why plain streams (B3).** CPU is not the cost: diffing 64 players against the last frame takes
+microseconds on the I/O thread. The cost is correctness on both sides: a baseline per subscriber,
+field masks, entities appearing and disappearing, a full frame after every gap, and the same logic
+again in the C# codec and the golden tests. Field deltas also save less than they seem, because every
+moving player's position and rotation changes every frame. A full 64-player frame is about 2.7 KB, so
+30 Hz is about 80 KB/s, and a 2v2 server with 4 players is about 6 KB/s. If that becomes a problem,
+the cheap step is to skip entities unchanged since the last frame, with a full frame every second; it
+is a new stream encoding, not a protocol redesign.
