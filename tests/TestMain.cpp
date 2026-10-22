@@ -14,6 +14,7 @@
 #include "Config.h"
 #include "Protocol.h"
 #include "Session.h"
+#include "SpawnPlan.h"
 
 using namespace serverext;
 using namespace serverext::proto;
@@ -665,6 +666,81 @@ void testChannel()
     CHECK(ch.drainLogs(logs) == 5 && logs.size() == Channel::kMaxLogLines);
 }
 
+
+// The fields of IServerExtension::SpawnGroupInfo, without the engine header.
+struct Group
+{
+    int id;
+    int squad;
+    int pointCount;
+    int enterOnSpawnPoints;
+    bool active;
+    bool onlyForHuman;
+    float x, y, z;
+};
+
+Group group(int id, int points, int enters, float x, bool active = true, int squad = 0, bool human = false)
+{
+    Group g = { id, squad, points, enters, active, human, x, 0.0f, 0.0f };
+    return g;
+}
+
+void testSpawnPlan()
+{
+    using namespace serverext::spawn;
+
+    // dalian_2_v_2-like: each base has a pad group and an in-heli enter-on-spawn point. A team
+    // switch re-resolves from the other team's list, so nothing of the old team survives.
+    const Group team1[] = { group(3, 4, 0, 0.0f), group(4, 1, 1, 14.0f) };
+    const Group team2[] = { group(7, 1, 1, 514.0f), group(8, 4, 0, 500.0f) };
+    Choice c = choose(team1, 2);
+    CHECK(c.ok && c.home == 3 && c.target == 3);
+    c = choose(team2, 2);
+    CHECK(c.ok && c.home == 8 && c.target == 8);   // the on-foot group, not the lower-id heli point
+    std::vector<int> order = fallbackOrder(c.home, c.target, team2, 2);
+    CHECK(order.size() == 2 && order[0] == 8 && order[1] == 7);
+
+    // Inactive groups still count: CreateBot and a team change succeed while the pad is blocked.
+    const Group blocked[] = { group(8, 4, 0, 500.0f, false) };
+    c = choose(blocked, 1);
+    CHECK(c.ok && c.home == 8);
+
+    // Only an enter-on-spawn group: no home, the target is that group.
+    const Group heliOnly[] = { group(7, 1, 1, 514.0f) };
+    c = choose(heliOnly, 1);
+    CHECK(c.ok && c.home == -1 && c.target == 7);
+    order = fallbackOrder(c.home, c.target, heliOnly, 1);
+    CHECK(order.size() == 1 && order[0] == 7);
+
+    // Nothing usable (squad, human-only, no points) or no groups at all: Error 6 / pending.
+    const Group unusable[] = { group(1, 4, 0, 0.0f, true, 2), group(2, 4, 0, 0.0f, true, 0, true), group(5, 0, 0, 0.0f) };
+    c = choose(unusable, 3);
+    CHECK(!c.ok && c.home == -1 && c.target == -1);
+    CHECK(fallbackOrder(c.home, c.target, unusable, 3).empty());
+    c = choose(unusable, 0);
+    CHECK(!c.ok);
+    CHECK(choose(static_cast<const Group*>(0), 0).ok == false);
+
+    // Order: home, then on-foot groups nearest home, then enter-on-spawn groups nearest home;
+    // unusable groups never appear.
+    const Group many[] = { group(1, 2, 1, 5.0f), group(2, 4, 0, 100.0f), group(3, 4, 0, 300.0f),
+                           group(4, 4, 0, 50.0f, false), group(5, 4, 0, 10.0f, true, 1), group(6, 2, 2, 400.0f),
+                           group(9, 4, 0, 200.0f) };
+    c = choose(many, 7);
+    CHECK(c.home == 2);
+    order = fallbackOrder(c.home, c.target, many, 7);
+    // From home at 100: on foot 4 (50 m, inactive but listed), 9 (100 m), 3 (200 m); then the
+    // enter-on-spawn groups 1 (95 m), 6 (300 m). 5 is a squad group.
+    CHECK(order.size() == 6);
+    if (order.size() == 6)
+    {
+        CHECK(order[0] == 2);
+        CHECK(order[1] == 4 && order[2] == 9 && order[3] == 3);
+        CHECK(order[4] == 1 && order[5] == 6);
+    }
+    CHECK(findGroup(many, 7, 9) == &many[6] && findGroup(many, 7, 42) == 0);
+}
+
 } // namespace
 
 int main()
@@ -678,6 +754,7 @@ int main()
     testSession();
     testFuzz();
     testChannel();
+    testSpawnPlan();
     std::printf("%d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;
 }

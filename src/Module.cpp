@@ -41,6 +41,7 @@
 #include "Config.h"
 #include "IoThread.h"
 #include "Protocol.h"
+#include "SpawnPlan.h"
 
 using namespace dice::hfe;
 using namespace dice::hfe::world;
@@ -55,6 +56,7 @@ const float kTickRate = 30.0f;
 const int kDefaultKit = 0;
 const unsigned int kStatsPeriodTicks = 1800;   // one stats line per minute
 const unsigned int kGroupRetryTicks = 10;      // re-set a cleared target spawn group this often
+const unsigned int kResolveRetryTicks = 30;    // retry a team without a usable spawn group once a second
 const unsigned int kVehicleListPeriod = 30;     // protocol.md v1: once a second
 const size_t kVehicleScanPerTick = 500;         // registered objects examined per tick
 const unsigned int kRestartMinTicks = 60 * 30;  // protocol.md v1: at most one RestartRound per 60 s
@@ -240,7 +242,7 @@ struct Bot
     int id;
     world::IPlayer* player;           // borrowed; compared with getPlayerFromId(id), never dereferenced first
     uint32_t conn;
-    int team;
+    int team;                         // the team the spawn groups below belong to; follows getTeam()
     float axes[proto::AxisCount];      // what is written every tick
     float pending[proto::AxisCount];   // latest SetInput of this tick
     uint32_t buttons;                  // pressed for this tick only
@@ -262,6 +264,8 @@ struct Bot
     std::vector<int> order;       // home first, then on-foot groups by distance, then enter-on-spawn
     std::vector<bool> tried;
     bool cycled;                  // every group of order was tried or found inactive
+    bool groupsPending;           // the team has no usable group; retried every kResolveRetryTicks
+    unsigned long lastResolve;    // tick of the last resolution attempt
 
     int viewMode;                 // last camera view mode seen, -1 if none (test observability)
     bool firing;
@@ -499,9 +503,9 @@ private:
         }
         // protocol.md v1: CreateBot succeeds whenever the team has a spawn group a bot can use,
         // active or not; a blocked one is handled by the spawn fallback.
-        const int groupCount = m_ext->listSpawnGroups(m.team, m_groups, kMaxSpawnGroups);
-        const int group = homeGroup(m_groups, groupCount < kMaxSpawnGroups ? groupCount : kMaxSpawnGroups);
-        if (group < 0 && !anyUsableGroup(m_groups, groupCount < kMaxSpawnGroups ? groupCount : kMaxSpawnGroups))
+        const int groupCount = listGroups(m.team);
+        const spawn::Choice choice = spawn::choose(m_groups, groupCount);
+        if (!choice.ok)
         {
             error(m.requestId, proto::ErrRefused, "the team has no spawn group (is a level loaded?)");
             logLine("tick %lu: CreateBot '%s' team %d refused: %d spawn groups, none usable", m_tick, name.c_str(),
@@ -516,8 +520,16 @@ private:
             logLine("tick %lu: CreateBot '%s' refused: createInputPlayer -> %d", m_tick, name.c_str(), id);
             return;
         }
+        // Python's PlayerConnect handlers ran inside createInputPlayer, and mm_autobalance may have
+        // put the bot on a team already (docs/findings/q5-q9.md, 4). The requested team wins.
+        const int connectTeam = p->getTeam();
         p->setTeam(m.team, false);
         p->setKit(kDefaultKit);
+        if (p->getTeam() != m.team)
+            logLine("tick %lu: bot %d: setTeam(%d) left it on team %d", m_tick, id, m.team, p->getTeam());
+        else if (connectTeam != m.team)
+            logLine("tick %lu: bot %d: moved from team %d (set during PlayerConnect) to the requested team %d", m_tick, id,
+                 connectTeam, m.team);
 
         Bot b;
         b.id = id;
@@ -534,12 +546,13 @@ private:
         b.removeCountdown = -1;
         b.missingTicks = 0;
         b.lastGroupTry = m_tick;
-        b.home = group;
+        b.home = choice.home;
         b.viewMode = -1;
         b.firing = false;
         resetFallback(b);
-        if (b.target < 0)
-            b.target = firstFallbackGroup(m_groups, groupCount < kMaxSpawnGroups ? groupCount : kMaxSpawnGroups);
+        b.target = choice.target;
+        b.groupsPending = false;
+        b.lastResolve = m_tick;
         p->setSpawnGroup(b.target);
         m_bots.push_back(b);
 
@@ -547,9 +560,9 @@ private:
         proto::encodeBotCreated(f, m.requestId, static_cast<uint8_t>(id));
         control(f);
         logLine("tick %lu: created bot %d '%s' team %d kit %d home spawn group %d target %d (ai %d connected %d)", m_tick, id,
-             p->getName().c_str(), m.team, kDefaultKit, group, m_bots.back().target, p->getIsAIPlayer() ? 1 : 0,
+             p->getName().c_str(), m.team, kDefaultKit, choice.home, m_bots.back().target, p->getIsAIPlayer() ? 1 : 0,
              p->getIsConnected() ? 1 : 0);
-        logGroups(m.team, m_groups, groupCount < kMaxSpawnGroups ? groupCount : kMaxSpawnGroups);
+        logGroups(m.team, m_groups, groupCount);
     }
 
     // The seat object with PCO id seat on vehicle root, if that seat is free and the vehicle's
@@ -604,6 +617,9 @@ private:
             return;
         }
 
+        // The live team, not the cached one: an admin may have switched it since the last tick.
+        const int team = p->getTeam();
+
         // protocol.md v1: both forms skip destroyed vehicles and require the bot within enterRange.
         const Vec3& myPos = me->getAbsolutePosition();
         const char* why = "no undestroyed vehicle with that seat free within enterRange";
@@ -633,7 +649,7 @@ private:
             else if (distance(root->getAbsolutePosition(), myPos) > m_config.enterRange)
                 why = "the vehicle is out of enterRange";
             else
-                seat = freeSeat(root, m.seat, b->team, &why);
+                seat = freeSeat(root, m.seat, team, &why);
         }
         else
         {
@@ -651,7 +667,7 @@ private:
                 if (destroyed)
                     continue;
                 const char* ignored = 0;
-                IObject* s = freeSeat(o, m.seat, b->team, &ignored);
+                IObject* s = freeSeat(o, m.seat, team, &ignored);
                 if (s)
                 {
                     best = d;
@@ -835,6 +851,13 @@ private:
                 continue;
             }
 
+            const int team = p->getTeam();
+            if (team != b.team)
+                onTeamChanged(b, p, team);
+            else if (b.groupsPending && m_tick - b.lastResolve >= kResolveRetryTicks && resolveGroups(b, p))
+                logLine("tick %lu: bot %d: team %d has a usable spawn group again; home %d target %d", m_tick, b.id,
+                     b.team, b.home, b.target);
+
             const bool alive = p->getIsAlive();
             if (alive != b.wasAlive)
             {
@@ -885,43 +908,11 @@ private:
 
     typedef IServerExtension::SpawnGroupInfo GroupInfo;
 
-    static bool usable(const GroupInfo& g)
+    // listSpawnGroups into m_groups, capped at its capacity.
+    int listGroups(int team)
     {
-        return g.squad <= 0 && !g.onlyForHuman && g.pointCount > 0;
-    }
-
-    // The pad: the team's lowest-id usable group without enter-on-spawn points, active or not.
-    // Matches findSpawnGroup(team, false) whenever nothing is blocked.
-    static int homeGroup(const GroupInfo* groups, int n)
-    {
-        for (int i = 0; i < n; ++i)
-            if (usable(groups[i]) && groups[i].enterOnSpawnPoints == 0)
-                return groups[i].id;
-        return -1;
-    }
-
-    static bool anyUsableGroup(const GroupInfo* groups, int n)
-    {
-        for (int i = 0; i < n; ++i)
-            if (usable(groups[i]))
-                return true;
-        return false;
-    }
-
-    static int firstFallbackGroup(const GroupInfo* groups, int n)
-    {
-        for (int i = 0; i < n; ++i)
-            if (usable(groups[i]))
-                return groups[i].id;
-        return -1;
-    }
-
-    static const GroupInfo* findGroup(const GroupInfo* groups, int n, int id)
-    {
-        for (int i = 0; i < n; ++i)
-            if (groups[i].id == id)
-                return &groups[i];
-        return 0;
+        const int n = m_ext->listSpawnGroups(team, m_groups, kMaxSpawnGroups);
+        return n < kMaxSpawnGroups ? n : kMaxSpawnGroups;
     }
 
     void logGroups(int team, const GroupInfo* groups, int n)
@@ -946,43 +937,48 @@ private:
         b.cycled = false;
     }
 
-    // Home first, then the other on-foot groups nearest to home first, then the groups with any
-    // enter-on-spawn point, nearest first.
     void buildOrder(Bot& b, const GroupInfo* groups, int n)
     {
-        const GroupInfo* ref = findGroup(groups, n, b.home >= 0 ? b.home : b.target);
-        std::vector<std::pair<float, int> > onFoot, enters;
-        for (int i = 0; i < n; ++i)
-        {
-            const GroupInfo& g = groups[i];
-            if (!usable(g) || g.id == b.home)
-                continue;
-            float d = 0.0f;
-            if (ref)
-            {
-                const float dx = g.x - ref->x, dy = g.y - ref->y, dz = g.z - ref->z;
-                d = std::sqrt(dx * dx + dy * dy + dz * dz);
-            }
-            (g.enterOnSpawnPoints > 0 ? enters : onFoot).push_back(std::make_pair(d, g.id));
-        }
-        std::stable_sort(onFoot.begin(), onFoot.end());
-        std::stable_sort(enters.begin(), enters.end());
-        b.order.clear();
-        if (b.home >= 0)
-            b.order.push_back(b.home);
-        for (size_t i = 0; i < onFoot.size(); ++i)
-            b.order.push_back(onFoot[i].second);
-        for (size_t i = 0; i < enters.size(); ++i)
-            b.order.push_back(enters[i].second);
+        b.order = spawn::fallbackOrder(b.home, b.target, groups, n);
         b.tried.assign(b.order.size(), false);
+    }
+
+    // Re-resolves home and target for b.team and restarts the fallback. On failure the bot keeps no
+    // group and updateBots retries once a second; until then no fallback timer runs.
+    bool resolveGroups(Bot& b, world::IPlayer* p)
+    {
+        const spawn::Choice c = spawn::choose(m_groups, listGroups(b.team));
+        b.lastResolve = m_tick;
+        b.home = c.home;
+        resetFallback(b);
+        b.target = c.target;
+        b.groupsPending = !c.ok;
+        if (c.ok)
+        {
+            p->setSpawnGroup(b.target);
+            b.lastGroupTry = m_tick;
+        }
+        return c.ok;
+    }
+
+    // An admin or ModManager changed the bot's team (bf2cc switchplayer, !sw, BF2WebAdmin team,
+    // mm_autobalance). Player::setTeam cleared its spawn group; the new team's groups replace the
+    // old team's.
+    void onTeamChanged(Bot& b, world::IPlayer* p, int team)
+    {
+        const int old = b.team;
+        b.team = team;
+        const bool ok = resolveGroups(b, p);
+        logLine("tick %lu: bot %d team changed %d -> %d outside the module (%s); home spawn group %d target %d%s", m_tick,
+             b.id, old, team, p->getIsAlive() ? "alive" : "dead", b.home, b.target,
+             ok ? "" : "; the team has no usable spawn group, retrying every second");
+        logGroups(team, m_groups, listGroups(team));
     }
 
     // The target's fallback time is up: move to the next group in the order that is active now.
     void advanceTarget(Bot& b, world::IPlayer* p)
     {
-        int n = m_ext->listSpawnGroups(b.team, m_groups, kMaxSpawnGroups);
-        if (n > kMaxSpawnGroups)
-            n = kMaxSpawnGroups;
+        const int n = listGroups(b.team);
         if (b.order.empty())
             buildOrder(b, m_groups, n);
         b.targetSince = m_tick;
@@ -999,7 +995,7 @@ private:
         for (int k = 1; k <= size && chosen < 0; ++k)
         {
             const int idx = pos < 0 ? k - 1 : (pos + k) % size;
-            const GroupInfo* g = findGroup(m_groups, n, b.order[idx]);
+            const GroupInfo* g = spawn::findGroup(m_groups, n, b.order[idx]);
             if (g && g->active)
                 chosen = idx;
             else
@@ -1018,7 +1014,7 @@ private:
             b.target = b.order[0];
         if (b.target != previous)
         {
-            const GroupInfo* g = findGroup(m_groups, n, b.target);
+            const GroupInfo* g = spawn::findGroup(m_groups, n, b.target);
             logLine("tick %lu: bot %d spawn fallback: group %d -> %d (%s)", m_tick, b.id, previous, b.target,
                  g && g->enterOnSpawnPoints > 0 ? "enter-on-spawn" : "on foot");
         }
@@ -1028,6 +1024,12 @@ private:
 
     void updateSpawnFallback(Bot& b, world::IPlayer* p)
     {
+        if (b.groupsPending)
+        {
+            // No usable group for the bot's team: nothing to offer, no timers, no SpawnBlocked.
+            b.readySince = 0;
+            return;
+        }
         if (b.target >= 0 && p->getSpawnGroup() != b.target && m_tick - b.lastGroupTry >= kGroupRetryTicks)
         {
             // uPlayingSpawning clears a group that is inactive at the moment; keep offering it.

@@ -1436,8 +1436,137 @@ def run_q5(args):
     return cl.finish()
 
 
+# ------------------------------------------------------------------------------------- team switch
+
+def board(cl, bot, team, label, exclude=()):
+    """Walks bot to the nearest undestroyed heli it may enter (team 0 or team, pilot seat free, not in
+    exclude) and enters its pilot seat. Returns the EnterVehicle reply."""
+    e = cl.states.get(bot)
+    hs = [v for v in cl.vehicles.values() if "ahe_" in v["name"] and free_seat0(v, team) and v["id"] not in exclude]
+    if not e or not hs:
+        return ("error", (5, "no heli to board"))
+    v = min(hs, key=lambda v: flat_dist(v["pos"], e["pos"]))
+    d = flat_dist(v["pos"], e["pos"])
+    log(f"{label}: boarding {v['name']} id {v['id']} team {v['team']} at {d:.1f} m")
+    if d > 7.0:
+        walk_to(cl, bot, v["pos"], 7.0, label=label)
+    return cl.enter(bot, v["id"], 0)
+
+
+def crash(cl, bot, label):
+    """Climbs about 25 m in the current heli, then dives into the ground. True if the bot died."""
+    cl.inputs[bot] = {}
+    cl.run_for(5.0)                       # rotor spin-up
+    y0 = cl.states[bot]["pos"][1]
+    r = fly(cl, bot, Autopilot(), dict(alt=y0 + 30.0), until=lambda e, t: e["pos"][1] - y0 > 25.0, timeout=40.0)
+    log(f"{label} climb: {r}, {cl.states[bot]['pos'][1] - y0:.1f} m; now collective -1, nose down")
+    cl.before_send = lambda: cl.inputs.__setitem__(bot, dict(coll=-1.0, pitch=0.6) if cl.in_vehicle(bot) else {})
+    died = cl.run_for(30.0, lambda: not cl.alive(bot))
+    cl.before_send = None
+    cl.inputs[bot] = {}
+    return died
+
+
+def run_teamswitch(args):
+    """An admin team switch of a bot (bf2cc switchplayer <id> 3). B goes 1 -> 2 while alive at team
+    1's pad: it is refused a seat in the heli A (team 1) holds, walks to another, empty heli (team 0),
+    crashes it, respawns at team 2's pad and enters a heli there. Then B crashes again, goes 2 -> 1
+    while dead, respawns at team 1's pad and gets the seat in A's heli it was refused before. No
+    SpawnBlocked at any point. (An empty heli is team 0, so the team check needs an occupied one, and
+    a crash is a more reliable death than on-foot fire.)"""
+    rc = Rcon(args.host, args.rcon_port, args.rcon_password)
+    cl = Client(args, "serverext testclient teamswitch")
+    mark("reset the vehicles: admin.restartMap")
+    rc("exec admin.restartMap")
+    cl.run_for(8.0)
+    for v in sorted(cl.vehicles.values(), key=lambda v: v["id"]):
+        log(f"  vehicle {v['id']} {v['name']} team {v['team']} flags {v['flags']} pos "
+            f"{v['pos'][0]:.1f} {v['pos'][1]:.1f} {v['pos'][2]:.1f} occ {v['occupied']:#x}")
+    mark("create A and B on team 1")
+    A = cl.create_bot("[BOT] ts A", 1)
+    B = cl.create_bot("[BOT] ts B", 1)
+    for b in (A, B):
+        cl.check(f"bot {b} spawned", cl.wait_alive(b))
+    cl.run_for(2.0, lambda: cl.vl_count > 0)
+    log_team_states(cl, (A, B))
+    cl.check("A and B are on team 1 in TickState (CreateBot's team won over PlayerConnect's)",
+             cl.states[A]["team"] == 1 and cl.states[B]["team"] == 1)
+    pad1 = list(cl.states[B]["pos"])
+    rc("bf2cc pl")
+
+    mark(f"switch B 1 -> 2 while alive: bf2cc switchplayer {B} 3")
+    rc(f"bf2cc switchplayer {B} 3")
+    cl.check("TickState shows B on team 2", cl.run_for(3.0, lambda: cl.states[B]["team"] == 2))
+
+    mark("A (team 1) takes the pilot seat of the nearest heli; B (team 2) asks for its seat 1")
+    kind, data = cl.enter(A, 0, 0)
+    cl.check(f"A entered: {kind} {data}", kind == "ack")
+    cl.run_for(1.5)
+    held = cl.vehicles.get(cl.states[A]["root"])
+    log(f"A holds {held and held['name']} id {held and held['id']} team {held and held['team']} seats {held and held['seats']}")
+    if held and held["seats"] > 1:
+        kind, data = cl.enter(B, held["id"], 1)
+        cl.check(f"EnterVehicle {held['id']} seat 1 (A's team 1 heli) refused for B on team 2: {kind} {data}",
+                 kind == "error" and data[0] == 5 and "other team" in data[1])
+
+    mark("B takes another, empty heli near team 1's pad and crashes it")
+    kind, data = board(cl, B, 2, "B", exclude=(held["id"],) if held else ())
+    cl.check(f"B (team 2) enters an empty heli: {kind} {data}", kind == "ack")
+    cl.run_for(1.0)
+    cl.check("B died in the crash", cl.in_vehicle(B) and crash(cl, B, "B"))
+    blocked0 = len(cl.blocked)
+    ok = wait_respawn(cl, B, timeout=40.0)
+    cl.check("B respawned after the switch", ok)
+    if ok:
+        cl.run_for(1.5)
+        e = cl.states[B]
+        far = flat_dist(e["pos"], pad1)
+        log(f"B respawn: {far:.0f} m from team 1's pad")
+        cl.check("B respawned on team 2, away from team 1's pad", e["team"] == 2 and far > 100.0)
+        kind, data = board(cl, B, 2, "B")
+        cl.check(f"B enters a heli at team 2's pad: {kind} {data}", kind == "ack")
+        cl.run_for(1.0)
+        e = cl.states[B]
+        v = cl.vehicles.get(e["root"])
+        cl.check(f"TickState shows B in a team 2 vehicle ({v and v['name']} team {v and v['team']})",
+                 cl.in_vehicle(B) and v is not None and v["team"] == 2)
+    cl.check(f"no SpawnBlocked for B after the switch ({cl.blocked[blocked0:]})",
+             not [x for x in cl.blocked[blocked0:] if x[1] == B])
+
+    mark("B crashes the heli at team 2's pad; switch it 2 -> 1 while dead")
+    died = cl.in_vehicle(B) and crash(cl, B, "B")
+    cl.check("B died in the crash", died)
+    if died:
+        rc(f"bf2cc switchplayer {B} 3")
+        cl.check("TickState shows dead B on team 1", cl.run_for(3.0, lambda: cl.states[B]["team"] == 1))
+    blocked0 = len(cl.blocked)
+    ok = wait_respawn(cl, B, timeout=40.0)
+    cl.check("B respawned after the switch back", ok)
+    if ok:
+        cl.run_for(1.5)
+        e = cl.states[B]
+        d = flat_dist(e["pos"], pad1)
+        log(f"B respawn: {d:.1f} m from team 1's pad")
+        cl.check("B respawned on team 1 at team 1's pad", e["team"] == 1 and d < 40.0)
+        if held and cl.in_vehicle(A):
+            kind, data = cl.enter(B, held["id"], 1)
+            cl.check(f"B (team 1 again) gets seat 1 of A's heli {held['id']}, refused before: {kind} {data}", kind == "ack")
+        else:
+            kind, data = board(cl, B, 1, "B")
+            cl.check(f"B enters a heli near team 1's pad: {kind} {data}", kind == "ack")
+        cl.run_for(1.0)
+        e = cl.states[B]
+        v = cl.vehicles.get(e["root"])
+        cl.check(f"TickState shows B in a team 1 vehicle ({v and v['name']} team {v and v['team']}, seat {e['seat']})",
+                 cl.in_vehicle(B) and v is not None and v["team"] == 1)
+    cl.check(f"no SpawnBlocked for B after the switch back ({cl.blocked[blocked0:]})",
+             not [x for x in cl.blocked[blocked0:] if x[1] == B])
+    rc("bf2cc pl")
+    return cl.finish()
+
+
 SCENARIOS = {"wreck": run_wreck, "walk": run_walk, "buttons": run_buttons, "blockpad": run_blockpad, "allblocked": run_allblocked,
-             "q9": run_q9, "q5": run_q5}
+             "q9": run_q9, "q5": run_q5, "teamswitch": run_teamswitch}
 
 
 # ------------------------------------------------------------------------------------- fuzz
@@ -1659,7 +1788,7 @@ def main():
     ap.add_argument("--fuzz-rounds", type=int, default=300)
     ap.add_argument("--expect-restart-refused", action="store_true", help="fuzz: the server has allowRoundRestart 0")
     ap.add_argument("--vehicle-log-every", type=float, default=60.0, help="seconds between VehicleList summaries")
-    ap.add_argument("--scenario", choices=["hover", "walk", "buttons", "blockpad", "allblocked", "wreck", "q9", "q5"],
+    ap.add_argument("--scenario", choices=["hover", "walk", "buttons", "blockpad", "allblocked", "wreck", "q9", "q5", "teamswitch"],
                     default="hover")
     ap.add_argument("--rcon-port", type=int, default=4723, help="q9: ModManager RCON port")
     ap.add_argument("--rcon-password", default="", help="q9: ModManager RCON password")
