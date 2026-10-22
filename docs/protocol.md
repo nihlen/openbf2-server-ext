@@ -216,7 +216,7 @@ the sidecar recreates them.
 | Type | Field |
 |---|---|
 | `u8` | player id |
-| `u8` | reason: 1 `RemoveBot`, 2 map change, 3 removed by the engine or an admin |
+| `u8` | reason: 1 `RemoveBot`, 2 map change, 3 vanished without an unload (no known admin path causes it) |
 
 ### Input
 
@@ -304,8 +304,12 @@ Codes: 1 version mismatch, 2 malformed frame, 3 unknown message type, 4 unknown 
   input and logs it once.
 - Neutral in v0: in a vehicle, cyclic and pedals 0 and collective held at its last value so the
   heli does not drop. On foot, every axis 0. On death the stored axes are zeroed, so a respawned bot
-  stands still until the sidecar sends input. Open question Q5: whether holding collective is the safest neutral, or whether a
-  server-side level-and-hover controller is needed.
+  stands still until the sidecar sends input.
+- Q5, answered (`docs/findings/q5-q9.md`): holding collective is safe only from a hover. On the Z-10 it
+  crashed the heli within about 10 s from a full-collective climb, a steep descent and a 32° banked
+  turn, because zero cyclic holds the current attitude. Proposed, not approved: in a heli, level the
+  attitude (P-D on pitch and roll, pedals damp yaw rate) and hold vertical speed at 0 (PI on
+  collective). All five tested states survived with it. It is a module change with no wire change.
 - On disconnect, bots are neutralised immediately and removed after the watchdog period, without
   `BotRemoved`.
 
@@ -375,11 +379,25 @@ and the 10-tick catch-up cap. Not part of v0.
 ### How these bots differ from retail AIDLL bots
 
 - They spawn without any human present: `m_roundGoing` is set before the begin-round wait for
-  `sv.numPlayersNeededToStart` humans (`ServerGameLogic.cpp:423`, `:452`). With the content's
-  setting of 2, the round stays in its waiting state (no timer, no tickets) but bots still spawn and
-  fly. Set it to 0 if the round timer and tickets matter.
-- `getIsAIGame()` is 0. Python sees `ai=1`, `remote=1`, `connected=0`, as for a retail bot.
-  How the netsky and `mm_webadmin` scripts treat such players is unchecked (Q9).
+  `sv.numPlayersNeededToStart` humans (`ServerGameLogic.cpp:423`, `:452`). But with only bots the
+  round never reaches Running: no round timer, no tickets, no scoring, no stats, and no Python
+  handlers, timers or triggers except `alwaysCall` ones. Bots never count as humans, and in this
+  tree `ServerSettings::getNumPlayersNeededToStart` returns a hard-coded 2
+  (`ServerSettings.cpp:333-342`, a `[CHOSEN, not recovered]` floor), so setting it to 0 has no
+  effect. Two connected humans are needed for a real round.
+- `getIsAIGame()` is 0. Python sees `ai=1`, `remote=1`, `connected=0`, profile 0, address `N/A`,
+  as for a retail bot. Q9, answered in `docs/findings/q5-q9.md`:
+  - No bot-specific Python exception in any ModManager module.
+  - Python `PlayerConnect` runs inside `createInputPlayer`, before the module sets the team, so
+    mm_autobalance and mm_webadmin first see the bot on team 2. No `PlayerChangeTeams` follows.
+  - A crash (death with no attacker) raises in `mm_webadmin.onPlayerKilled` and is never reported.
+    That is not bot-specific.
+  - Kick and ban do nothing to a bot. A ModManager ban writes a permanent ban on address `N/A`.
+    So `BotRemoved` reason 3 cannot come from an admin.
+  - An admin team switch leaves the module's cached team stale: the bot never respawns. That is a
+    module bug and is being fixed: `TickState`'s team is authoritative.
+  - After a kill, the alive flag stays set for `sv.manDownTime` (2 s), because the soldier is
+    man-down.
 - GameSpy reports `AIPlayer=1` per bot but `hasBots=0`.
 - They get human weapon deviation and none of the AIDLL's squad, heal or ammo notifications.
 
@@ -398,8 +416,8 @@ to an empty server ticking on `dalian_2_v_2` for over 5 minutes, in both WSL and
 - Changes from production: `sv.internet 0`, `sv.punkBuster 0`, `mm_webadmin` pointed at an unused
   port (`127.0.0.1:4303`), and the server started with `start.sh`, never `start_bf2hub.sh`, which
   preloads the retail `libbf2hub.so`.
-- Bot-only runs need no human (Q7, answered). Set `sv.numPlayersNeededToStart 0` if the round
-  timer and tickets matter.
+- Bots spawn and fly with no human, but the round only runs with two connected humans (see "How
+  these bots differ"). Anything that needs round scoring or tickets needs two game clients.
 
 ### Where to run the server
 
@@ -617,11 +635,11 @@ fights and a gunner bot. Item 8 overlaps the admin channel's events (`docs/admin
 | Q2 | Engine native rotation convention and the conversion | Answered ([Conventions](#conventions)) |
 | Q3 | How to spawn a bot into a heli seat; AI flags on the 2v2 spawn points | Answered: pad spawn, then `EnterVehicle`; needs R1b |
 | Q4 | Does writing raw axes match the client ControlMap path, including signs | Server side answered (mapping bits, quantization); client ControlMap stage open |
-| Q5 | Safest neutral input for the watchdog | Open |
+| Q5 | Safest neutral input for the watchdog | Answered: held collective is unsafe outside a hover; level-and-hold proposed ([Watchdog](#watchdog)) |
 | Q6 | Can a Windows client join a server in WSL (UDP forwarding) | Answered: use the WSL VM's IP, or Docker |
-| Q7 | Does `sv.numPlayersNeededToStart 0` start a round with only bots | Answered: bots spawn with 0 or 2; 0 also starts the timer and tickets |
+| Q7 | Does `sv.numPlayersNeededToStart 0` start a round with only bots | Answered: bots spawn either way, but the round never runs without two humans; this tree floors the setting at 2 |
 | Q8 | Does unrecovered retail code use EventManager category 7 | Open; needs IDA/Ghidra. If yes, use R0 |
-| Q9 | How the netsky and `mm_webadmin` Python treat `ai=1`, `connected=0` players | Open |
+| Q9 | How the netsky and `mm_webadmin` Python treat `ai=1`, `connected=0` players | Answered (see "How these bots differ") |
 | Q10 | Which slots move, strafe and turn a soldier, and the look axes' range | Answered ([On foot](#on-foot)); look pitch sign unmeasured |
 | Q11 | Button bit table | Answered ([Buttons](#buttons)) |
 
