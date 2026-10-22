@@ -582,6 +582,20 @@ From the v1 sidecar (`bf2-bots/docs/serverext-backend.md`). Not approved.
 2. `enterRange` in `Welcome`, so the sidecar doesn't have to be told it.
 3. More than one connection, or a way to hand bots between connections. Test setups that need a
    second client currently run everything on one connection.
+4. Weapon state per own bot in `TickState`: the selected weapon, rounds loaded, magazines and
+   reloading. Today the sidecar counts its own shots against the tweak files.
+5. Projectiles near own bots, at least missiles in flight: position, velocity, owner team and
+   template. These are raw and must go through the perception filter. They are needed for dodging,
+   for enemy TV-missile timing, and for a gunner bot that guides a TV missile.
+6. Spotting: a spot button or message, and the team's spotted state of enemies.
+7. Round start: chat lines for this connection, or a round-state field. The 2v2 rules start on the
+   gunners' "rdy"/"go".
+8. Damage events (victim, attacker, weapon, amount), filtered to what a player would see (hit
+   markers, kill messages).
+9. Teleport, for test drills on test servers only, behind a `serverext.cfg` switch.
+
+Items 4-8 come from the play mission (`bf2-bots/docs/serverext-missions.md`). Items 4 and 5 unblock TV
+fights and a gunner bot. Item 8 overlaps the admin channel's events (`docs/admin-channel-draft.md`).
 
 ## Later
 
