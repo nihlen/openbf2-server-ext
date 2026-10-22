@@ -77,11 +77,11 @@ protocol and its problems: draft 1, in git history (`5fc2a6d`).
 
 | Entity | Fields |
 |---|---|
-| Player | id, name, team, squad, bot flag, profile id, IP and CD-key hash (only with `adminSendIdentity`), ping, score, kills, deaths, team kills, alive or man-down or dead, vehicle id and seat |
+| Player | id, name, team, squad, bot flag, profile id, IP and CD-key hash (sent unless `adminSendIdentity 0`; WebAdmin keys auth and match records on the hash), ping, score, kills, deaths, team kills, alive or man-down or dead, vehicle id and seat, position and rotation (of the root vehicle when seated) |
 | Vehicle | networkable id, template, team, position, rotation, velocity, health, destroyed, occupied seats |
 | Control point | id, template, team, capture state |
 | Projectile | id, template, owner player, position, velocity (only templates WebAdmin subscribes to, e.g. TV missiles) |
-| Game | state (all six, including Paused), tickets for both teams, round time |
+| Game | state (all six, including Paused), tickets and score for both teams, round time |
 
 **`Subscribe(stream, rateHz, filter)`**
 - The streams are player states, vehicles, projectiles (filtered by template) and tickets.
@@ -89,6 +89,8 @@ protocol and its problems: draft 1, in git history (`5fc2a6d`).
   rotations are float32; WebAdmin picks low rates (1-5 Hz) where it doesn't animate.
 
 ### Events (sequence-numbered)
+
+For one victim, `Kill` comes before `Death`. `Spawn` also fires for a spawn straight into a vehicle.
 
 | Event | Notes |
 |---|---|
@@ -112,17 +114,19 @@ protocol and its problems: draft 1, in git history (`5fc2a6d`).
 |---|---|
 | `Console` | executes a line and returns its output. Runs in order. Can be turned off |
 | `Say` | to all, a team or one player |
-| `Teleport` | a player's root vehicle or any object id: position and rotation |
-| `SetHealth`, `KillPlayer` | |
+| `Teleport` | a player's root vehicle or any object id: position, rotation, or both |
+| `SetHealth`, `KillPlayer` | `KillPlayer` states whether the player's vehicle is destroyed too (today's `damage 1` does) |
 | `SetTeam` | optionally killing the player |
 | `SetScore` | score, kills, deaths |
 | `Rank`, `Medal` | |
 | `GameEvent`, `HudEvent` | including the 0 values today's Python skips |
 | `Kick`, `Ban` | For a bot these map to `RemoveBot`, or are refused, never to the address `N/A` ban |
 | `Map` | restart, next, or set map and mode |
-| `ListObjects` | template filter; returns ids, templates, positions, rotations and health. Replaces `listObjectsOfTemplate` parsing |
+| `ListObjects` | template filter; returns ids, templates, positions, rotations and health. Replaces `listObjectsOfTemplate` parsing. Returns the console id beside the networkable id, because static map objects (fences) may have no networkable id |
+| `SetObjectActive` | by console or networkable id; replaces `object.active id<N>` for Freeze, Heli2v2 noclip and `.nofences` |
 | `SpawnObject`, `DeleteObject` | template, position, rotation; for map modules. Can be turned off |
 | `Subscribe`, `Unsubscribe` | streams |
+| `Ping` | keepalive either way, so a dead link is noticed |
 | `SetPolicy`, `ClearPolicy` | phase 3 |
 
 ### Policies (phase 3)
@@ -135,6 +139,14 @@ protocol and its problems: draft 1, in git history (`5fc2a6d`).
 
 The module reports every action it takes as an event. Policies need engine veto hooks (R6), each
 designed and approved on its own.
+
+### Conventions
+
+- Rotations use the bot channel's convention (`docs/protocol.md`, Conventions).
+- Text is UTF-8. `§` (BF2's colour-code prefix) maps to byte 0xA7 at the engine boundary, so colour
+  codes keep working.
+- The `Welcome` map list carries each map's mode and size.
+- WebAdmin's server id is its existing `Server.ServerId` value; the key is a new `AdminKey` column.
 
 ## Engine changes (OpenBF2 branch `serverext/r1`, each `[CHOSEN, not recovered]`)
 
@@ -151,6 +163,8 @@ designed and approved on its own.
   - a listener with the new protocol and authentication;
   - a C# codec with the shared golden-byte tests;
   - events and state fed straight into its domain model, with no text lines.
+- The survey of what changes is `docs/findings/admin-csharp-inventory.md`: roughly 25-30 files
+  touched, 10-12 new, and the old socket/parser/writer removed.
 - **Game modules change where they relied on the text protocol.** Heli2v2's `listObjectsOfTemplate`
   parsing becomes `ListObjects`. `RootVehicleId` becomes the networkable id. Rcon `\b` parsing and
   ordered raw console strings become typed commands where one exists.
@@ -165,6 +179,7 @@ designed and approved on its own.
    - The admin channel's session, authentication and TLS, snapshot, events, streams and the core
      commands. The byte layouts go into this document for review before phase 2.
    - A Python reference client with a fuzz mode, as for the bot channel.
+   - Verify that OpenBF2 computes a CD-key hash for each player; WebAdmin depends on it.
    - Verified on the WSL and Docker test servers.
 2. **BF2WebAdmin.**
    - The C# codec and backend, and the module refactors.
