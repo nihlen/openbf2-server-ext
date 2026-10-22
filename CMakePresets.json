@@ -1,0 +1,22 @@
+{
+  "version": 3,
+  "configurePresets": [
+    {
+      "name": "linux-x64",
+      "displayName": "libserverext.so, Linux x86-64 (WSL or Debian 11)",
+      "generator": "Ninja",
+      "binaryDir": "$env{HOME}/serverext-build/linux-x64",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "SERVEREXT_BUILD_TESTS": "ON"
+      },
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux" }
+    }
+  ],
+  "buildPresets": [
+    { "name": "linux-x64", "configurePreset": "linux-x64" }
+  ],
+  "testPresets": [
+    { "name": "linux-x64", "configurePreset": "linux-x64", "output": { "outputOnFailure": true } }
+  ]
+}
