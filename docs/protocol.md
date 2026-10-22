@@ -468,6 +468,9 @@ Entry:
 - The engine pools vehicle objects. A cleared wreck, or a heli waiting for its spawner, sits at
   0/0/0 with no armour component (health -1, not flagged destroyed) until it is placed again. All
   helis are in that state briefly during a level load. The sidecar ignores entries with health -1.
+  Each crash and respawn can leave another pooled entry, and a base's heli can come back under a
+  different id, so an id is only good for one pick.
+- Damaged helis are not destroyed and can be entered. A minimum health is sidecar policy.
 - Team is 0 for every empty heli, including those on a base's pad, so only position tells whose
   heli it is.
 - This is the sidecar's only source for a vehicle's type and for empty vehicles. Enemy vehicles
@@ -554,7 +557,7 @@ evidence in `module-v1.md`.
 | 6 | prone | toggles |
 | 7 | reload | |
 | 8 | cycle camera view | cycles every tick while held, so send it for one tick |
-| 9-12 | camera views 1-4 | idempotent |
+| 9-12 | camera views 1-4 | 10-12 are idempotent. 9 is not: from view 1 it selects the nose cam when the server allows it. To reach view 1 from any view, press 10, then 9. |
 | 13-21 | weapon select 1-9 | gas mask and night vision flip every tick while held |
 | 22 | next weapon | |
 | 23 | fire mode | |
@@ -569,6 +572,16 @@ evidence in `module-v1.md`.
 - `IServerExtension` gained, appended: `listSpawnGroups(team, SpawnGroupInfo*, capacity)`,
   `restartRound()` (what `admin.restartMap` runs) and `getGameStatus()`. OpenBF2 branch
   `serverext/r1`, commit `540fa88`.
+
+## Proposed for v2
+
+From the v1 sidecar (`bf2-bots/docs/serverext-backend.md`). Not approved.
+
+1. Each own bot's camera view mode in `TickState`, so the sidecar can verify a view change. Today
+   it is visible only in the module's log, and latest-wins can drop a one-tick press.
+2. `enterRange` in `Welcome`, so the sidecar doesn't have to be told it.
+3. More than one connection, or a way to hand bots between connections. Test setups that need a
+   second client currently run everything on one connection.
 
 ## Later
 
