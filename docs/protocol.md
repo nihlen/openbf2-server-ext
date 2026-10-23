@@ -941,6 +941,20 @@ Layout unchanged (33 bytes). Semantics:
 - The module logs the first 20 applied directions and every 300th, with the target object's
   position after the call.
 
+### Sidecar on v3
+
+bf2-bots `b8babda` (`docs/serverext-backend.md` "Protocol v3"): gunner bots in both helis toggle to the
+TV launcher, aim and guide every tick; crews fight crew against crew. Over three 10-minute soaks, 24 of
+25 heli kills were TV kills, 0 tick gaps, 0 refused directions; no camera press needed repeating.
+
+- **Only one TV missile flies at a time on this server** (Q12): 19 of 85 fire presses launched nothing,
+  each while the other crew's TV missile was in flight. Every TV missile is the same pooled object
+  (projectile 1852), and `LPTargetComp::requestFire` refuses while its `m_currentProjectile` weak
+  pointer resolves (`LPTargetComp.cpp:322-336`, `disableFireWhenActiveMissile 1`). Suspected: the weak
+  pointer to an ended missile resolves again when the pool reuses the object for another launcher.
+- **Projectile ids are reused across flights.** The sidecar starts a new flight when the id was absent
+  at the last update, its time to live went up, or its owner changed.
+
 ### Chat text
 
 `Chat` text is converted from Windows-1252 to UTF-8 like the admin channel's (`§`, byte 0xA7, arrives
@@ -968,6 +982,8 @@ splits a character.
 - The admin channel for BF2WebAdmin: approved 2026-10-22 as `docs/admin-channel-draft.md` draft 2
   (its own contract, not bound to `mm_webadmin`). It shares R5 with v2 item 8.
 - R3 stepped time and a `Step` message.
+- Proposed by the sidecar, not approved: a per-flight id or launch counter in `ProjectileList`, since
+  pooled projectile ids are reused.
 
 
 - Hooks that can veto or change actions (damage, team selection).
@@ -987,6 +1003,7 @@ splits a character.
 | Q9 | How the netsky and `mm_webadmin` Python treat `ai=1`, `connected=0` players | Answered (see "How these bots differ") |
 | Q10 | Which slots move, strafe and turn a soldier, and the look axes' range | Answered ([On foot](#on-foot)); look pitch sign unmeasured |
 | Q11 | Button bit table | Answered ([Buttons](#buttons)) |
+| Q12 | Why a TV launch is refused while another launcher's TV missile flies; does retail do the same | Open; investigation launched 2026-10-23 |
 
 Still unexercised at runtime: the three R1b guards, the enter-on-spawn path for a bot, yaw and roll
 input and any client connection. The `[FRONTIER]` comment at `SpawnPoint.cpp:211-214` is stale: the bodies below it are
