@@ -1011,7 +1011,7 @@ splits a character.
 | Q9 | How the netsky and `mm_webadmin` Python treat `ai=1`, `connected=0` players | Answered (see "How these bots differ") |
 | Q10 | Which slots move, strafe and turn a soldier, and the look axes' range | Answered ([On foot](#on-foot)); look pitch sign unmeasured |
 | Q11 | Button bit table | Answered ([Buttons](#buttons)) |
-| Q12 | Why a TV launch is refused while another launcher's TV missile flies; does retail do the same | Cause found in OpenBF2 source (stale `IProjectileObject` weak block after caching, `docs/findings/q12-tv-refusal.md`); retail unverified (no IDA/Ghidra); fix not implemented |
+| Q12 | Why a TV launch is refused while another launcher's TV missile flies; does retail do the same | Cause found in OpenBF2 source (stale `IProjectileObject` weak block after caching, `docs/findings/q12-tv-refusal.md`); retail unverified (no IDA/Ghidra); engine fix deferred by the author 2026-10-23; sidecar workaround in use |
 
 Still unexercised at runtime: the three R1b guards, the enter-on-spawn path for a bot, yaw and roll
 input and any client connection. The `[FRONTIER]` comment at `SpawnPoint.cpp:211-214` is stale: the bodies below it are
