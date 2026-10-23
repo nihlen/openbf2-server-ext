@@ -1,7 +1,9 @@
 # Admin channel: proposal (draft 2)
 
-Status: **approved by the author on 2026-10-22**, with the decisions in [Decisions](#decisions). Byte
-layouts are written in phase 1 and reviewed before the C# side starts. It replaces draft 1, which kept
+Status: **approved by the author on 2026-10-22**, with the decisions in [Decisions](#decisions).
+**Phase 1 implemented 2026-10-23** (OpenBF2 `873d1b1`, module `f62ae97`..`0aab582`,
+`docs/findings/admin-phase1.md`). The wire format below is phase 1's and awaits the author's review
+before the C# side (phase 2) starts. It replaces draft 1, which kept
 `mm_webadmin.py`'s text protocol.
 The author has decided that the BF2WebAdmin C# side may change as much as needed, and that the
 author keeps deployments from running `mm_webadmin.py` and the native channel at the same time.
@@ -190,6 +192,506 @@ designed and approved on its own.
 
 TLS is part of phase 1 (B1).
 
+## Wire format (admin protocol version 1, phase 1)
+
+Copied from `docs/findings/admin-phase1.md`, where it was written before the code.
+
+#### Framing and conventions
+
+- **Transport.** TCP from the module to WebAdmin (`adminConnect host:port`), inside TLS 1.3 unless
+  `adminTls 0`. The module dials; WebAdmin listens.
+- **Frame.** The bot channel's header: `u32` payload length, `u16` type, `u16` reserved (0), then
+  the payload. Little-endian. Strings are `u16` byte length plus UTF-8, no terminator.
+- **Frame size.** WebAdmin → module payloads are at most 64 KiB, as on the bot channel. Module →
+  WebAdmin payloads may be up to 1 MiB, because `Snapshot`, `ObjectList` and `ConsoleResult` can be
+  large. A larger length, or a nonzero reserved field, is a framing error: `Error` 2 and close.
+- **Its own version and type range.** The admin channel is version 1 of its own protocol. Its types
+  are `0x1001`-`0x15FF`; only `0xFFFF Error` is shared with the bot channel, with the same layout.
+  Nothing on this connection is a bot-channel message.
+- **Errors.** As on the bot channel: framing or parse error `Error` 2 and close; an unknown type, or
+  a type sent in the wrong direction, `Error` 3 and close; per-request errors keep the connection.
+- **Player ids** are `u8` where a player must exist and `i16` where none is possible (`-1` = none).
+  The bot channel's presence bits are not reused here: bots count down from 255, and an `i16` cannot
+  be misread.
+- **Object ids.** A networkable id is `u32` (the engine's id is 16 bits; 0 = none). A console id is
+  the object's grid id, the `N` in `object.active idN` (`IObject::getObjectId`, resolved by
+  `ObjectManager::getObjectFromGrid`, `Scene/Object/ObjectTemplateUtil.cpp:76-85`), as `u32` with
+  `0xFFFFFFFF` = none. Static map objects can have a console id and no networkable id.
+- **`ObjectRef`** (commands that act on an object):
+
+  | Type | Field |
+  |---|---|
+  | `u8` | kind: 1 a player's root object (its vehicle when seated, else its soldier), 2 networkable id, 3 console id |
+  | `u32` | id: the player id for kind 1 |
+
+- **Vectors.** `Vec3` is 3 × `f32` x, y, z (metres; m/s for velocities). `Rot` is 3 × `f32` yaw,
+  pitch, roll in degrees, the bot channel's convention (`docs/protocol.md`, Conventions). It is
+  the same as Python's `getRotation`: Python returns the negated, reversed ZXY angles
+  (`Game/Python/py/Objects.cpp:611-628`), and `getRotationZXY` (`Math/Mat4.cpp:234-264`) gives
+  z = atan2(-m1, m5), x = asin(m9), y = atan2(-m8, m10), so Python's (yaw, pitch, roll) is
+  (atan2(m8, m10), -asin(m9), atan2(m1, m5)), which is the bot channel's formula. The draft's
+  rotation gap in `admin-csharp-inventory.md` section 2 therefore needs no conversion. Setting a
+  rotation uses the exact inverse, `setRotationZXY(-roll, -pitch, -yaw)` (`Math/Mat4.cpp:167-232`),
+  which is also what `IGame::createObjectOnAllClients` does with its rotation argument
+  (`Game/GameServer/GameServer.cpp:2327`).
+- **Text** is UTF-8 on the wire and Windows-1252 in the engine. The module converts both ways, so
+  `§` (U+00A7) is byte 0xA7 in the engine and colour codes keep working. Inbound text that is not
+  valid UTF-8 is `Error` 7; a character with no 1252 byte becomes `?`.
+- **Order.** The game thread runs WebAdmin's commands in arrival order, at most 64 per tick (the rest
+  on the next tick), and queues each reply when the command has run. Everything the module sends
+  (replies, `Snapshot`, events) goes out in the order it was queued, except stream frames
+  (latest wins, written after the queued frames of each flush).
+
+#### Sequence numbers and resync
+
+- Every event carries a `u32` sequence number. Numbers count per link session: the first event after
+  the `Snapshot` that follows `Welcome` is 1, and each event sent on that session is the previous
+  plus one.
+- **`Snapshot.lastSeq`** is the number of the last event whose effect the snapshot already includes.
+  WebAdmin drops events with a number at or below it and applies the rest.
+- **Gaps.** The module never blocks on a slow WebAdmin. When its outbound queue exceeds
+  `adminQueueBytes` (default 4 MiB), it drops new events instead of queueing them; their numbers are
+  used up, so WebAdmin sees the gap and sends `RequestSnapshot`. Replies and snapshots are never
+  dropped; if the queue reaches four times `adminQueueBytes` the module closes the link and
+  reconnects.
+- **Reconnect.** A new link gets a new session number in `Welcome`, a full `Snapshot` and numbering
+  from 1. Subscriptions do not survive a reconnect.
+
+#### Session (`0x10xx`)
+
+The module connects, completes TLS (pinned, below), and sends `Hello`. WebAdmin answers `Challenge`.
+The module checks WebAdmin's proof, then sends `Auth`, `Welcome` and `Snapshot` without waiting.
+WebAdmin checks the module's proof before it uses anything after it; on a bad proof it sends `Error`
+8 and closes. The whole handshake, TLS included, must finish within 10 s of the TCP connect.
+
+**`0x1001 Hello`** (module → WebAdmin)
+
+| Type | Field |
+|---|---|
+| `u16` | admin protocol version, 1 |
+| string | server id (`adminServerId`, 1-64 bytes; WebAdmin's `Server.ServerId`) |
+| 32 bytes | module nonce `Nm` (random, from OpenSSL `RAND_bytes`) |
+| string | module build, for logs (for example `libserverext admin 1`) |
+
+**`0x1002 Challenge`** (WebAdmin → module)
+
+| Type | Field |
+|---|---|
+| 32 bytes | WebAdmin nonce `Nw` (random) |
+| 32 bytes | WebAdmin proof `Pw` |
+
+**`0x1003 Auth`** (module → WebAdmin)
+
+| Type | Field |
+|---|---|
+| 32 bytes | module proof `Pm` |
+
+Proofs, with `K` the raw key (`adminKey` as hex, 16-64 bytes) and `id` the server id bytes:
+
+```
+T(label) = label || 0x00 || u16le(len(id)) || id || Nm || Nw
+Pw = HMAC-SHA256(K, T("OBF2-ADMIN-1 webadmin"))
+Pm = HMAC-SHA256(K, T("OBF2-ADMIN-1 server"))
+```
+
+- The labels are ASCII. Different labels mean neither side's proof can be replayed as the other's.
+- WebAdmin proves the key first, so the module sends nothing that depends on the key, and no server
+  information, to a peer that has not proven it.
+- Compare proofs in constant time (`CRYPTO_memcmp`; .NET `CryptographicOperations.FixedTimeEquals`).
+- **Not bound to the TLS session.** .NET's `SslStream` has no TLS exporter, so the transcript does
+  not include TLS keying material. The pinned certificate is what prevents a relay; the HMAC proves
+  the key.
+- A version other than 1 in `Hello`: WebAdmin sends `Error` 1 and closes. An unknown server id or a
+  server with no key: `Error` 8 and close. A bad `Pw`: the module sends `Error` 8, closes and backs
+  off as after any failed attempt.
+
+**`0x1004 Welcome`** (module → WebAdmin)
+
+| Type | Field |
+|---|---|
+| `u16` | admin protocol version, 1 |
+| `u32` | session number: 1 for the first link since the server process started, then +1 per link |
+| `u32` | current module tick |
+| `f32` | tick rate, Hz (30) |
+| string | server name (`IGameServer::getName`) |
+| `u16` | game port (`sv.serverPort`) |
+| `u16` | GameSpy query port (`sv.gameSpyPort`) |
+| `u8` | maximum players (`sv.maxPlayers`) |
+| `u8` | capabilities: bit 0 `Console` allowed, bit 1 `SpawnObject`/`DeleteObject` allowed, bit 2 IPs and CD-key hashes are sent |
+| string | current map name |
+| string | current game mode |
+| `u16` | current map size (`IGame::getCurrentMapSize`) |
+| `u16` | current map-list index, `0xFFFF` if none |
+| `u16` | map-list entries M |
+| M × entry | string name, string game mode, `u16` size: the server's rotation (`maplist.list`), every mode |
+| string | team 1 name (`IGameLogic::getTeamName(1)`) |
+| string | team 2 name |
+| `GameState` | below |
+
+#### State (`0x11xx`)
+
+**`GameState`** (in `Welcome`, `Snapshot`, `GameStream` and the `GameState` event)
+
+| Type | Field |
+|---|---|
+| `u8` | game status (`IGameLogic::getGameStatus`): 1 playing, 2 end game, 3 pre game, 4 paused, 5 restart, 6 not connected; 0 none |
+| `u8` | begin-round state: 0 announce, 1 waiting for players, 2 pre-round countdown, 3 running; 255 none |
+| `f32` | seconds to the next state change, -1 if none |
+| 2 × `i32` | tickets of teams 1 and 2, -1 if unknown |
+| `f32` | round time: seconds since the round started (`ServerGameLogic` round-start tick), -1 if not started |
+| `f32` | time limit, seconds (`sv.timeLimit`), 0 if none |
+| `u8` | winner of the last round, 0 if none |
+| `u8` | victory type of the last round, 0 if none |
+
+**`PlayerState`** (per player, in `Snapshot` and `PlayerStream`)
+
+| Type | Field |
+|---|---|
+| `u8` | team |
+| `u8` | squad, 0 if none |
+| `u8` | life: 0 dead, 1 alive, 2 man-down (alive and down; `IPlayer::getIsManDown`) |
+| `u8` | flags: bit 0 seated in a vehicle, bit 1 commander, bit 2 squad leader |
+| `u16` | ping, ms |
+| `u32` | root object's networkable id (its vehicle when seated, else its soldier), 0 if none |
+| `u32` | root object's console id, `0xFFFFFFFF` if none |
+| `u8` | seat (the PCO id), 255 on foot or dead |
+| `Vec3` | root position (0/0/0 when dead) |
+| `Rot` | root rotation |
+| `Vec3` | root velocity (its physics node) |
+| `f32` | soldier health 0..1 (its armour), -1 if none |
+
+**`PlayerScore`** (in `PlayerInfo` and `ScoreChange`)
+
+| Type | Field |
+|---|---|
+| `i32` | score (`PlayerScoreData::m_score`) |
+| `i32` | team score (`rplScore`, `m_field04`) |
+| `i32` | kills (`m_field14`) |
+| `i32` | deaths (`m_field10`) |
+| `i32` | team kills (`TKs`, `m_field18`) |
+| `i16` | rank (`m_rank`), -1 if none |
+
+The field mapping is Python's `pmgr_setScore` (`Game/Python/PythonHost.cpp:1474-1511`).
+
+**`PlayerInfo`** (per player, in `Snapshot` and `PlayerConnect`)
+
+| Type | Field |
+|---|---|
+| `u8` | player id |
+| string | name |
+| `u8` | flags: bit 0 AI-flagged (any bot), bit 1 created by the module's bot channel, bit 2 connected (`IPlayer::getIsConnected`), bit 3 IP and hash below are sent |
+| `i32` | profile id |
+| string | IP address, empty if withheld or none (bots) |
+| string | CD-key hash, empty if withheld or none (see the CD-key answer below) |
+| `PlayerScore` | |
+| `PlayerState` | |
+
+**`VehicleState`**
+
+| Type | Field |
+|---|---|
+| `u32` | networkable id |
+| `u32` | console id |
+| string | template name |
+| `u8` | team, 0 if neutral or empty |
+| `u8` | flags: bit 0 destroyed (hit points at or below 0) |
+| `Vec3` | position |
+| `Rot` | rotation |
+| `Vec3` | velocity |
+| `f32` | health 0..1, -1 with no armour component (a pooled wreck) |
+| `u8` | seats |
+| `u32` | occupied seats, bit 0 = seat 0 |
+
+The set is the bot channel's vehicle set (`docs/protocol.md` v1 "Vehicles"): every root object with
+seats that is not a soldier or a camera, including pooled entries at 0/0/0 with health -1.
+
+**`ControlPointState`**
+
+| Type | Field |
+|---|---|
+| `u32` | console id |
+| `u32` | networkable id, 0 if none |
+| string | template name |
+| `u8` | team (`IControlPoint::getTeam`) |
+| `u8` | flag team (`IControlPoint::getFlag`) |
+| `f32` | take-over counter 0..1 (`getTakeOverCounter`) |
+| `u8` | capturing state (`getCapturingState`) |
+| `Vec3` | position |
+
+**`ProjectileState`**
+
+| Type | Field |
+|---|---|
+| `u32` | id: networkable id, or the engine object id plus 0x10000 without one (as the bot channel) |
+| string | template name |
+| `i16` | owner player, -1 if none |
+| `u8` | owner team |
+| `u8` | flags: bit 0 guided (seek component) |
+| `u32` | networkable id of the guided target's root, 0 if none |
+| `Vec3` | position |
+| `Rot` | rotation |
+| `Vec3` | velocity |
+| `f32` | time to live, seconds |
+
+Only projectiles whose template is in a projectile subscription are tracked (`Subscribe` stream 3 or
+17), at most 256 at once.
+
+**`0x1101 Snapshot`** (module → WebAdmin): after `Welcome`, and in reply to `RequestSnapshot`.
+
+| Type | Field |
+|---|---|
+| `u32` | request id: 0 after `Welcome`, else `RequestSnapshot`'s |
+| `u32` | `lastSeq` (above) |
+| `u32` | tick |
+| `f64` | server time, seconds |
+| `GameState` | |
+| `u8` | players P, then P × `PlayerInfo` |
+| `u16` | vehicles V, then V × `VehicleState` |
+| `u16` | control points C, then C × `ControlPointState` |
+| `u16` | projectiles R, then R × `ProjectileState` (the subscribed templates only) |
+
+**`0x1102 RequestSnapshot`** (WebAdmin → module): `u32` request id. Reply: `Snapshot`.
+
+**`0x1103 Subscribe`** (WebAdmin → module). Reply `Ok` or `Error` 7.
+
+| Type | Field |
+|---|---|
+| `u32` | request id |
+| `u8` | stream: 1 players, 2 vehicles, 3 projectiles, 4 game; event streams 16 `Damage`, 17 `ProjectileFired`/`ProjectileHit` |
+| `u8` | rate, Hz, 1..30 (ignored for 16 and 17) |
+| `u8` | filters F |
+| F × string | template names, compared without case. Streams 3 and 17 need at least one; the others take none |
+
+A new `Subscribe` for a stream replaces the old one. The module sends a stream frame every
+`round(30 / rate)` ticks.
+
+**`0x1104 Unsubscribe`** (WebAdmin → module): `u32` request id, `u8` stream. Reply `Ok`.
+
+**Stream frames** (module → WebAdmin; latest wins: an unsent frame is replaced by the next one):
+
+| Type | Payload |
+|---|---|
+| `0x1111 PlayerStream` | `u32` tick, `f64` time, `u8` N, N × (`u8` player id, `PlayerState`) |
+| `0x1112 VehicleStream` | `u32` tick, `f64` time, `u16` N, N × `VehicleState` |
+| `0x1113 ProjectileStream` | `u32` tick, `f64` time, `u16` N, N × `ProjectileState` |
+| `0x1114 GameStream` | `u32` tick, `f64` time, `GameState` |
+
+#### Events (`0x12xx`, module → WebAdmin)
+
+Every event starts with `u32` sequence number and `u32` tick. The fields below follow them. Sources:
+"R4" is the script-event observer (engine change below) with its script-event id; the module
+reads the objects during the callback, before Python's handlers run.
+
+| Type | Event | Fields after seq and tick | Source |
+|---|---|---|---|
+| `0x1201` | GameState | `GameState`, `u8` previous status | `ECGameLogic` id 1 (every status change, Paused included, `ServerGameLogic.cpp:311-318`), and begin-round state changes polled per tick |
+| `0x1202` | RoundStart | string map, string mode, 2 × `i32` tickets | status becomes 1 (playing) from anything except 4 (paused) |
+| `0x1203` | RoundEnd | 2 × `i32` tickets, `u8` winner (0 none), `u8` victory type | status becomes 2 (end game); `endGame` sets the winner first (`ServerGameLogic.cpp:883-897`) |
+| `0x1204` | PlayerConnect | `PlayerInfo` | R4 14 |
+| `0x1205` | PlayerDisconnect | `u8` player, `u8` reason: 0 unknown, 1 left, 2 kicked, 3 timed out, 4 banned, 5 other; `u16` engine reason, `0xFFFF` if none | R4 15 plus the pending disconnect type (engine getter below) |
+| `0x1206` | Spawn | `u8` player, `u8` team, `u32` root networkable id, `u32` root console id, string root template, `Vec3` position, `Rot` rotation | R4 23 while the player is not yet alive (`spawnPlayer` enters the soldier before `setIsAlive(true)`, `ServerGameLogic.cpp:2061-2062`). A spawn straight into a vehicle is `Spawn` (soldier) then `EnterVehicle` |
+| `0x1207` | Death | `u8` player, `u8` team, `u32` networkable id, string template of the object the player was in, `Vec3` its position | R4 3 |
+| `0x1208` | Revive | `u8` revived player, `i16` medic | R4 2 |
+| `0x1209` | TeamChange | `u8` player, `u8` old team, `u8` new team, `u8` flags: bit 0 bot-channel bot | the module compares every player's team each tick (any source) |
+| `0x120A` | ScoreChange | `u8` player, `PlayerScore` | the module compares every player's score fields each tick (any source) |
+| `0x120B` | Kill | see below | R4 1 |
+| `0x120C` | Damage | see below; only while subscribed (stream 16) | R5 |
+| `0x120D` | EnterVehicle | `u8` player, `u8` seat, `u8` flags (bit 0 the child soldier is active), `u32` root networkable id, `u32` root console id, string root template, string seat template | R4 21 (non-soldier objects only) |
+| `0x120E` | ExitVehicle | the same fields, for the vehicle left | R4 22 |
+| `0x120F` | VehicleDestroyed | `u32` networkable id, `u32` console id, string template, `i16` attacker, `Vec3` position | R4 24, vehicles only (the engine also raises it for dying soldiers) |
+| `0x1210` | ControlPoint | `u8` kind (1 captured, 0 neutralised: the engine's argument), `ControlPointState` (the team after the game-mode script ran) | R4 25, reported at the module's next tick (the conquest script sets the new team in its Python handler, after R4) |
+| `0x1211` | Chat | `i16` sender (-1 the server), `u8` sender team (for channel 13 the target team), `u8` channel (the engine's number, `GameServer::handleStringReceivedEvent`), string channel name, `u32` engine flags, `u8` text flags (bit 0 a dead prefix was removed), string text | R4 39 |
+| `0x1212` | ProjectileFired | `ProjectileState` | the v2 projectile observer, subscribed templates only (stream 17) |
+| `0x1213` | ProjectileHit | `u32` id, string template, `i16` owner, `u8` flags (bit 0 expired: time to live ran out, bit 1 it damaged something), `u32` networkable id of the first object it damaged (0 none), `Vec3` last position | a tracked projectile no longer in flight (stream 17) |
+| `0x1214` | Kick | `u8` player, string name | R4 17 (`BanList::alertOnKicked`: every kick, ban and vote kick) |
+| `0x1215` | Ban | `u8` player, string name, `u8` ban type (0 timed, 1 permanent, 2 round), `u32` expiry (Unix time; 0 permanent) | R4 16 (`BanList::alertOnBanned`) |
+| `0x1216` | Bot | `u8` player, `u8` kind (1 created, 2 removed, 3 team change), `u8` team, `u32` bot-channel connection | the module's bot channel |
+
+**`Kill`** (for one victim, `Kill` precedes `Death`: the engine raises event 1 before it calls
+`killPlayer`, `GameLogicDamage.cpp:484-507`):
+
+| Type | Field |
+|---|---|
+| `u8` | victim |
+| `i16` | attacker, -1 if none |
+| `u8` | kind: 1 kill, 2 team kill, 3 suicide (attacker = victim), 4 roadkill (no weapon, an attacker vehicle), 5 no attacker (crash, fall, out of bounds) |
+| string | weapon template, empty if none |
+| `u8` | victim team |
+| `u32` | victim root networkable id |
+| string | victim root template |
+| `Vec3` | victim root position (the victim's own vehicle, not the fifth script argument) |
+| `u8` | attacker team, 0 if none |
+| `u32` | attacker vehicle networkable id: the root of the script's fifth argument, else the attacker's root; 0 if none |
+| string | that vehicle's template |
+| `Vec3` | attacker root position |
+| `u8` | assists A, then A × (`u8` player, `i32` assist score) |
+
+**`Damage`**
+
+| Type | Field |
+|---|---|
+| `i16` | victim player: the soldier's player, or for a vehicle its first occupant, or the occupant this damage killed; -1 if none |
+| `u32` | victim root networkable id |
+| `u32` | victim root console id |
+| string | victim template (the object whose armour took the damage) |
+| `i16` | attacker, -1 if none |
+| string | weapon template |
+| string | projectile (source) template |
+| `f32` | amount |
+| `f32` | hit points before |
+| `f32` | hit points after |
+| `f32` | maximum hit points |
+| `Vec3` | position the engine passed (`docs/findings/module-v2.md`, R5 position caveat) |
+| `u8` | flags: bit 0 the victim's hit points reached 0, bit 1 this damage killed a player |
+
+#### Commands (`0x13xx`, WebAdmin → module) and replies (`0x14xx`)
+
+Every command starts with `u32` request id; the reply echoes it. Success is `0x1401 Ok` (`u32`
+request id) unless a typed result is listed. Failure is `Error` with the request id.
+
+| Type | Command | Fields after the request id | Reply |
+|---|---|---|---|
+| `0x1301` | Console | string line (one line, no newline, at most 4096 bytes) | `ConsoleResult`; `Error` 9 with `adminAllowConsole 0` |
+| `0x1302` | Say | `u8` target (0 all, 1 team, 2 one player), `u8` team or player id, string text | `Ok` |
+| `0x1303` | Teleport | `ObjectRef`, `u8` flags (bit 0 set position, bit 1 set rotation; at least one), `Vec3` position, `Rot` rotation | `Ok` |
+| `0x1304` | SetHealth | `ObjectRef`, `u8` flags (bit 0 the value is a fraction of the maximum), `f32` value (hit points) | `Ok` |
+| `0x1305` | KillPlayer | `u8` player, `u8` flags (bit 0 also set the player's vehicle's hit points to 0) | `Ok` |
+| `0x1306` | SetTeam | `u8` player, `u8` team (1 or 2), `u8` flags (bit 0 kill the player after the switch) | `Ok` |
+| `0x1307` | SetScore | `u8` player, `u8` mask (bit 0 score, 1 team score, 2 kills, 3 deaths, 4 team kills), 5 × `i32` values in that order (all present) | `Ok` |
+| `0x1308` | Rank | `u8` player, `u8` rank (0-21), `u8` flags (bit 0 send the rank-up event) | `Ok` |
+| `0x1309` | Medal | `u8` player, `i32` medal, `i32` value | `Ok` |
+| `0x130A` | GameEvent | `u8` player, `u8` event (0-24), `i32` data | `Ok` |
+| `0x130B` | HudEvent | `u8` player, `u8` event (0-78), `i32` data | `Ok` |
+| `0x130C` | Kick | `u8` player, string reason (shown to the player) | `Ok` |
+| `0x130D` | Ban | `u8` player, `u8` by (0 address, 1 CD key), `u8` duration (0 permanent, 1 this round, 2 seconds), `u32` seconds, string reason (logged) | `Ok` |
+| `0x130E` | Map | `u8` action (1 restart the round, 2 run the next map, 3 run a map-list index, 4 run a map by name and mode), `u16` index, string name, string mode, `u16` size (0 any) | `Ok` |
+| `0x130F` | ListObjects | string template name (exact, without case), `u16` maximum entries (1-4096) | `ObjectList` |
+| `0x1310` | SetObjectActive | `ObjectRef` (kind 2 or 3) | `Ok` |
+| `0x1311` | SpawnObject | string template name, `Vec3` position, `Rot` rotation, `u8` team | `ObjectSpawned`; `Error` 9 with `adminAllowObjects 0` |
+| `0x1312` | DeleteObject | `ObjectRef` (kind 2 or 3) | `Ok`; `Error` 9 with `adminAllowObjects 0` |
+
+**`0x1402 ConsoleResult`**: `u32` request id, `u8` flags (bit 0 output truncated at 256 KiB), `u16`
+line count L, L × string. The output of `Console::executeLine` split at `\n`, without the final
+empty line.
+
+**`0x1403 ObjectList`**: `u32` request id, `u8` flags (bit 0 more objects matched than were
+returned), `u16` N, N × entry:
+
+| Type | Field |
+|---|---|
+| `u32` | console id |
+| `u32` | networkable id, 0 if none |
+| string | template name |
+| `Vec3` | position |
+| `Rot` | rotation (the absolute matrix) |
+| `f32` | health 0..1, -1 without armour |
+| `u8` | flags: bit 0 the object has a parent |
+
+The walk is `object.listObjectsOfTemplate`'s: every grid object whose template is the named one
+(`Scene/Object/ToolObject/ObjectTemplateAdm.cpp:263-277`).
+
+**`0x1404 ObjectSpawned`**: `u32` request id, `u32` console id, `u32` networkable id (0: the object
+has no networkable and exists on the server only).
+
+**Keepalive** (either direction):
+
+| Type | Message | Fields |
+|---|---|---|
+| `0x1501` | Ping | `u32` request id, `u64` the sender's clock, echoed |
+| `0x1502` | Pong | `u32` request id, `u64` the echoed clock |
+
+- WebAdmin's `Ping` is answered by the game thread, in order with the commands, so a `Pong` also
+  shows the server is ticking.
+- The module sends `Ping` after 15 s without receiving anything and closes the link after 45 s
+  without receiving anything. WebAdmin answers with `Pong`.
+
+**Error codes** (`0xFFFF Error`: `u32` request id, `u16` code, string message): 1 version mismatch, 2
+malformed frame, 3 unknown message type, 4 unknown player, 5 unknown object or unavailable, 6
+refused by the engine or by a rule, 7 invalid value, 8 authentication failed, 9 disabled by this
+server's `serverext.cfg`.
+
+#### Command semantics
+
+- **Console**: `MainConsole`'s `executeLine(line + "\n", out, false × 5)`, as Python's
+  `host.rcon_invoke` does (`Game/Python/PythonHost.cpp:1766-1783`).
+- **Say**: `IGameServer::sayAll` (channel 12), `sayTeam(team)` (channel 13), or
+  `say(text, channel 14 "Player", type 1, 0, player)` for one player: the engine's own Player channel,
+  which only that player's connection receives (`GameServer::adminToPlayerEvent`).
+- **Teleport**: the target's root object; `setAbsoluteTransformation` (keeping the current
+  position or rotation if only one is set), then the physics node is reset (speeds zero) and woken,
+  as the bot channel's `Teleport` does. On foot a soldier's yaw does not stick.
+- **SetHealth**: `IArmorGLComp::setHitPoints` on the target's armour, Python's `setDamage`
+  (`Game/Python/py/Objects.cpp:706-722`). It bypasses the damage path, so no damage, kill or
+  destruction is reported from it. A result of 0 hit points on a soldier or an occupied vehicle is
+  `Error` 6: it would abort the server (see "Draft points", 3).
+- **KillPlayer**: `ServerGameLogic::killPlayer(player, true, true)` (engine method below; the same
+  call a crash makes, so `Death` is raised; no `Kill`). With bit 0 and the player seated, the module
+  then sets the emptied vehicle's hit points to 0 (a wreck); with another occupant in it the command
+  is `Error` 6 and nothing is done. Unlike `mm_webadmin`'s `damage`, nothing is deleted.
+- **SetTeam**: `IPlayer::setTeam(team, false)`, then `KillPlayer` if bit 0. `TeamChange` follows
+  from the module's own detection.
+- **SetScore**: writes the `PlayerScoreData` fields directly, as Python's score setter does; it does
+  not raise script event 28 (`docs/findings/admin-channel-a1-a4.md`, A1 surprise 4).
+- **Rank, Medal, GameEvent, HudEvent**: the bodies of Python's `sgl_sendRankEvent` (plus
+  `PlayerScoreData::setRank`), `sgl_sendMedalEvent`, `sgl_sendGameLogicEvent` and
+  `sgl_sendHudEvent` (`ServerGameLogic.cpp:2540-2662`), through appended engine methods. The 0 values
+  `mm_webadmin` skipped are sent.
+- **Kick**: `IGameServer::kickPlayer(id, reason 21, text)`. **Ban**: `admin.banPlayer` or
+  `admin.banPlayerKey` with `perm`, `round` or the seconds, run by the module (not a raw console
+  line from WebAdmin, so it works with `adminAllowConsole 0`). Both refuse AI-flagged players
+  (`Error` 6): a bot cannot be kicked or banned (the ban would land on address `N/A`), and bot-channel
+  bots are removed through the bot channel. A player that is not connected is `Error` 6.
+- **Map**: action 1 is `admin.restartMap` (`IServerExtension::restartRound`); 2 is
+  `admin.runNextLevel`; 3 and 4 set the next level to the map-list index (4 looks it up by name,
+  mode and size) and run it. A map that is not in the rotation is `Error` 5.
+- **SetObjectActive**: runs `object.active idN` with the object's console id, so the console's
+  object commands that follow act on it (Freeze, noclip, `.nofences`).
+- **SpawnObject**: `ObjectTemplateManager::getTemplate`, then
+  `IGame::createObjectOnAllClients(template, position, rotation, true, 0, team)`, the engine's own
+  ObjectSpawner path (`ServerGameLogic::spawnObject`, `ServerGameLogic.cpp:947-951`). An unknown
+  template is `Error` 5.
+- **DeleteObject**: `ObjectManager::destroyObject`, what `object.delete` runs. The module refuses
+  (`Error` 6) a soldier, a camera, or a vehicle with a player in it.
+
+### Configuration (`serverext.cfg`)
+
+| Key | Default | Meaning |
+|---|---|---|
+| `adminConnect` | none (the admin channel is off) | `host:port` of WebAdmin's admin listener. Never port 16567 |
+| `adminServerId` | required with `adminConnect` | the server id sent in `Hello`, 1-64 printable bytes |
+| `adminKey` | required with `adminConnect` | the shared key, 32-128 hex digits (16-64 bytes) |
+| `adminTls` | 1 | 0 sends in the clear and is accepted only for a loopback `adminConnect` |
+| `adminCertSha256` | required with `adminTls 1` | SHA-256 of WebAdmin's certificate's SubjectPublicKeyInfo, 64 hex digits |
+| `adminSendIdentity` | 1 with TLS, 0 without | send players' IPs and CD-key hashes |
+| `adminAllowConsole` | 1 (B5) | allow `Console` |
+| `adminAllowObjects` | 1 | allow `SpawnObject` and `DeleteObject` |
+| `adminQueueBytes` | 4194304 | outbound queue size beyond which events are dropped (64 KiB to 64 MiB) |
+
+Reconnect backoff: 1 s after a failure, doubled up to 60 s, with ±20% jitter; back to 1 s after a link
+authenticates. A bad value refuses the module's load, as for the bot channel's keys.
+
+### Implementation notes that change the outline above
+
+- **CD-key hash:** OpenBF2 doesn't compute one; it is the client's GameSpy key response, present only
+  on an internet server with a working cd-key SDK. On LAN and test servers it is empty. `Ban` by key
+  with no hash is refused. WebAdmin needs a fallback player key (open question B6).
+- **Zero hit points on an occupied object abort the server** (retail `destroyObject` on a soldier with
+  a kit). `SetHealth` refuses 0 on a soldier or occupied vehicle; `KillPlayer` with the vehicle bit
+  kills first and wrecks the vehicle only when it's empty. Nothing is deleted.
+- `Spawn` into a vehicle is `Spawn` then `EnterVehicle`. `ControlPoint` is reported a tick late, with
+  the team after the conquest script ran. `VehicleDestroyed` is for vehicles only.
+- `Say` to one player uses the engine's Player channel (14).
+- No team score exists besides tickets; a player's team score is in `PlayerScore`.
+- Round time is -1 until the round runs.
+- Module → WebAdmin frames may reach 1 MiB; WebAdmin → module 64 KiB. Optional player ids are `i16`
+  -1 (the bot channel uses presence bits).
+- `Damage` and projectile events are opt-in streams (volume: 199 events in one short bot fight).
+- Spawned objects without a networkable exist on the server only (networkable id 0).
+- `SetObjectActive` only helps raw `Console` lines, so it is useless with `adminAllowConsole 0`.
+- An overloaded link (WebAdmin not reading) drops events beyond `adminQueueBytes` and closes at four
+  times that; WebAdmin then reconnects and gets a snapshot.
+- Measured: the admin channel adds 20-40 µs per tick (p99); 64 players at 30 Hz are about 108 KB/s.
+
 ## Decisions
 
 | Id | Question | Decision (2026-10-22) |
@@ -199,6 +701,7 @@ TLS is part of phase 1 (B1).
 | B3 | Plain snapshots or deltas | Plain, at a per-stream rate. Deltas can come later without changing events or commands (below) |
 | B4 | Bot management from WebAdmin | Maybe, later. The channel must not rule it out; no messages yet |
 | B5 | Raw console by default | Yes, with a per-server switch to turn it off |
+| B6 | Player key when the CD-key hash is empty (LAN and test servers, and possibly BF2Hub on OpenBF2) | Open; awaiting the author |
 
 **Why plain streams (B3).** CPU is not the cost: diffing 64 players against the last frame takes
 microseconds on the I/O thread. The cost is correctness on both sides: a baseline per subscriber,
