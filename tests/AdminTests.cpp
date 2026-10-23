@@ -1453,6 +1453,8 @@ std::map<std::string, std::vector<uint8_t> > readGolden(const std::string& path)
     std::string line;
     while (std::getline(in, line))
     {
+        if (!line.empty() && line[line.size() - 1] == '')
+            line.erase(line.size() - 1);   // a CRLF checkout
         if (line.empty() || line[0] == '#')
             continue;
         std::istringstream s(line);
