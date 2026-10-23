@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Test client for the openbf2-server-ext bot channel (docs/protocol.md v2; layouts in docs/findings/module-v2.md).
+"""Test client for the openbf2-server-ext bot channel (docs/protocol.md v3; layouts in docs/findings/module-v2.md
+and docs/findings/module-v3.md).
 
 Python 3 standard library only, so it runs unchanged on Windows and in WSL with no build step.
 
@@ -14,6 +15,9 @@ bot's TickState lines. Survives deaths (re-enters) and map changes (recreates th
 v1 scenarios (--scenario): walk, buttons, blockpad, allblocked. See docs/findings/module-v1.md.
 v2 scenarios: view, weapons, multiconn, projectiles, damage, spot, round, teleport, soak2; the watchdog
 neutral is q5 with --q5-neutral module. See docs/findings/module-v2.md.
+v3 scenarios: burst (item 1, one-tick presses in superseded SetInputs), tv (items 2 and 3, the gunner's TV
+missile launched and steered with SetTargetDirection), soak3 (two bots, the gunner guiding TV missiles
+periodically). See docs/findings/module-v3.md.
 Q5/Q9 scenarios: q5 (watchdog neutral in flight), q9 (what the server's Python sees). See
 docs/findings/q5-q9.md.
 """
@@ -33,13 +37,15 @@ CREATE_BOT, BOT_CREATED, ENTER_VEHICLE, REMOVE_BOT, ACK, BOT_REMOVED = 0x0101, 0
 SPAWN_BLOCKED, RESTART_ROUND = 0x0107, 0x0108
 TELEPORT, SPOT = 0x0109, 0x010A
 SET_INPUT, TICK_STATE, VEHICLE_LIST, ERROR = 0x0201, 0x0301, 0x0302, 0xFFFF
+SET_TARGET_DIRECTION = 0x0202
 PROJECTILE_LIST, DAMAGE, KILL, CHAT, ROUND_STATE = 0x0303, 0x0304, 0x0305, 0x0306, 0x0307
 NAMES = {HELLO: "Hello", WELCOME: "Welcome", CREATE_BOT: "CreateBot", BOT_CREATED: "BotCreated",
          ENTER_VEHICLE: "EnterVehicle", REMOVE_BOT: "RemoveBot", ACK: "Ack", BOT_REMOVED: "BotRemoved",
          SPAWN_BLOCKED: "SpawnBlocked", RESTART_ROUND: "RestartRound", SET_INPUT: "SetInput",
          TICK_STATE: "TickState", VEHICLE_LIST: "VehicleList", ERROR: "Error", TELEPORT: "Teleport", SPOT: "Spot",
-         PROJECTILE_LIST: "ProjectileList", DAMAGE: "Damage", KILL: "Kill", CHAT: "Chat", ROUND_STATE: "RoundState"}
-PROTOCOL_VERSION = 2
+         PROJECTILE_LIST: "ProjectileList", DAMAGE: "Damage", KILL: "Kill", CHAT: "Chat", ROUND_STATE: "RoundState",
+         SET_TARGET_DIRECTION: "SetTargetDirection"}
+PROTOCOL_VERSION = 3
 F_ALIVE, F_OWN, F_VEHICLE, F_MANDOWN, F_SPOTTED = 1, 2, 4, 8, 16
 ENTRY = struct.Struct("<BBBBI3f3f3f3ff")
 VEHICLE_TAIL = struct.Struct("<BB3fffBI")   # after the u32 id and the template string
@@ -208,6 +214,11 @@ def spot_frame(rid, pid, target):
 def set_input(pid, tick, pitch, roll, coll, pedals, buttons=0, look_yaw=0.0, look_pitch=0.0):
     """v1 SetInput. On foot: coll = walk forward/back, pedals = strafe, look_yaw = turn."""
     return frame(SET_INPUT, struct.pack("<BIffffffI", pid, tick, pitch, roll, coll, pedals, look_yaw, look_pitch, buttons))
+
+
+def target_direction(pid, tick, start, end):
+    """v3 SetTargetDirection: steer the bot's TV missile along the ray from start through end."""
+    return frame(SET_TARGET_DIRECTION, struct.pack("<BI6f", pid, tick, start[0], start[1], start[2], end[0], end[1], end[2]))
 
 
 def parse_vehiclelist(p):
@@ -538,6 +549,9 @@ class Client:
         self.kills = []
         self.chats = []
         self.rounds = []
+        self.steers = {}          # bot id -> (start, end) sent after its SetInput on every TickState (v3)
+        self.extra = {}           # bot id -> SetInput dicts sent right after the main one, once (v3 burst)
+        self.errors0 = []         # (time, tick, code, message) of Errors without a request id
 
     def next_req(self):
         self.req += 1
@@ -564,10 +578,19 @@ class Client:
                     self.others.append(e)
             if self.before_send:
                 self.before_send()
+            out = []
             for bot, cmd in list(self.inputs.items()):
                 btn = cmd.get("buttons", 0) | self.pulses.pop(bot, 0)
-                self.c.send(set_input(bot, tick, cmd.get("pitch", 0.0), cmd.get("roll", 0.0), cmd.get("coll", 0.0),
-                                      cmd.get("ped", 0.0), btn, cmd.get("look_yaw", 0.0), cmd.get("look_pitch", 0.0)))
+                out.append(set_input(bot, tick, cmd.get("pitch", 0.0), cmd.get("roll", 0.0), cmd.get("coll", 0.0),
+                                     cmd.get("ped", 0.0), btn, cmd.get("look_yaw", 0.0), cmd.get("look_pitch", 0.0)))
+                for x in self.extra.pop(bot, ()):
+                    out.append(set_input(bot, tick, x.get("pitch", cmd.get("pitch", 0.0)), x.get("roll", cmd.get("roll", 0.0)),
+                                         x.get("coll", cmd.get("coll", 0.0)), x.get("ped", cmd.get("ped", 0.0)),
+                                         x.get("buttons", 0)))
+            for bot, (start, end) in list(self.steers.items()):
+                out.append(target_direction(bot, tick, start, end))
+            if out:
+                self.c.send(b"".join(out))   # one write, so a tick's SetInputs arrive together
             if self.on_state:
                 self.on_state()
         elif t == VEHICLE_LIST:
@@ -598,7 +621,9 @@ class Client:
             rid, code, msg = parse_error(p)
             self.replies[rid] = ("error", (code, msg))
             if rid == 0:
-                log(f"Error (no request) code {code}: {msg}")
+                self.errors0.append((time.time(), self.tick, code, msg))
+                if len(self.errors0) <= 20:
+                    log(f"Error (no request) code {code}: {msg}")
         elif t == SPAWN_BLOCKED:
             pid, secs = struct.unpack("<BH", p)
             self.blocked.append((time.time(), pid, secs))
@@ -1761,7 +1786,7 @@ def run_view(args):
     cl = Client(args, "serverext testclient view")
     w = cl.welcome
     cl.check(f"Welcome v2: enterRange {w['enter_range']:.1f} m, projectileRange {w['projectile_range']:.0f} m, "
-             f"teleport {w['teleport']}, restart {w['restart']}", w["version"] == 2 and w["enter_range"] > 0)
+             f"teleport {w['teleport']}, restart {w['restart']}", w["version"] == PROTOCOL_VERSION and w["enter_range"] > 0)
     if args.enter_range:
         cl.check(f"Welcome enterRange equals serverext.cfg ({args.enter_range})", abs(w["enter_range"] - args.enter_range) < 0.01)
     bot = cl.create_bot(args.name, args.team)
@@ -1806,9 +1831,10 @@ def run_weapons(args):
     log(f"pilot weapons: {ws}")
     if gunner is not None:
         log(f"gunner weapons: {cl.states[gunner]['weapons'] if gunner in cl.states else None}")
-        cl.pulses[gunner] = BTN_WEAPON[1]     # the gunner's second weapon: the guided missile
+        # v3 item 2: the TV launcher is not selectable; one tick of alt fire (the seat's toggle) selects it.
+        cl.pulses[gunner] = BTN_ALT_FIRE
         cl.run_for(1.0)
-        log(f"gunner weapons after weapon select 2: {cl.states[gunner]['weapons'] if gunner in cl.states else None}")
+        log(f"gunner weapons after one tick of alt fire: {cl.states[gunner]['weapons'] if gunner in cl.states else None}")
     cl.check("the pilot seat reports at least one weapon", len(ws) > 0)
     # Select weapon 1 (rockets) for one tick.
     cl.pulses[pilot] = BTN_WEAPON[0]
@@ -1836,9 +1862,8 @@ def run_weapons(args):
     plans = {pilot: (ap, lambda e, t: dict(alt=pad[1] + 45.0, pitch_cmd=15.0, heading=hdg),
                      lambda t: BTN_FIRE if 1.5 < t < 5.5 and cl.tick % 6 < 3 else 0)}
     if gunner is not None:
-        # Fire, then alt fire, a few pulses each: whichever slot holds the missile launches it.
-        plans[gunner] = (Autopilot(), dict(idle=True),
-                         lambda t: BTN_FIRE if 1.0 < t < 3.0 else (BTN_ALT_FIRE if 3.5 < t < 5.0 else 0))
+        # Fire launches the TV missile (unguided: it flies straight on until its time to live).
+        plans[gunner] = (Autopilot(), dict(idle=True), lambda t: BTN_FIRE if 1.0 < t < 1.2 else 0)
     fly_bots(cl, plans, 7.0)
     # Level off and hover while the rockets land and the magazine reloads.
     fly_bots(cl, {pilot: (ap, dict(alt=pad[1] + 45.0, heading=hdg), None)}, 14.0)
@@ -2268,6 +2293,498 @@ SCENARIOS_V2 = {"view": run_view, "weapons": run_weapons, "damage": run_damage, 
                 "teleport": run_teleport, "multiconn": run_multiconn, "soak2": run_soak2}
 
 
+# ------------------------------------------------------------------------------------- v3
+
+TV_LAUNCHERS = ("ahe_ah1z_cogunner_hellfirelaunchertv", "ahe_z10_hj8launcher_tv")
+TV_PROJECTILE = "agm114_hellfire_tv"
+
+
+def slot0(cl, bot):
+    e = cl.states.get(bot)
+    return next((w for w in e["weapons"] if w["slot"] == 0), None) if e else None
+
+
+def slot0_name(cl, bot):
+    w = slot0(cl, bot)
+    return w["name"] if w else None
+
+
+def has_tv(cl, bot):
+    w = slot0(cl, bot)
+    return w is not None and w["name"].lower() in TV_LAUNCHERS
+
+
+def own_tv_missiles(cl, bot):
+    return [p for p in cl.projectiles if p["name"].lower() == TV_PROJECTILE and p["owner"] == bot]
+
+
+def wait_ticks(cl, n, timeout=10.0):
+    start = cl.tick
+    return cl.run_for(timeout, lambda: cl.tick is not None and start is not None and cl.tick >= start + n)
+
+
+class Holder:
+    """Holds pilots in a hover (altitude and heading) on every TickState through cl.before_send, so a
+    scenario can drive gunners with pulses and steers meanwhile. aim, if set, is called on every
+    TickState and returns {bot: (start, end)} for cl.steers."""
+
+    def __init__(self, cl):
+        self.cl = cl
+        self.plans = {}
+        self.aim = None
+        cl.before_send = self.ctl
+
+    def hold(self, bot, alt, heading):
+        ap = self.plans[bot][0] if bot in self.plans else Autopilot()
+        self.plans[bot] = (ap, dict(alt=alt, heading=heading))
+
+    def ctl(self):
+        for bot, (ap, mode) in self.plans.items():
+            e = self.cl.states.get(bot)
+            if not (e and self.cl.in_vehicle(bot)):
+                self.cl.inputs[bot] = {}
+                continue
+            cp, cr, c, ped = ap.step(e, self.cl.tick, **mode)
+            self.cl.inputs[bot] = dict(pitch=cp, roll=cr, coll=c, ped=ped)
+        if self.aim:
+            for bot, ray in self.aim().items():
+                if ray:
+                    self.cl.steers[bot] = ray
+                else:
+                    self.cl.steers.pop(bot, None)
+
+    def stop(self):
+        self.cl.before_send = None
+        for bot in self.plans:
+            self.cl.inputs[bot] = {}
+
+
+def eye(cl, bot):
+    """The gunner's eye for SetTargetDirection: its vehicle's position, 1.5 m up."""
+    p = cl.states[bot]["pos"]
+    return (p[0], p[1] + 1.5, p[2])
+
+
+def ahead(pos, heading, dist, y):
+    h = math.radians(heading)
+    return (pos[0] + math.sin(h) * dist, y, pos[2] + math.cos(h) * dist)
+
+
+def line_dist(p, a, b):
+    """Distance from p to the infinite line through a and b."""
+    d = [b[i] - a[i] for i in range(3)]
+    w = [p[i] - a[i] for i in range(3)]
+    dd = sum(x * x for x in d)
+    t = sum(w[i] * d[i] for i in range(3)) / dd if dd else 0.0
+    return math.sqrt(sum((w[i] - t * d[i]) ** 2 for i in range(3)))
+
+
+def dist3(a, b):
+    return math.sqrt(sum((a[i] - b[i]) ** 2 for i in range(3)))
+
+
+def tv_shot(cl, holder, gunner, label, aim=None, retarget=None, retarget_after=1.0, csv=None):
+    """Fires one TV missile from gunner (the TV launcher must be in slot 0). aim() -> (start, end), or None
+    for no SetTargetDirection; it is re-evaluated on every TickState, before the launch and in flight.
+    retarget() replaces aim retarget_after seconds after the launch. Returns a dict describing the shot."""
+    ready = cl.run_for(20.0, lambda: has_tv(cl, gunner) and slot0(cl, gunner)["ammo"] > 0 and
+                       not slot0(cl, gunner)["reloading"] and not own_tv_missiles(cl, gunner))
+    if not ready:
+        log(f"{label}: TV launcher not ready: {slot0(cl, gunner)}")
+        return None
+    current = [aim]
+    holder.aim = (lambda: {gunner: current[0]() if current[0] else None})
+    if aim:
+        wait_ticks(cl, 6)          # the direction is applied before the trigger is pressed
+    w0 = slot0(cl, gunner)
+    cl.pulses[gunner] = BTN_FIRE
+    press_tick = cl.tick
+    t0 = time.time()
+    track = []
+    launched = None
+    gone_since = None
+    errors_before = len(cl.errors0)
+    while time.time() - t0 < 9.0:
+        n = cl.pl_count
+        cl.pump(0.2)
+        if cl.pl_count == n:
+            continue
+        mine = own_tv_missiles(cl, gunner)
+        for p in mine:
+            track.append((cl.tick, p))
+        if mine and launched is None:
+            launched = time.time()
+        if retarget and launched and time.time() - launched >= retarget_after and current[0] is not retarget:
+            current[0] = retarget
+            log(f"{label}: retargeted at tick {cl.tick}")
+        if launched and not mine:
+            gone_since = gone_since or time.time()
+            if time.time() - gone_since > 0.5:
+                break
+    holder.aim = None
+    cl.steers.pop(gunner, None)
+    out = dict(label=label, launched=bool(track), track=track, press_tick=press_tick, weapon_before=w0,
+               weapon_after=slot0(cl, gunner), errors=cl.errors0[errors_before:])
+    if not track:
+        log(f"{label}: no TV missile seen; slot 0 before {w0}, after {out['weapon_after']}")
+        return out
+    first, last = track[0][1], track[-1][1]
+    out.update(first=first, last=last, first_tick=track[0][0], last_tick=track[-1][0], guided=first["guided"],
+               own=first["own"], ids=sorted(set(p["id"] for _, p in track)))
+    log(f"{label}: missile {first['id']} launched at tick {track[0][0]} (fire pressed after tick {press_tick}), "
+        f"guided {first['guided']}, own {first['own']}, target {first['target']}; first at "
+        f"{tuple(round(v, 1) for v in first['pos'])} v {tuple(round(v, 1) for v in first['vel'])}; last at "
+        f"{tuple(round(v, 1) for v in last['pos'])} after {(track[-1][0] - track[0][0]) / 30.0:.2f} s, ttl {last['ttl']:.2f}")
+    if csv:
+        with open(csv, "a") as f:
+            for tick, p in track:
+                f.write(f"{label},{p['id']},{tick},{p['pos'][0]:.2f},{p['pos'][1]:.2f},{p['pos'][2]:.2f},"
+                        f"{p['vel'][0]:.2f},{p['vel'][1]:.2f},{p['vel'][2]:.2f},{p['ttl']:.3f},{p['target']}\n")
+    return out
+
+
+def climb_hold(cl, holder, pilot, alt, heading, label, timeout=60.0):
+    holder.hold(pilot, alt, heading)
+    ok = cl.run_for(timeout, lambda: cl.in_vehicle(pilot) and abs(cl.states[pilot]["pos"][1] - alt) < 4.0 and
+                    math.sqrt(sum(c * c for c in cl.states[pilot]["vel"])) < 3.0)
+    e = cl.states.get(pilot)
+    log(f"{label}: hover at {alt:.0f} m: {ok}; y {e['pos'][1]:.1f}, heading {e['ypr'][0]:.0f}")
+    return ok
+
+
+def board_crew(cl, team, name):
+    """A pilot and a gunner in one heli; returns (pilot, gunner, heli) or None."""
+    pilot = cl.create_bot(name + " pilot", team)
+    gunner = cl.create_bot(name + " gunner", team)
+    if not cl.check("pilot boarded", ensure_boarded(cl, pilot, team, "pilot")):
+        return None
+    heli = cl.states[pilot]["root"]
+    hname = cl.vehicles.get(heli, {}).get("name", "?")
+    if not cl.check(f"gunner boarded seat 1 of {hname} ({heli})",
+                    ensure_boarded(cl, gunner, team, "gunner", seat=1, vehicle_id=heli, spinup=0.5)):
+        return None
+    cl.run_for(1.0)
+    return pilot, gunner, heli
+
+
+def run_tv(args):
+    """Items 2 and 3. On the pad: v2's sequence (weapon select 2, alt fire held) launches nothing; one tick
+    of alt fire toggles the gunner's slot 0 between the gun and the TV launcher. In a hover: an unguided
+    shot (where the missile goes with no SetTargetDirection), a shot steered onto the sea, a shot
+    retargeted in flight, refusals, and with --tv-target a shot steered onto an own bot of the other team."""
+    cl = Client(args, "serverext testclient tv")
+    crew = board_crew(cl, args.team, args.name)
+    if not crew:
+        return cl.finish()
+    pilot, gunner, heli = crew
+    log(f"gunner weapons: {[(w['slot'], w['name'], w['ammo'], w['mags']) for w in cl.states[gunner]['weapons']]}, "
+        f"view {cl.states[gunner]['view']}")
+    cl.check(f"gunner slot 0 starts at the gun: {slot0_name(cl, gunner)}", slot0(cl, gunner) and not has_tv(cl, gunner))
+
+    # Refused while the gun is active.
+    errs = len(cl.errors0)
+    cl.steers[gunner] = (eye(cl, gunner), ahead(eye(cl, gunner), 0.0, 100.0, 0.0))
+    cl.run_for(0.5)
+    cl.steers.pop(gunner, None)
+    got = [e for e in cl.errors0[errs:]]
+    cl.check(f"SetTargetDirection with the gun active is refused: {got[:1]}", got and got[0][2] == 6)
+
+    # Item 2: v2's sequence.
+    pl_before = cl.pl_count
+    seen = {p["id"] for p in cl.projectiles}
+    cl.pulses[gunner] = BTN_WEAPON[1]
+    cl.run_for(1.0)
+    cl.check(f"weapon select 2 leaves slot 0 at {slot0_name(cl, gunner)} (the TV launcher is isSelectable 0)",
+             not has_tv(cl, gunner))
+    launched = []
+    cl.on_state = lambda: launched.extend(p for p in own_tv_missiles(cl, gunner) if p["id"] not in seen)
+    cl.inputs[gunner] = dict(buttons=BTN_ALT_FIRE)
+    cl.run_for(1.5)
+    cl.inputs[gunner] = {}
+    cl.run_for(1.0)
+    cl.on_state = None
+    cl.check(f"alt fire held 1.5 s toggled slot 0 once, to {slot0_name(cl, gunner)}", has_tv(cl, gunner))
+    cl.check(f"... and launched nothing ({len(launched)} TV missiles)", not launched)
+    log(f"gunner view mode with the TV launcher: {cl.states[gunner]['view']}")
+    cl.pulses[gunner] = BTN_ALT_FIRE
+    cl.run_for(1.0)
+    cl.check(f"one tick of alt fire toggles back to {slot0_name(cl, gunner)}", not has_tv(cl, gunner))
+    cl.pulses[gunner] = BTN_ALT_FIRE
+    cl.run_for(1.0)
+    cl.check(f"one more tick toggles to {slot0_name(cl, gunner)}", has_tv(cl, gunner))
+    cl.pulses[gunner] = BTN_TOGGLE_WEAPON
+    cl.run_for(1.0)
+    cl.check(f"next weapon (bit 22) does not leave the TV launcher: {slot0_name(cl, gunner)}", has_tv(cl, gunner))
+
+    # Up to a hover, nose seaward.
+    holder = Holder(cl)
+    pad = cl.states[pilot]["pos"]
+    hdg = seaward(pad)
+    alt = pad[1] + 60.0
+    if not cl.check("hover reached", climb_hold(cl, holder, pilot, alt, hdg, "tv")):
+        holder.stop()
+        return cl.finish()
+    shots = []
+    csv = args.trace_csv or None
+
+    # Unguided: no SetTargetDirection on this server process yet (run this scenario first after a start).
+    s = tv_shot(cl, holder, gunner, "unguided", aim=None, csv=csv)
+    shots.append(s)
+    if cl.check("unguided: a TV missile launched (fire, one tick)", s and s["launched"]):
+        cl.check(f"unguided: ProjectileList flags it guided and own ({s['guided']}, {s['own']})", s["guided"] and s["own"])
+        l0, l1 = s["first"]["pos"], s["last"]["pos"]
+        log(f"unguided: heli heading {hdg:.0f}, missile went towards {bearing(l0, l1):.0f} (world origin at "
+            f"{bearing(l0, (0.0, 0.0, 0.0)):.0f}), {flat_dist(l0, l1):.0f} m horizontally, {l0[1] - l1[1]:.0f} m down, "
+            f"last y {l1[1]:.1f}, ttl {s['last']['ttl']:.2f}")
+        w = s["weapon_after"]
+        cl.check(f"after the launch the launcher is empty or reloading: {w}", w and (w["ammo"] == 0 or w["reloading"]))
+
+    def report(label, s, aim_pt, other=None):
+        d_pt = dist3(s["last"]["pos"], aim_pt)
+        line = f"{label}: aim {tuple(round(v, 1) for v in aim_pt)}; last seen {tuple(round(v, 1) for v in s['last']['pos'])} " \
+               f"after {(s['last_tick'] - s['first_tick']) / 30.0:.2f} s, {d_pt:.1f} m from the aim point"
+        if other:
+            line += f", {dist3(s['last']['pos'], other):.1f} m from the first aim point"
+        log(line)
+        return d_pt
+
+    sea = args.sea_level
+    # Direction sent only before the launch: does the missile still go there once the stream stops?
+    pre_pt = ahead(cl.states[pilot]["pos"], hdg - 20.0, args.tv_range, sea)
+    start0 = eye(cl, gunner)
+    holder.aim = lambda: {gunner: (eye(cl, gunner), pre_pt)}
+    wait_ticks(cl, 6)
+    holder.aim = None
+    cl.steers.pop(gunner, None)
+    wait_ticks(cl, 30)
+    s = tv_shot(cl, holder, gunner, "pre-launch only", aim=None, csv=csv)
+    shots.append(s)
+    if cl.check("pre-launch only: a TV missile launched", s and s["launched"]):
+        d = report("pre-launch only", s, pre_pt)
+        log(f"pre-launch only: {line_dist(s['last']['pos'], start0, pre_pt):.1f} m from the aim line")
+
+    # Steered on every tick onto the sea, args.tv_range ahead and 20 degrees right.
+    aim_pt = ahead(cl.states[pilot]["pos"], hdg + 20.0, args.tv_range, sea)
+    s = tv_shot(cl, holder, gunner, "sea", aim=lambda: (eye(cl, gunner), aim_pt), csv=csv)
+    shots.append(s)
+    if cl.check("sea: a TV missile launched", s and s["launched"]):
+        d = report("sea", s, aim_pt)
+        cl.check(f"sea: the missile ended {d:.1f} m from the aim point on the sea (< 15 m)", d < 15.0)
+        cl.check(f"sea: no refusal while steering ({s['errors'][:1]})", not s["errors"])
+
+    # Retargeted in flight: launched at a point 10 degrees left, switched 0.5 s later to 10 degrees right
+    # (about 90 m apart). The missile turns at most about 1.5 rad/s (follow.maxYaw), so a much larger or
+    # later switch cannot be made before it reaches the sea.
+    p1 = ahead(cl.states[pilot]["pos"], hdg - 10.0, args.tv_range, sea)
+    p2 = ahead(cl.states[pilot]["pos"], hdg + 10.0, args.tv_range, sea)
+    s = tv_shot(cl, holder, gunner, "retarget", aim=lambda: (eye(cl, gunner), p1),
+                retarget=lambda: (eye(cl, gunner), p2), retarget_after=0.5, csv=csv)
+    shots.append(s)
+    if cl.check("retarget: a TV missile launched", s and s["launched"]):
+        d2 = report("retarget", s, p2, other=p1)
+        d1 = dist3(s["last"]["pos"], p1)
+        cl.check(f"retarget: the missile followed the new direction ({d2:.1f} m from the new point, {d1:.1f} m from "
+                 f"the first)", d2 < 15.0 and d1 > 50.0)
+
+    # Steered along a sweep: the end point moves 2 degrees a tick from 25 degrees left to 25 right of the
+    # nose; the missile's bearing from the heli follows it.
+    t_sweep = [None]
+
+    def sweep():
+        if t_sweep[0] is None:
+            t_sweep[0] = cl.tick
+        ang = hdg - 25.0 + min(50.0, 2.0 * (cl.tick - t_sweep[0]) / 3.0)
+        return eye(cl, gunner), ahead(cl.states[pilot]["pos"], ang, args.tv_range, sea)
+
+    s = tv_shot(cl, holder, gunner, "sweep", aim=sweep, csv=csv)
+    shots.append(s)
+    if cl.check("sweep: a TV missile launched", s and s["launched"]):
+        hp = cl.states[pilot]["pos"]
+        bearings = [wrap180(bearing(hp, p["pos"]) - hdg) for _, p in s["track"][::6]]
+        log(f"sweep: missile bearing from the heli relative to the nose every 0.2 s: "
+            f"{[round(b) for b in bearings]}")
+        final = ahead(hp, hdg + 25.0, args.tv_range, sea)
+        d = report("sweep", s, final)
+        low = min(bearings[1:])
+        cl.check(f"sweep: the missile's bearing followed the sweep (from {low:.0f} up to {bearings[-1]:.0f}, the sweep "
+                 f"ended at +25; {d:.1f} m from its last point)", bearings[-1] - low > 20.0 and abs(bearings[-1] - 25.0) < 10.0)
+
+    if args.tv_target:
+        shots.append(tv_target(cl, holder, gunner, pilot, hdg, alt, args, csv))
+
+    # The launcher back to the gun: a direction is refused again.
+    cl.pulses[gunner] = BTN_ALT_FIRE
+    cl.run_for(1.0)
+    errs = len(cl.errors0)
+    cl.steers[gunner] = (eye(cl, gunner), ahead(eye(cl, gunner), hdg, 100.0, 0.0))
+    cl.run_for(0.5)
+    cl.steers.pop(gunner, None)
+    got = cl.errors0[errs:]
+    cl.check(f"after toggling back to {slot0_name(cl, gunner)} a direction is refused: {got[:1]}", got and got[0][2] == 6)
+    holder.stop()
+    log("TV shots: " + "; ".join(f"{s['label']}: launched {s['launched']}" for s in shots if s))
+    return cl.finish()
+
+
+def tv_target(cl, holder, gunner, pilot, hdg, alt, args, csv):
+    """Steers a TV missile onto an own bot of the other team, teleported into a hover args.tv_range ahead."""
+    other = 3 - args.team
+    t = cl.create_bot(args.name + " target", other)
+    if not cl.check("target bot boarded a heli", ensure_boarded(cl, t, other, "target")):
+        return None
+    pos = ahead(cl.states[pilot]["pos"], hdg, args.tv_range, alt)
+    kind, data = cl.teleport(t, pos, (hdg + 180.0) % 360.0)
+    if not cl.check(f"target heli teleported {args.tv_range:.0f} m ahead: {kind} {data}", kind == "ack"):
+        return None
+    holder.hold(t, alt, (hdg + 180.0) % 360.0)
+    cl.run_for(4.0)
+    et = cl.states[t]
+    log(f"target: {tuple(round(v, 1) for v in et['pos'])}, {flat_dist(et['pos'], cl.states[pilot]['pos']):.0f} m from the "
+        f"gunner's heli, health {et['health']:.2f}")
+    d0, k0 = len(cl.damages), len(cl.kills)
+    s = tv_shot(cl, holder, gunner, "own bot",
+                aim=lambda: (eye(cl, gunner), cl.states[t]["pos"]) if cl.alive(t) else None, csv=csv)
+    cl.run_for(1.0)
+    hits = [d for d in cl.damages[d0:] if d["attacker"] == gunner and d["victim"] == t]
+    kills = [k for k in cl.kills[k0:] if k["attacker"] == gunner and k["victim"] == t]
+    for d in hits[:3]:
+        log(f"  Damage {d}")
+    for k in kills[:3]:
+        log(f"  Kill {k}")
+    cl.check(f"own bot: the missile hit the target ({len(hits)} Damage events from the gunner, sources "
+             f"{sorted(set(d['source'] for d in hits))})", hits)
+    cl.check(f"own bot: the target was killed ({len(kills)} Kill events)", kills)
+    holder.plans.pop(t, None)
+    cl.inputs[t] = {}
+    return s
+
+
+def run_burst(args):
+    """Item 1: a one-tick camera press survives a SetInput that supersedes it in the same tick. Each press
+    is sent with one or two more SetInputs for the bot in the same write; every press must change the
+    view mode in TickState."""
+    cl = Client(args, "serverext testclient burst")
+    bot = cl.create_bot(args.name, args.team)
+    if not cl.check("boarded a heli", ensure_boarded(cl, bot, args.team, "burst", spinup=1.0)):
+        return cl.finish()
+    cl.run_for(1.0)
+    # Camera mode keys 2 and 3 give view modes 3 and 4 (module-v1.md Q11); both are idempotent, so
+    # alternating them changes the view with every press.
+    keys = [(BTN_CAMERA_MODE[1], 3), (BTN_CAMERA_MODE[2], 4)]
+    cl.pulses[bot] = BTN_CAMERA_MODE[1]
+    cl.run_for(1.0)
+    log(f"start view mode {cl.states[bot]['view']}")
+    patterns = [
+        ("press, then a SetInput without buttons", lambda k: (k, [dict()])),
+        ("press, then two SetInputs without buttons", lambda k: (k, [dict(), dict()])),
+        ("no buttons, the press, then no buttons", lambda k: (0, [dict(buttons=k), dict()])),
+        ("press, then a SetInput with another button (flares)", lambda k: (k, [dict(buttons=BTN_FLARE)])),
+    ]
+    total_lost = 0
+    for name, make in patterns:
+        lost = 0
+        lag = []
+        for i in range(args.burst_presses):
+            key, want = keys[(i + 1) % 2]
+            first, extra = make(key)
+            if first:
+                cl.pulses[bot] = first
+            cl.extra[bot] = extra
+            sent = cl.tick
+            changed = cl.run_for(1.0, lambda: cl.states[bot]["view"] == want)
+            if changed:
+                lag.append(cl.tick - sent)
+            else:
+                lost += 1
+                log(f"  {name}: press {i} after tick {sent} did not reach view {want} (view {cl.states[bot]['view']})")
+                cl.pulses[bot] = key      # resync for the next press
+                cl.run_for(1.0, lambda: cl.states[bot]["view"] == want)
+            wait_ticks(cl, 3)
+        total_lost += lost
+        lag_txt = f"lag {min(lag)}-{max(lag)} ticks" if lag else "no changes"
+        cl.check(f"{name}: {args.burst_presses - lost}/{args.burst_presses} presses changed the view ({lag_txt})", lost == 0)
+    log(f"burst: {total_lost} presses lost in {len(patterns) * args.burst_presses}")
+    return cl.finish()
+
+
+def run_soak3(args):
+    """The v3 soak: a pilot and a gunner in one heli hovering seaward of the pad; every --tv-every seconds (75:
+    the 8 missiles a sortie carries last the 10 minutes)
+    the gunner fires a TV missile and guides it onto the sea (alternating sides, retargeted in flight on
+    every other pair of shots, 0.5 s after launch); every 45 s a burst of camera presses in superseded SetInputs."""
+    cl = Client(args, "serverext testclient soak3")
+    crew = board_crew(cl, args.team, args.name)
+    if not crew:
+        return cl.finish()
+    pilot, gunner, heli = crew
+    cl.pulses[gunner] = BTN_ALT_FIRE
+    cl.run_for(1.0)
+    cl.check(f"gunner on the TV launcher: {slot0_name(cl, gunner)}", has_tv(cl, gunner))
+    holder = Holder(cl)
+    pad = cl.states[pilot]["pos"]
+    hdg = seaward(pad)
+    alt = pad[1] + 60.0
+    if not cl.check("hover reached", climb_hold(cl, holder, pilot, alt, hdg, "soak3")):
+        holder.stop()
+        return cl.finish()
+    ticks = []
+    cl.on_state = lambda: ticks.append(cl.tick)
+    t0 = time.time()
+    next_shot = t0 + 5.0
+    next_burst = t0 + 20.0
+    shots, hits, presses, lost = [], 0, 0, 0
+    deaths = 0
+    was_alive = True
+    while time.time() - t0 < args.soak_seconds:
+        cl.pump(0.2)
+        alive = cl.in_vehicle(pilot) and cl.in_vehicle(gunner)
+        if not alive:
+            if was_alive:
+                deaths += 1
+                log(f"soak3: crew out of the heli at {time.time() - t0:.0f} s")
+            was_alive = False
+            continue
+        was_alive = True
+        if time.time() >= next_burst:
+            next_burst += 45.0
+            for i in range(4):
+                key, want = [(BTN_CAMERA_MODE[1], 3), (BTN_CAMERA_MODE[2], 4)][i % 2]
+                cl.pulses[pilot] = key
+                cl.extra[pilot] = [dict()]
+                presses += 1
+                if not cl.run_for(1.0, lambda: cl.states[pilot]["view"] == want):
+                    lost += 1
+                wait_ticks(cl, 3)
+        if time.time() >= next_shot:
+            next_shot += args.tv_every
+            n = len(shots)
+            side = 10.0 if n % 2 else -10.0
+            p1 = ahead(cl.states[pilot]["pos"], hdg + side, args.tv_range, args.sea_level)
+            p2 = ahead(cl.states[pilot]["pos"], hdg - side, args.tv_range, args.sea_level)
+            final = p2 if n % 4 >= 2 else p1
+            s = tv_shot(cl, holder, gunner, f"soak shot {n + 1}", aim=lambda: (eye(cl, gunner), p1),
+                        retarget=(lambda: (eye(cl, gunner), p2)) if n % 4 >= 2 else None, retarget_after=0.5,
+                        csv=args.trace_csv or None)
+            shots.append(s)
+            if s and s["launched"]:
+                d = line_dist(s["last"]["pos"], eye(cl, gunner), final)
+                hits += d < 15.0
+                log(f"soak shot {n + 1}: guided {s['guided']}, ended {d:.1f} m from the aim line")
+    cl.on_state = None
+    holder.stop()
+    gaps = sum(1 for a, b in zip(ticks, ticks[1:]) if b != a + 1)
+    launched = sum(1 for s in shots if s and s["launched"])
+    cl.check(f"soak3: {len(ticks)} TickStates in {args.soak_seconds:.0f} s, {gaps} gaps", gaps == 0)
+    cl.check(f"soak3: {launched}/{len(shots)} TV shots launched, {hits} ended within 15 m of the aim line", launched == len(shots) and hits == launched)
+    cl.check(f"soak3: {presses - lost}/{presses} camera presses in superseded SetInputs changed the view", lost == 0)
+    cl.check(f"soak3: crew stayed in the heli ({deaths} losses)", deaths == 0)
+    cl.check(f"soak3: {len(cl.errors0)} errors without a request", not cl.errors0)
+    return cl.finish()
+
+
+SCENARIOS_V3 = {"burst": run_burst, "tv": run_tv, "soak3": run_soak3}
+
+
 # ------------------------------------------------------------------------------------- fuzz
 
 def expect_error(c, label, want_code=None, timeout=3.0):
@@ -2305,7 +2822,12 @@ def run_fuzz(args):
     case("RestartRound before Hello", frame(RESTART_ROUND, struct.pack("<I", 1)), 2, hello_first=False)
     case("Hello version 0 (v0 client)", frame(HELLO, struct.pack("<H", 0) + pstr("x")), 1, hello_first=False)
     case("Hello version 1 (v1 client)", frame(HELLO, struct.pack("<H", 1) + pstr("x")), 1, hello_first=False)
-    case("Hello version 3", frame(HELLO, struct.pack("<H", 3) + pstr("x")), 1, hello_first=False)
+    case("Hello version 2 (v2 client)", frame(HELLO, struct.pack("<H", 2) + pstr("x")), 1, hello_first=False)
+    case("Hello version 4", frame(HELLO, struct.pack("<H", 4) + pstr("x")), 1, hello_first=False)
+    case("SetTargetDirection before Hello", target_direction(255, 0, (0, 0, 0), (1, 1, 1)), 2, hello_first=False)
+    case("short SetTargetDirection (28 bytes)", frame(SET_TARGET_DIRECTION, b"\x00" * 28), 2)
+    case("long SetTargetDirection (30 bytes)", frame(SET_TARGET_DIRECTION, b"\x00" * 30), 2)
+    case("empty SetTargetDirection", frame(SET_TARGET_DIRECTION, b""), 2)
     case("Teleport before Hello", teleport_frame(1, 255, (0, 0, 0), 0), 2, hello_first=False)
     case("Spot before Hello", spot_frame(1, 255, 1), 2, hello_first=False)
     case("short Teleport (20 bytes)", frame(TELEPORT, b"\x00" * 20), 2)
@@ -2404,6 +2926,7 @@ def run_fuzz(args):
     tp_refused = args.expect_teleport_refused
     want_error("Teleport foreign player", teleport_frame(55, 1, (0, 50, 0), 0), 6 if tp_refused else 4)
     want_error("Spot foreign player", spot_frame(56, 1, 1), 4)
+    want_error("SetTargetDirection foreign player", target_direction(1, 0, (0, 50, 0), (10, 0, 10)), 4)
 
     # A real bot: NaN, inf and out-of-range inputs, buttons, bad vehicle ids.
     c.send(frame(CREATE_BOT, struct.pack("<I", 60) + pstr("[BOT] fuzz") + b"\x02"))
@@ -2434,6 +2957,19 @@ def run_fuzz(args):
         want_error("Teleport x 1e9", teleport_frame(66, bot, (1e9, 50, 0), 0), 6 if tp_refused else 7)
         want_error("Spot target 0", spot_frame(67, bot, 0), (5, 6))
         want_error("Spot target 70000", spot_frame(68, bot, 70000), (5, 6))
+        # v3 SetTargetDirection: bad values are 7; a bot without an active TV-guided weapon is 6.
+        want_error("SetTargetDirection NaN start", target_direction(bot, 0, (nan, 50, 0), (10, 0, 10)), 7)
+        want_error("SetTargetDirection +inf end", target_direction(bot, 0, (0, 50, 0), (float("inf"), 0, 10)), 7)
+        want_error("SetTargetDirection end x 9000", target_direction(bot, 0, (0, 50, 0), (9000, 0, 10)), 7)
+        want_error("SetTargetDirection start y -2000", target_direction(bot, 0, (0, -2000, 0), (10, 0, 10)), 7)
+        want_error("SetTargetDirection start == end", target_direction(bot, 0, (5, 50, 5), (5, 50, 5)), 7)
+        want_error("SetTargetDirection without a TV weapon", target_direction(bot, 0, (0, 50, 0), (10, 0, 10)), 6)
+        # A flood of directions: latest wins per tick, so the server applies at most one a tick.
+        try:
+            c.send(target_direction(bot, 0, (0, 50, 0), (10, 0, 10)) * 3000)
+            results.append(("3000-frame SetTargetDirection burst sent", True))
+        except OSError as ex:
+            results.append((f"3000-frame SetTargetDirection burst: {ex}", True))
         # Flood: many SetInputs in one burst (latest wins; the queue bound may close the connection).
         burst = set_input(bot, 0, 0.1, 0, 0, 0) * 20000
         try:
@@ -2518,7 +3054,8 @@ def main():
     ap.add_argument("--expect-restart-refused", action="store_true", help="fuzz: the server has allowRoundRestart 0")
     ap.add_argument("--vehicle-log-every", type=float, default=60.0, help="seconds between VehicleList summaries")
     ap.add_argument("--scenario", choices=["hover", "walk", "buttons", "blockpad", "allblocked", "wreck", "q9", "q5", "teamswitch",
-                                           "view", "weapons", "damage", "spot", "round", "teleport", "multiconn", "soak2"],
+                                           "view", "weapons", "damage", "spot", "round", "teleport", "multiconn", "soak2",
+                                           "burst", "tv", "soak3"],
                     default="hover")
     ap.add_argument("--rcon-port", type=int, default=4723, help="q9: ModManager RCON port")
     ap.add_argument("--rcon-password", default="", help="q9: ModManager RCON password")
@@ -2551,10 +3088,20 @@ def main():
     ap.add_argument("--max-connections", type=int, default=4, help="multiconn/fuzz: the server's maxConnections")
     ap.add_argument("--expect-teleport-refused", action="store_true", help="teleport/fuzz: the server has allowTeleport 0")
     ap.add_argument("--soak-seconds", type=float, default=600.0)
+    ap.add_argument("--burst-presses", type=int, default=60, help="burst: one-tick camera presses per pattern")
+    ap.add_argument("--tv-target", action="store_true", help="tv: also steer a missile onto an own bot of the other team")
+    ap.add_argument("--tv-range", type=float, default=250.0, help="tv: metres from the heli to the aim points")
+    ap.add_argument("--sea-level", type=float, default=141.4,
+                    help="tv: the map's sea level (dalian_2_v_2 Heightdata.con setSeaWaterLevel); aim points lie on it")
+    ap.add_argument("--tv-every", type=float, default=75.0,
+                    help="soak3: seconds between guided TV shots (the AH-1Z carries 8 and does not rearm in a hover)")
+    ap.add_argument("--trace-csv", default="", help="tv: write every TV missile's track to this CSV")
     args = ap.parse_args()
     try:
         if args.fuzz:
             return run_fuzz(args)
+        if args.scenario in SCENARIOS_V3:
+            return SCENARIOS_V3[args.scenario](args)
         if args.scenario in SCENARIOS_V2:
             return SCENARIOS_V2[args.scenario](args)
         if args.scenario != "hover":

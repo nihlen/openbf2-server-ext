@@ -15,6 +15,7 @@
 #include "Protocol.h"
 #include "Session.h"
 #include "Neutral.h"
+#include "PendingInput.h"
 #include "SpawnPlan.h"
 
 using namespace serverext;
@@ -82,6 +83,18 @@ std::vector<uint8_t> spotPayload(uint32_t requestId, uint8_t id, uint32_t target
     w.u32(requestId);
     w.u8(id);
     w.u32(target);
+    return p;
+}
+
+std::vector<uint8_t> directionPayload(uint8_t id, uint32_t tick, float sx, float sy, float sz, float ex, float ey,
+                                      float ez)
+{
+    std::vector<uint8_t> p;
+    Writer w(p);
+    w.u8(id);
+    w.u32(tick);
+    w.f32(sx); w.f32(sy); w.f32(sz);
+    w.f32(ex); w.f32(ey); w.f32(ez);
     return p;
 }
 
@@ -281,9 +294,97 @@ void testParsers()
     CHECK(!parseSpot(std::vector<uint8_t>(), sp));
 
     CHECK(isClientMessage(MsgTeleport) && isClientMessage(MsgSpot));
+
+    // v3: SetTargetDirection (29 bytes), exact length only; values are checked separately.
+    SetTargetDirectionMsg td;
+    CHECK(directionPayload(0, 0, 0, 0, 0, 0, 0, 0).size() == 29);
+    CHECK(parseSetTargetDirection(directionPayload(254, 4321, -10.5f, 120.0f, 30.0f, 200.0f, 0.0f, -75.25f), td) &&
+          td.playerId == 254 && td.tick == 4321 && td.start[0] == -10.5f && td.start[1] == 120.0f &&
+          td.start[2] == 30.0f && td.end[0] == 200.0f && td.end[1] == 0.0f && td.end[2] == -75.25f);
+    {
+        std::vector<uint8_t> t = directionPayload(1, 2, 0, 0, 0, 1, 1, 1);
+        t.pop_back();
+        CHECK(!parseSetTargetDirection(t, td));
+        t.push_back(0);
+        t.push_back(0);
+        CHECK(!parseSetTargetDirection(t, td));
+        CHECK(!parseSetTargetDirection(std::vector<uint8_t>(), td));
+        CHECK(!parseSetTargetDirection(std::vector<uint8_t>(28, 0), td));
+        CHECK(parseSetTargetDirection(std::vector<uint8_t>(29, 0), td));
+    }
+    CHECK(isClientMessage(MsgSetTargetDirection));
     const uint16_t moduleOnly[] = { MsgProjectileList, MsgDamage, MsgKill, MsgChat, MsgRoundState };
     for (size_t i = 0; i < sizeof(moduleOnly) / sizeof(moduleOnly[0]); ++i)
         CHECK(!isClientMessage(moduleOnly[i]));
+}
+
+// v3 item 3: SetTargetDirection value checks.
+void testTargetDirection()
+{
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    const float inf = std::numeric_limits<float>::infinity();
+    SetTargetDirectionMsg m;
+
+    CHECK(parseSetTargetDirection(directionPayload(1, 0, 0, 100, 0, 300, 0, 300), m) && !checkTargetDirection(m));
+    // Every coordinate of both points, NaN and infinite.
+    for (int k = 0; k < 6; ++k)
+        for (int v = 0; v < 3; ++v)
+        {
+            float f[6] = { 0, 100, 0, 300, 0, 300 };
+            f[k] = v == 0 ? nan : v == 1 ? inf : -inf;
+            CHECK(parseSetTargetDirection(directionPayload(1, 0, f[0], f[1], f[2], f[3], f[4], f[5]), m) &&
+                  checkTargetDirection(m) != 0);
+        }
+    // World bounds, as Teleport's: |x|, |z| <= 8192, y in -1000..10000, for start and end.
+    CHECK(parseSetTargetDirection(directionPayload(1, 0, 8192, 10000, -8192, -8192, -1000, 8192), m) &&
+          !checkTargetDirection(m));
+    const float out[][6] = { { 8193, 0, 0, 0, 1, 0 }, { 0, 0, -8193, 0, 1, 0 }, { 0, 10001, 0, 0, 0, 0 },
+                             { 0, -1001, 0, 0, 0, 0 }, { 0, 0, 0, 9000, 0, 0 }, { 0, 0, 0, 0, 0, -9000 },
+                             { 0, 0, 0, 0, 20000, 0 }, { 0, 0, 0, 0, -5000, 0 } };
+    for (size_t i = 0; i < sizeof(out) / sizeof(out[0]); ++i)
+    {
+        const float* f = out[i];
+        CHECK(parseSetTargetDirection(directionPayload(1, 0, f[0], f[1], f[2], f[3], f[4], f[5]), m) &&
+              checkTargetDirection(m) != 0);
+    }
+    // Start and end must be at least 0.1 m apart.
+    CHECK(parseSetTargetDirection(directionPayload(1, 0, 5, 5, 5, 5, 5, 5), m) && checkTargetDirection(m) != 0);
+    CHECK(parseSetTargetDirection(directionPayload(1, 0, 5, 5, 5, 5.05f, 5, 5), m) && checkTargetDirection(m) != 0);
+    CHECK(parseSetTargetDirection(directionPayload(1, 0, 5, 5, 5, 5.2f, 5, 5), m) && !checkTargetDirection(m));
+}
+
+// v3 item 1: the buttons of superseded SetInputs are ORed, the axes are latest wins.
+void testPendingInput()
+{
+    PendingInput pi;
+    uint32_t kept = 99;
+    const float a1[AxisCount] = { 0.1f, 0.2f, 0.3f, 0.4f, 0.5f, 0.6f };
+    const float a2[AxisCount] = { -0.1f, -0.2f, -0.3f, -0.4f, -0.5f, -0.6f };
+    CHECK(!pi.has && pi.buttons == 0);
+    CHECK(!pi.add(a1, 1u << 8, kept) && kept == 0 && pi.has && pi.buttons == (1u << 8));
+    // A later SetInput without the camera press keeps it; its axes win.
+    CHECK(pi.add(a2, 1u << 0, kept) && kept == (1u << 8) && pi.buttons == ((1u << 8) | 1u));
+    for (int i = 0; i < AxisCount; ++i)
+        CHECK(pi.axes[i] == a2[i]);
+    // A release in the same tick cannot cancel the press.
+    CHECK(pi.add(a1, 0, kept) && kept == ((1u << 8) | 1u) && pi.buttons == ((1u << 8) | 1u));
+    // Pressing the same buttons again keeps nothing new.
+    CHECK(pi.add(a1, (1u << 8) | 1u, kept) && kept == 0);
+    for (int i = 0; i < AxisCount; ++i)
+        CHECK(pi.axes[i] == a1[i]);
+    // After the tick applies it, the next SetInput starts afresh: no carry-over.
+    pi.clear();
+    CHECK(!pi.has && pi.buttons == 0);
+    CHECK(!pi.add(a2, 1u << 31, kept) && kept == 0 && pi.buttons == (1u << 31));
+    // A burst of one-tick presses, one bit each, all survive.
+    pi.clear();
+    uint32_t all = 0;
+    for (int bit = 0; bit < 32; ++bit)
+    {
+        pi.add(a1, 1u << bit, kept);
+        all |= 1u << bit;
+    }
+    CHECK(pi.buttons == all && pi.buttons == 0xFFFFFFFFu);
 }
 
 // The v2 module-to-sidecar events, field by field.
@@ -419,7 +520,7 @@ void testEncoders()
     Frame f;
     CHECK(d.next(f) == FrameDecoder::GotFrame && f.type == MsgWelcome);
     Reader r(f.payload.data(), f.payload.size());
-    CHECK(r.u16() == 2);
+    CHECK(r.u16() == 3);   // v3: the version is the only Welcome change
     CHECK(r.f32() == 30.0f);
     CHECK(r.u32() == 123);
     std::string map, mode;
@@ -697,7 +798,15 @@ void testSession()
         Channel ch;
         Session s(&ch, 1);
         std::vector<uint8_t> reply;
-        std::vector<uint8_t> f = frame(MsgHello, helloPayload(3, "x"));
+        std::vector<uint8_t> f = frame(MsgHello, helloPayload(2, "x"));   // nor v2
+        CHECK(!s.onBytes(f.data(), f.size(), reply));
+        CHECK(errorCode(reply) == ErrVersion);
+    }
+    {
+        Channel ch;
+        Session s(&ch, 1);
+        std::vector<uint8_t> reply;
+        std::vector<uint8_t> f = frame(MsgHello, helloPayload(4, "x"));
         CHECK(!s.onBytes(f.data(), f.size(), reply));
         CHECK(errorCode(reply) == ErrVersion);
     }
@@ -712,6 +821,32 @@ void testSession()
         std::deque<Command> q;
         ch.drainCommands(q);
         CHECK(q.size() == 2 && q[1].kind == Command::RestartRound && q[1].restartRound.requestId == 99 && q[1].conn == 4);
+    }
+    // v3 SetTargetDirection becomes a command; before Hello it closes with code 2.
+    {
+        Channel ch;
+        Session s(&ch, 6);
+        std::vector<uint8_t> reply;
+        std::vector<uint8_t> h = frame(MsgHello, helloPayload(kVersion, "x"));
+        std::vector<uint8_t> d = frame(MsgSetTargetDirection, directionPayload(253, 77, 1, 2, 3, 4, 5, 6));
+        // Non-finite values pass the session; the module answers them with Error 7.
+        std::vector<uint8_t> n = frame(MsgSetTargetDirection,
+                                       directionPayload(253, 78, std::numeric_limits<float>::quiet_NaN(), 0, 0, 1, 1, 1));
+        CHECK(s.onBytes(h.data(), h.size(), reply) && s.onBytes(d.data(), d.size(), reply) &&
+              s.onBytes(n.data(), n.size(), reply) && reply.empty());
+        std::deque<Command> q;
+        ch.drainCommands(q);
+        CHECK(q.size() == 3 && q[1].kind == Command::SetTargetDirection && q[1].conn == 6 &&
+              q[1].targetDirection.playerId == 253 && q[1].targetDirection.tick == 77 &&
+              q[1].targetDirection.start[2] == 3.0f && q[1].targetDirection.end[0] == 4.0f &&
+              q[2].kind == Command::SetTargetDirection && q[2].targetDirection.tick == 78);
+    }
+    {
+        Channel ch;
+        Session s(&ch, 1);
+        std::vector<uint8_t> reply;
+        std::vector<uint8_t> d = frame(MsgSetTargetDirection, directionPayload(253, 77, 1, 2, 3, 4, 5, 6));
+        CHECK(!s.onBytes(d.data(), d.size(), reply) && errorCode(reply) == ErrMalformed);
     }
     // v2 Teleport and Spot become commands; before Hello they close with code 2.
     {
@@ -790,7 +925,8 @@ void testSession()
         }
     }
     // Malformed payloads of known types close with code 2.
-    const uint16_t types[] = { MsgCreateBot, MsgEnterVehicle, MsgRemoveBot, MsgSetInput, MsgRestartRound, MsgTeleport, MsgSpot };
+    const uint16_t types[] = { MsgCreateBot, MsgEnterVehicle, MsgRemoveBot, MsgSetInput, MsgRestartRound, MsgTeleport, MsgSpot,
+                               MsgSetTargetDirection };
     for (size_t i = 0; i < sizeof(types) / sizeof(types[0]); ++i)
     {
         Channel ch;
@@ -863,8 +999,9 @@ void testFuzz()
             for (size_t i = 0; i < payload.size(); ++i)
                 payload[i] = static_cast<uint8_t>(rng());
             const uint16_t types[] = { MsgHello, MsgCreateBot, MsgEnterVehicle, MsgRemoveBot, MsgSetInput,
-                                       MsgRestartRound, MsgTeleport, MsgSpot, static_cast<uint16_t>(rng()) };
-            std::vector<uint8_t> f = frame(types[rng() % 9], payload);
+                                       MsgRestartRound, MsgTeleport, MsgSpot, MsgSetTargetDirection,
+                                       static_cast<uint16_t>(rng()) };
+            std::vector<uint8_t> f = frame(types[rng() % 10], payload);
             if (rng() % 8 == 0)
                 f[rng() % f.size()] ^= static_cast<uint8_t>(1u << (rng() % 8));
             open = s.onBytes(f.data(), f.size(), reply);
@@ -1100,6 +1237,8 @@ int main()
     testWriterReader();
     testDecoder();
     testParsers();
+    testTargetDirection();
+    testPendingInput();
     testV2Encoders();
     testEncoders();
     testConditioning();

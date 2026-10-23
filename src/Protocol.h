@@ -1,4 +1,4 @@
-// Wire format of the bot channel, docs/protocol.md v2 (layouts in docs/findings/module-v2.md). Engine-free: the I/O thread, the main thread
+// Wire format of the bot channel, docs/protocol.md v3 (layouts in docs/findings/module-v2.md and module-v3.md). Engine-free: the I/O thread, the main thread
 // and the unit tests all use it.
 
 #ifndef SERVEREXT_PROTOCOL_H
@@ -12,7 +12,7 @@
 namespace serverext {
 namespace proto {
 
-const uint16_t kVersion = 2;
+const uint16_t kVersion = 3;
 const size_t kHeaderSize = 8;
 const uint32_t kMaxPayload = 64 * 1024;
 
@@ -31,6 +31,7 @@ enum MsgType : uint16_t
     MsgTeleport     = 0x0109,
     MsgSpot         = 0x010A,
     MsgSetInput     = 0x0201,
+    MsgSetTargetDirection = 0x0202,   // v3 item 3
     MsgTickState    = 0x0301,
     MsgVehicleList  = 0x0302,
     MsgProjectileList = 0x0303,
@@ -180,6 +181,15 @@ struct SetInputMsg
     uint32_t buttons;
 };
 
+// v3 item 3: steer the bot's TV-guided weapon along the ray from start through end (world metres).
+struct SetTargetDirectionMsg
+{
+    uint8_t playerId;
+    uint32_t tick;
+    float start[3];
+    float end[3];
+};
+
 // Each parser requires the payload to be exactly the message, with no trailing bytes.
 bool parseHello(const std::vector<uint8_t>& p, HelloMsg& out);
 bool parseCreateBot(const std::vector<uint8_t>& p, CreateBotMsg& out);
@@ -189,6 +199,12 @@ bool parseSetInput(const std::vector<uint8_t>& p, SetInputMsg& out);
 bool parseRestartRound(const std::vector<uint8_t>& p, RestartRoundMsg& out);
 bool parseTeleport(const std::vector<uint8_t>& p, TeleportMsg& out);
 bool parseSpot(const std::vector<uint8_t>& p, SpotMsg& out);
+bool parseSetTargetDirection(const std::vector<uint8_t>& p, SetTargetDirectionMsg& out);
+
+// Checks a SetTargetDirection's values (v3 item 3): finite, both points inside the world (|x| and
+// |z| at most 8192, y in -1000..10000) and at least 0.1 m apart. Returns null when valid, else the
+// reason for the Error 7 message.
+const char* checkTargetDirection(const SetTargetDirectionMsg& m);
 
 // True for the message types a sidecar may send.
 bool isClientMessage(uint16_t type);

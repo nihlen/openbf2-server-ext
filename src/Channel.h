@@ -20,7 +20,7 @@ namespace serverext {
 struct Command
 {
     enum Kind { Connected, Disconnected, Hello, CreateBot, EnterVehicle, RemoveBot, SetInput, RestartRound, Teleport,
-                Spot };
+                Spot, SetTargetDirection };
 
     Kind kind;
     uint32_t conn;
@@ -32,6 +32,7 @@ struct Command
     proto::RestartRoundMsg restartRound;
     proto::TeleportMsg teleport;
     proto::SpotMsg spot;
+    proto::SetTargetDirectionMsg targetDirection;
 };
 
 class Channel

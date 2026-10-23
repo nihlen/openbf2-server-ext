@@ -1,5 +1,5 @@
-// libserverext: the engine side of the bot channel, docs/protocol.md v2 (byte layouts in
-// docs/findings/module-v2.md). It also hosts the admin channel (Admin.cpp), whose per-tick work
+// libserverext: the engine side of the bot channel, docs/protocol.md v3 (byte layouts in
+// docs/findings/module-v2.md and module-v3.md). It also hosts the admin channel (Admin.cpp), whose per-tick work
 // runs from this module's tick handler.
 //
 // Everything in this file runs on the server's main thread: inside the EventManager category-7
@@ -50,6 +50,7 @@
 #include "EngineUtil.h"
 #include "IoThread.h"
 #include "Neutral.h"
+#include "PendingInput.h"
 #include "Protocol.h"
 #include "SpawnPlan.h"
 
@@ -81,6 +82,7 @@ const size_t kMaxTrackedProjectiles = 256;
 const unsigned int kCachedObjectFlag = 0x20;    // ObjectCache: a disabled, recycled object
 const int kCategoryHelicopter = 3;              // VCHelicopter (ModuleWorldObjTemplGame.cpp); every heli's vehicleCategory
 const uint32_t kNoNetIdBase = 0x10000;          // ProjectileList id without a networkable id
+const int kTargetSystemTV = 4;                  // TSTVGuided (Game/Objects/CompTemplateBases.h)
 
 // protocol.md v1 "Buttons": SetInput bit n presses PlayerInput slot kButtonSlots[n] for one tick.
 // The table and its evidence are in docs/findings/module-v1.md (Q11). PIUse is deliberately absent.
@@ -213,10 +215,10 @@ struct Bot
     uint32_t conn;
     int team;                         // the team the spawn groups below belong to; follows getTeam()
     float axes[proto::AxisCount];      // what is written every tick
-    float pending[proto::AxisCount];   // latest SetInput of this tick
+    PendingInput pending;              // SetInputs since the last tick (v3 item 1: buttons ORed)
     uint32_t buttons;                  // pressed for this tick only
-    uint32_t pendingButtons;
-    bool hasPending;
+    bool hasDirection;                 // a SetTargetDirection waits for this tick (v3 item 3)
+    proto::SetTargetDirectionMsg direction;
     unsigned int idleTicks;
     bool watchdogTripped;
     bool levelAndHold;                 // v2 item 11: the watchdog flies the heli neutral
@@ -395,7 +397,16 @@ public:
         const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
         m_cost.add(us);
         if (m_tick % kStatsPeriodTicks == 0)
+        {
             m_cost.report(m_tick, m_bots.size(), m_conns.size(), m_tracked.size(), m_launches);
+            logLine("tick %lu inputs: SetInput superseded %lu this minute (%lu kept a button), %lu run (%lu); "
+                    "SetTargetDirection applied %lu this minute, %lu run (%lu superseded, %lu refused)",
+                    m_tick, m_superseded - m_supersededMark, m_keptPresses - m_keptMark, m_superseded, m_keptPresses,
+                    m_steers - m_steersMark, m_steers, m_steersSuperseded, m_steersRefused);
+            m_supersededMark = m_superseded;
+            m_keptMark = m_keptPresses;
+            m_steersMark = m_steers;
+        }
     }
 
     // ---------------------------------------------------------------- engine observers (v2)
@@ -688,6 +699,7 @@ private:
             case Command::RestartRound: onRestartRound(c.conn, c.restartRound); break;
             case Command::Teleport:     onTeleport(c.conn, c.teleport); break;
             case Command::Spot:         onSpot(c.conn, c.spot); break;
+            case Command::SetTargetDirection: onSetTargetDirection(c.conn, c.targetDirection); break;
             default: break;
             }
         }
@@ -702,7 +714,8 @@ private:
             Bot& b = m_bots[i];
             if (b.conn != conn || b.removeCountdown >= 0)
                 continue;
-            b.hasPending = false;
+            b.pending.clear();
+            b.hasDirection = false;
             neutralise(b, live(b));
             b.removeCountdown = m_config.watchdogTicks;
             ++n;
@@ -779,9 +792,9 @@ private:
         b.conn = conn;
         b.team = m.team;
         for (int i = 0; i < proto::AxisCount; ++i)
-            b.axes[i] = b.pending[i] = 0.0f;
-        b.buttons = b.pendingButtons = 0;
-        b.hasPending = false;
+            b.axes[i] = 0.0f;
+        b.buttons = 0;
+        b.hasDirection = false;
         b.idleTicks = 0;
         b.watchdogTripped = false;
         b.levelAndHold = false;
@@ -988,10 +1001,94 @@ private:
         }
         // Every one of the 32 bits is in the button table (kButtonSlots), so there is no unknown
         // bit to ignore and log.
-        for (int i = 0; i < proto::AxisCount; ++i)
-            b->pending[i] = axes[i];   // latest wins within a tick, buttons included
-        b->pendingButtons = m.buttons;
-        b->hasPending = true;
+        // v3 item 1: the axes are latest wins within a tick; the buttons of a superseded SetInput
+        // are ORed into the one applied, so a one-tick press is never lost.
+        uint32_t kept = 0;
+        if (b->pending.add(axes, m.buttons, kept))
+        {
+            ++m_superseded;
+            if (kept)
+                ++m_keptPresses;
+        }
+    }
+
+    // v3 item 3: checked here, applied in the tick handler (latest wins per bot per tick).
+    void onSetTargetDirection(uint32_t conn, const proto::SetTargetDirectionMsg& m)
+    {
+        Bot* b = ownBot(m.playerId, conn);
+        if (!b)
+        {
+            ++m_steersRefused;
+            error(conn, 0, proto::ErrUnknownPlayer, "SetTargetDirection for a player that is not a bot of this connection");
+            return;
+        }
+        if (const char* why = proto::checkTargetDirection(m))
+        {
+            ++m_steersRefused;
+            error(conn, 0, proto::ErrInvalidValue, why);
+            return;
+        }
+        if (b->hasDirection)
+            ++m_steersSuperseded;
+        b->direction = m;
+        b->hasDirection = true;
+    }
+
+    // The bot's active TV-guided weapon (protocol.md v3 item 3), or null. Wire-guided weapons are
+    // not returned: the server re-aims them from the player's camera every tick.
+    IWeaponObject* tvWeapon(world::IPlayer* p)
+    {
+        IObject* holder = p->getVehicle();
+        IPlayerControlObject* pco =
+            holder ? static_cast<IPlayerControlObject*>(holder->queryInterface(IID_IPlayerControlObject)) : 0;
+        if (!pco || holder->queryInterface(IID_ICameraObject))
+            return 0;
+        for (int slot = 0; slot < proto::kMaxWeapons; ++slot)
+        {
+            IObject* weapon = pco->getActiveWeapon(slot);
+            IWeaponObject* w = weapon ? static_cast<IWeaponObject*>(weapon->queryInterface(IID_IWeaponObject)) : 0;
+            if (w && w->getTargetSystemType() == kTargetSystemTV)
+                return w;
+        }
+        return 0;
+    }
+
+    // Applies the bot's latest SetTargetDirection through the virtual the client's
+    // TargetDirectionEvent::executeServer calls (GameEvents/TargetDirectionEvent.cpp).
+    void applyDirection(Bot& b, world::IPlayer* p)
+    {
+        b.hasDirection = false;
+        const proto::SetTargetDirectionMsg& m = b.direction;
+        const char* why = 0;
+        IWeaponObject* w = 0;
+        if (!p->getIsAlive() || p->getIsManDown())
+            why = "SetTargetDirection: the bot must be alive and not man-down";
+        else if (!(w = tvWeapon(p)))
+            why = "SetTargetDirection: the bot has no active TV-guided weapon";
+        else if (!w->getTargetObject())
+            why = "SetTargetDirection: the TV-guided weapon has no target object";
+        if (why)
+        {
+            ++m_steersRefused;
+            error(b.conn, 0, proto::ErrRefused, why);
+            return;
+        }
+        const Vec3 start = { m.start[0], m.start[1], m.start[2] };
+        const Vec3 end = { m.end[0], m.end[1], m.end[2] };
+        w->setTargetDirection(start, end);
+        ++m_steers;
+        if (m_steerLogs < 20 || m_steers % 300 == 0)
+        {
+            ++m_steerLogs;
+            IObject* target = w->getTargetObject();
+            Vec3 t = { 0.0f, 0.0f, 0.0f };
+            if (target)
+                t = target->getAbsolutePosition();
+            IObject* missile = w->getProjectile();
+            logLine("tick %lu: bot %d steer #%lu (from tick %u) start %.1f %.1f %.1f end %.1f %.1f %.1f -> target %.1f %.1f %.1f%s",
+                    m_tick, b.id, m_steers, m.tick, start.x, start.y, start.z, end.x, end.y, end.z, t.x, t.y, t.z,
+                    missile ? " (missile in flight)" : "");
+        }
     }
 
     void onRestartRound(uint32_t conn, const proto::RestartRoundMsg& m)
@@ -1356,12 +1453,12 @@ private:
             else
                 observe(b, p);
 
-            if (b.hasPending)
+            if (b.pending.has)
             {
                 for (int k = 0; k < proto::AxisCount; ++k)
-                    b.axes[k] = b.pending[k];
-                b.buttons = b.pendingButtons;
-                b.hasPending = false;
+                    b.axes[k] = b.pending.axes[k];
+                b.buttons = b.pending.buttons;
+                b.pending.clear();
                 b.idleTicks = 0;
                 if (b.watchdogTripped)
                     logLine("tick %lu: bot %d input resumed", m_tick, b.id);
@@ -1381,6 +1478,8 @@ private:
                     flyNeutral(b, p);
             }
             writeInput(b, p);
+            if (b.hasDirection)
+                applyDirection(b, p);
             ++i;
         }
     }
@@ -1998,6 +2097,15 @@ private:
     unsigned long m_projectileLogs = 0;
     unsigned long m_skippedLogs = 0;
     unsigned long m_launches = 0;
+    unsigned long m_superseded = 0;        // v3 item 1: SetInputs replaced before their tick
+    unsigned long m_supersededMark = 0;
+    unsigned long m_keptPresses = 0;       // ... of which kept a button the later one did not press
+    unsigned long m_keptMark = 0;
+    unsigned long m_steers = 0;            // v3 item 3: SetTargetDirections applied
+    unsigned long m_steersMark = 0;
+    unsigned long m_steersSuperseded = 0;
+    unsigned long m_steersRefused = 0;
+    unsigned long m_steerLogs = 0;
     unsigned long m_spotLogs = 0;
     unsigned long m_chatLogs = 0;
     GroupInfo m_groups[kMaxSpawnGroups];

@@ -260,6 +260,36 @@ bool parseSpot(const std::vector<uint8_t>& p, SpotMsg& out)
     return r.done();
 }
 
+bool parseSetTargetDirection(const std::vector<uint8_t>& p, SetTargetDirectionMsg& out)
+{
+    Reader r(p.data(), p.size());
+    out.playerId = r.u8();
+    out.tick = r.u32();
+    for (int k = 0; k < 3; ++k)
+        out.start[k] = r.f32();
+    for (int k = 0; k < 3; ++k)
+        out.end[k] = r.f32();
+    return r.done();
+}
+
+const char* checkTargetDirection(const SetTargetDirectionMsg& m)
+{
+    for (int k = 0; k < 3; ++k)
+        if (!std::isfinite(m.start[k]) || !std::isfinite(m.end[k]))
+            return "SetTargetDirection value is NaN or infinite";
+    const float* points[2] = { m.start, m.end };
+    for (int i = 0; i < 2; ++i)
+    {
+        const float* q = points[i];
+        if (std::fabs(q[0]) > 8192.0f || std::fabs(q[2]) > 8192.0f || q[1] < -1000.0f || q[1] > 10000.0f)
+            return "SetTargetDirection point outside the world";
+    }
+    const double dx = m.end[0] - m.start[0], dy = m.end[1] - m.start[1], dz = m.end[2] - m.start[2];
+    if (dx * dx + dy * dy + dz * dz < 0.01)
+        return "SetTargetDirection start and end are less than 0.1 m apart";
+    return 0;
+}
+
 bool isClientMessage(uint16_t type)
 {
     switch (type)
@@ -272,6 +302,7 @@ bool isClientMessage(uint16_t type)
     case MsgRestartRound:
     case MsgTeleport:
     case MsgSpot:
+    case MsgSetTargetDirection:
         return true;
     default:
         return false;
