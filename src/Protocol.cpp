@@ -350,6 +350,7 @@ void encodeProjectileList(std::vector<uint8_t>& out, uint32_t tick, const std::v
         for (int k = 0; k < 3; ++k) w.f32(e.pos[k]);
         for (int k = 0; k < 3; ++k) w.f32(e.vel[k]);
         w.f32(e.timeToLive);
+        w.u32(e.launch);
     }
     w.finish();
 }

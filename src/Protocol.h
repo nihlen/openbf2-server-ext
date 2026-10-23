@@ -296,6 +296,18 @@ struct ProjectileEntry
     float pos[3];
     float vel[3];
     float timeToLive;
+    uint32_t launch;         // launch number, from LaunchCounter
+};
+
+// ProjectileList launch numbers: 1, 2, 3, ... for every launch the module tracks since it loaded.
+// The projectile id is reused across flights (the engine pools projectile objects); this is not.
+class LaunchCounter
+{
+public:
+    explicit LaunchCounter(uint32_t last = 0) : m_last(last) {}
+    uint32_t next() { return ++m_last ? m_last : ++m_last; }   // 0 is never handed out
+private:
+    uint32_t m_last;
 };
 
 // At most kMaxProjectiles entries are written.

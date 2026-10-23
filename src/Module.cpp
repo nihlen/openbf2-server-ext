@@ -265,6 +265,7 @@ struct Tracked
     uint32_t wireId;
     std::string templateName;
     bool guided;
+    uint32_t launch;        // ProjectileList launch number
 };
 
 class Module : public IEventListener,
@@ -478,10 +479,11 @@ public:
         t.wireId = net ? net : kNoNetIdBase + t.objectId;
         t.templateName = templateName(projectile);
         t.guided = guided;
+        t.launch = m_launchNumbers.next();
         m_tracked.push_back(t);
         if (++m_projectileLogs <= 20 || m_projectileLogs % 200 == 0)
-            logLine("tick %lu: projectile %u '%s' launched (net id %u, guided %d, %lu so far)", m_tick, t.wireId,
-                 t.templateName.c_str(), net, guided ? 1 : 0, m_projectileLogs);
+            logLine("tick %lu: projectile %u '%s' launched (net id %u, guided %d, launch %u, %lu so far)", m_tick, t.wireId,
+                 t.templateName.c_str(), net, guided ? 1 : 0, t.launch, m_projectileLogs);
     }
 
     // v2 item 6 (IServerExtension::ISpotObserver): a target stays spotted for its spotting team for
@@ -1839,6 +1841,7 @@ private:
                 v = node->getPositionalSpeed();
             e.vel[0] = v.x; e.vel[1] = v.y; e.vel[2] = v.z;
             e.timeToLive = info.timeToLive;
+            e.launch = t.launch;
             ++i;
         }
 
@@ -2097,6 +2100,7 @@ private:
     unsigned long m_projectileLogs = 0;
     unsigned long m_skippedLogs = 0;
     unsigned long m_launches = 0;
+    proto::LaunchCounter m_launchNumbers;  // never reset, so a number is never reused while loaded
     unsigned long m_superseded = 0;        // v3 item 1: SetInputs replaced before their tick
     unsigned long m_supersededMark = 0;
     unsigned long m_keptPresses = 0;       // ... of which kept a button the later one did not press

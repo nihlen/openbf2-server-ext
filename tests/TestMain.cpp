@@ -404,6 +404,7 @@ void testV2Encoders()
         e.pos[0] = 1; e.pos[1] = 2; e.pos[2] = 3;
         e.vel[0] = 4; e.vel[1] = 5; e.vel[2] = 6;
         e.timeToLive = 7.5f;
+        e.launch = 0xA1B2C3D4;
         std::vector<uint8_t> b;
         encodeProjectileList(b, 44, v);
         FrameDecoder d;
@@ -417,7 +418,38 @@ void testV2Encoders()
         CHECK(name == "ahe_ah1z_hellfire" && r.u8() == 254 && r.u8() == 2 && r.u8() == (kProjectileGuided | kProjectileOwn));
         CHECK(r.u32() == 1819);
         CHECK(r.f32() == 1 && r.f32() == 2 && r.f32() == 3 && r.f32() == 4 && r.f32() == 5 && r.f32() == 6);
-        CHECK(r.f32() == 7.5f && r.done());
+        CHECK(r.f32() == 7.5f && r.u32() == 0xA1B2C3D4 && r.done());
+
+        // Two flights on the same pooled projectile id get different launch numbers.
+        {
+            LaunchCounter launches;
+            std::vector<ProjectileEntry> flights(2, e);
+            flights[0].launch = launches.next();
+            flights[1].launch = launches.next();
+            CHECK(flights[0].launch == 1 && flights[1].launch == 2);
+            std::vector<uint8_t> fb;
+            encodeProjectileList(fb, 45, flights);
+            FrameDecoder fd;
+            fd.feed(fb.data(), fb.size());
+            Frame ff;
+            CHECK(fd.next(ff) == FrameDecoder::GotFrame);
+            Reader fr(ff.payload.data(), ff.payload.size());
+            CHECK(fr.u32() == 45 && fr.u8() == 2);
+            uint32_t ids[2], numbers[2];
+            for (int k = 0; k < 2; ++k)
+            {
+                ids[k] = fr.u32();
+                std::string n;
+                fr.str(n);
+                fr.u8(); fr.u8(); fr.u8(); fr.u32();
+                for (int j = 0; j < 7; ++j) fr.f32();
+                numbers[k] = fr.u32();
+            }
+            CHECK(fr.done() && ids[0] == 2101 && ids[1] == 2101 && numbers[0] == 1 && numbers[1] == 2);
+            // 0 is never handed out, also past the u32 wrap.
+            LaunchCounter wrap(0xFFFFFFFEu);
+            CHECK(wrap.next() == 0xFFFFFFFFu && wrap.next() == 1 && wrap.next() == 2);
+        }
 
         // Empty, and capped at kMaxProjectiles.
         b.clear();
@@ -427,7 +459,15 @@ void testV2Encoders()
         b.clear();
         encodeProjectileList(b, 1, many);
         CHECK(b[kHeaderSize + 4] == kMaxProjectiles);
-        CHECK(b.size() == kHeaderSize + 5 + kMaxProjectiles * (4 + 2 + 3 + 4 + 24 + 4));
+        CHECK(b.size() == kHeaderSize + 5 + kMaxProjectiles * (4 + 2 + 3 + 4 + 24 + 4 + 4));
+        // The largest list (64 entries, 255-byte names) stays within kMaxPayload.
+        for (size_t k = 0; k < many.size(); ++k)
+            many[k].templateName.assign(1000, 'x');
+        b.clear();
+        encodeProjectileList(b, 1, many);
+        CHECK(b[kHeaderSize + 4] == kMaxProjectiles);
+        CHECK(b.size() == kHeaderSize + 5 + kMaxProjectiles * (4 + 2 + 255 + 3 + 4 + 24 + 4 + 4));
+        CHECK(b.size() - kHeaderSize <= kMaxPayload);
     }
     // Damage
     {

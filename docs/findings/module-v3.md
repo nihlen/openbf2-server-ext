@@ -472,3 +472,63 @@ soak the client removed its bots mid-air, so the empty heli fell and burned
 - openbf2-server-ext, branch `master`: `86cabf3` (the module, tests, test client, README and this file),
   then a second commit with the `Chat` text conversion, its tests and this file's record of it. Nothing was pushed; no remotes, issues or pull requests.
 - OpenBF2 `serverext/r1`: nothing to commit (no engine change).
+
+## Launch number
+
+Added on 2026-10-23 by a worker thread, as specified in `docs/protocol.md` `0x0303 ProjectileList`: each entry
+gets a new last field, a `u32` launch number. The protocol version stays 3 (the author's call). `docs/protocol.md`
+was not edited, and the engine was not changed (OpenBF2 `873d1b1`).
+
+- **Where it is assigned.** `onProjectileLaunched` in `src/Module.cpp` assigns it when a launch passes the filter
+  and is added to the tracked list, so it counts only launches the module tracks. Bullets, and launches made while
+  no connection is ready or the 256-entry table is full, get no number. The counter (`proto::LaunchCounter`,
+  `src/Protocol.h`) belongs to the `Module` object. Nothing resets it, not even level unload, so a number is never
+  reused while the module is loaded. It never hands out 0, even after the u32 wrap (4.3 billion launches). The
+  number is also in the module's "projectile ... launched" log line.
+- **The admin channel is unchanged.** `Admin.cpp` has its own projectile observer and its own encoder
+  (`AdminProtocol`'s `ProjectileState`). It shares no code with `encodeProjectileList`, so its wire format is the
+  approved one.
+- **Size.** An entry is now 4 bytes longer. The largest list, 64 entries with 255-byte names, is
+  5 + 64 × 304 = 19,461 bytes, well inside the 64 KiB `kMaxPayload`. The 64-entry cap is unchanged.
+- **Unit tests** (`testV2Encoders`). The field is checked byte for byte. Two flights with the same id 2101 encode
+  launch numbers 1 and 2. The counter wraps from 0xFFFFFFFF to 1. The 64-entry cap holds, and so does the
+  255-byte-name list's exact size within `kMaxPayload`. `serverext_tests` and `serverext_admin_tests` pass
+  (`build-module.sh`, WSL).
+- **Test client.** `parse_projectiles` reads the field (`launch`) and now rejects trailing bytes.
+  `projectile_seen` is keyed by launch number instead of id: the Hydra and S-8 ids (object id + 0x10000) are pooled
+  too, so keying by id undercounted. The `tv` scenario (`seen`, the shot's `launches`, and the CSV's new `launch`
+  column after the id) and the `q12` scenario (`press` finds a launch by a new launch number, not by "nothing was
+  flying before") now tell flights apart by launch number.
+
+### Run
+
+| Item | Value |
+|---|---|
+| OpenBF2 | `~/bf2-linux-serverext-v3` (`873d1b1`), read-only; `bf2` md5 `5c904e400db57415c38b09149da5d1bf` |
+| Module | `~/serverext-build/launch` (this repo, `build-module.sh`); `libserverext.so` md5 `4cd2d1bcd0299ba256eb3b19105bfe78` |
+| Run dir | `~/serverext-launch/srv`, a copy of bf2-bots' `~/serverext-sidecar-v3/srv` (same content and `serverext.cfg`) with this module |
+| Ports | game 16571, gamespy 29903, RCON 127.0.0.1:4723, bot 127.0.0.1:16701; admin channel off. No container touched |
+| Sidecar | bf2-bots `serverext-sidecar` with its launch-number change (Release build), crew against crew: `serverext-play-2v2`, `--gunners`, USMC AH-1Z crew against China Z-10 crew, one connection, 360 s |
+
+Results (one server process, stopped with SIGTERM afterwards):
+
+- **13 TV launches over the server's run, all projectile id 1852, launch numbers 1 to 13** in the module's log.
+  Launches 1-4 came from a first sidecar run, a Debug build that fell behind (504 tick gaps on the sidecar side,
+  38% CPU; the module's handler was fine). Launches 5-13 came from the Release run.
+- In the Release run every launch was registered by both crew members, with the same numbers. The USMC gunner
+  had launches 6, 8, 10 and 13, and its pilot's own-TV list was the same. The China gunner had 5, 7, 9, 11 and 12,
+  and so did its pilot. 9 presses, 9 launches, 0 refused.
+- Release run: 10,797 TickStates, **0 tick gaps**, 0 skipped, 0 refused `SetTargetDirection`.
+- Module handler over the whole run: p50 100 µs, p99 210 µs, max 3.8 ms, 0 ticks over 20 ms. No `[FRONTIER]`,
+  abort or segfault line in `bf2.log`.
+- **Test client, `--scenario q12`** (same server process, after the sidecar): 16/18. That is the result in
+  `q12-tv-refusal.md` without the engine fix (cases 2 and 4 refused). Each of the 7 launches was found by its new
+  launch number (14 to 20). Six were on id 1852; B's first, in case 1, was on 1851.
+- Logs: `~/serverext-launch/bf2-run.log` (server console) and `~/serverext-launch/q12.log`. The sidecar's logs are
+  in `%TEMP%\launchwork\run\sidecar.log` (Release run) and `run-debug\sidecar.log`. The server is stopped.
+
+### Git (launch number)
+
+- openbf2-server-ext `master`: one local commit (module, unit tests, test client, this section). Nothing pushed.
+- bf2-bots `serverext-sidecar`: one local commit (codec, `ProjectileSense`, `TvGunner`, summary, tests,
+  `docs/serverext-backend.md`). Nothing pushed.

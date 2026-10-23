@@ -166,8 +166,11 @@ def parse_projectiles(p):
         name = r.str()
         owner, team, flags, target = r.take("<BBBI")
         v = r.take("<7f")
+        launch = r.take("<I")
         out.append(dict(id=pid, name=name, owner=owner if flags & 4 else None, team=team, guided=bool(flags & 1), own=bool(flags & 2),
-                        target=target, pos=v[0:3], vel=v[3:6], ttl=v[6]))
+                        target=target, pos=v[0:3], vel=v[3:6], ttl=v[6], launch=launch))
+    if r.p != len(p):
+        raise ValueError(f"ProjectileList: {len(p) - r.p} trailing bytes")
     return tick, out
 
 
@@ -546,7 +549,7 @@ class Client:
         self.welcome = self.c.welcome
         self.projectiles = []     # latest ProjectileList entries
         self.pl_count = 0
-        self.projectile_seen = {} # id -> first entry seen
+        self.projectile_seen = {} # launch number -> first entry seen (ids are reused across flights)
         self.damages = []         # v2 events, in arrival order
         self.kills = []
         self.chats = []
@@ -603,7 +606,7 @@ class Client:
             _, self.projectiles = parse_projectiles(p)
             self.pl_count += 1
             for e in self.projectiles:
-                self.projectile_seen.setdefault(e["id"], e)
+                self.projectile_seen.setdefault(e["launch"], e)
         elif t == DAMAGE:
             self.damages.append(parse_damage(p))
         elif t == KILL:
@@ -2432,15 +2435,16 @@ def tv_shot(cl, holder, gunner, label, aim=None, retarget=None, retarget_after=1
         return out
     first, last = track[0][1], track[-1][1]
     out.update(first=first, last=last, first_tick=track[0][0], last_tick=track[-1][0], guided=first["guided"],
-               own=first["own"], ids=sorted(set(p["id"] for _, p in track)))
-    log(f"{label}: missile {first['id']} launched at tick {track[0][0]} (fire pressed after tick {press_tick}), "
+               own=first["own"], ids=sorted(set(p["id"] for _, p in track)),
+               launches=sorted(set(p["launch"] for _, p in track)))
+    log(f"{label}: missile {first['id']} (launch {first['launch']}) launched at tick {track[0][0]} (fire pressed after tick {press_tick}), "
         f"guided {first['guided']}, own {first['own']}, target {first['target']}; first at "
         f"{tuple(round(v, 1) for v in first['pos'])} v {tuple(round(v, 1) for v in first['vel'])}; last at "
         f"{tuple(round(v, 1) for v in last['pos'])} after {(track[-1][0] - track[0][0]) / 30.0:.2f} s, ttl {last['ttl']:.2f}")
     if csv:
         with open(csv, "a") as f:
             for tick, p in track:
-                f.write(f"{label},{p['id']},{tick},{p['pos'][0]:.2f},{p['pos'][1]:.2f},{p['pos'][2]:.2f},"
+                f.write(f"{label},{p['id']},{p['launch']},{tick},{p['pos'][0]:.2f},{p['pos'][1]:.2f},{p['pos'][2]:.2f},"
                         f"{p['vel'][0]:.2f},{p['vel'][1]:.2f},{p['vel'][2]:.2f},{p['ttl']:.3f},{p['target']}\n")
     return out
 
@@ -2493,13 +2497,13 @@ def run_tv(args):
 
     # Item 2: v2's sequence.
     pl_before = cl.pl_count
-    seen = {p["id"] for p in cl.projectiles}
+    seen = {p["launch"] for p in cl.projectiles}
     cl.pulses[gunner] = BTN_WEAPON[1]
     cl.run_for(1.0)
     cl.check(f"weapon select 2 leaves slot 0 at {slot0_name(cl, gunner)} (the TV launcher is isSelectable 0)",
              not has_tv(cl, gunner))
     launched = []
-    cl.on_state = lambda: launched.extend(p for p in own_tv_missiles(cl, gunner) if p["id"] not in seen)
+    cl.on_state = lambda: launched.extend(p for p in own_tv_missiles(cl, gunner) if p["launch"] not in seen)
     cl.inputs[gunner] = dict(buttons=BTN_ALT_FIRE)
     cl.run_for(1.5)
     cl.inputs[gunner] = {}
@@ -2832,7 +2836,7 @@ def run_q12(args):
 
     def press(tags, label):
         """One tick of fire for each gunner in tags (the same TickState); returns {tag: launch tick or None}."""
-        before = {t: bool(flying(gunners[t])) for t in tags}
+        before = {t: {p["launch"] for p in flying(gunners[t])} for t in tags}
         for t in tags:
             cl.pulses[gunners[t]] = BTN_FIRE
         press_tick = cl.tick
@@ -2840,14 +2844,15 @@ def run_q12(args):
 
         def seen():
             for t in tags:
-                if out[t] is None and not before[t] and flying(gunners[t]):
-                    p = flying(gunners[t])[0]
+                new = [p for p in flying(gunners[t]) if p["launch"] not in before[t]]
+                if out[t] is None and new:
+                    p = new[0]
                     out[t] = cl.tick
-                    log(f"{label}: {t} launched missile {p['id']} at tick {cl.tick} (pressed after {press_tick}), "
+                    log(f"{label}: {t} launched missile {p['id']} (launch {p['launch']}) at tick {cl.tick} (pressed after {press_tick}), "
                         f"ttl {p['ttl']:.2f}")
             return all(v is not None for v in out.values())
         cl.run_for(1.5, seen)
-        others = [(p["id"], p["owner"], round(p["ttl"], 2)) for p in cl.projectiles if p["name"].lower() == TV_PROJECTILE]
+        others = [(p["id"], p["launch"], p["owner"], round(p["ttl"], 2)) for p in cl.projectiles if p["name"].lower() == TV_PROJECTILE]
         for t in tags:
             if out[t] is None:
                 log(f"{label}: {t} pressed after tick {press_tick}: NO launch; TV missiles in flight {others}; "
@@ -2855,7 +2860,7 @@ def run_q12(args):
         return out
 
     def in_flight_of(t):
-        return [(p["id"], round(p["ttl"], 2)) for p in flying(gunners[t])]
+        return [(p["id"], p["launch"], round(p["ttl"], 2)) for p in flying(gunners[t])]
 
     def overlap(first, second, label):
         if not wait_ready([first, second]):
