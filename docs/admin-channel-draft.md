@@ -3,7 +3,10 @@
 Status: **approved by the author on 2026-10-22**, with the decisions in [Decisions](#decisions).
 **Phase 1 implemented 2026-10-23** (OpenBF2 `873d1b1`, module `f62ae97`..`0aab582`,
 `docs/findings/admin-phase1.md`). The wire format below was approved by the author on 2026-10-23;
-phase 2 (C#) builds against it. It replaces draft 1, which kept
+phase 2 (C#) builds against it. **Phase 2 implemented 2026-10-23** in BF2WebAdmin, branch
+`admin-channel` (`8973560`, `f3c4801`, `626a780`, its `docs/admin-channel.md`), tested end to end in
+the BF2WebAdmin localtest with an OpenBF2 container (OpenBF2 `873d1b1`, module `0aab582`, Debian 11
+with OpenSSL 1.1.1w) and bots. It replaces draft 1, which kept
 `mm_webadmin.py`'s text protocol.
 The author has decided that the BF2WebAdmin C# side may change as much as needed, and that the
 author keeps deployments from running `mm_webadmin.py` and the native channel at the same time.
@@ -188,7 +191,7 @@ designed and approved on its own.
    - Tested end to end with the netsky 2v2 setup in the BF2WebAdmin local test environment
      (`C:\Data\Projects\DotNet\BF2WebAdmin-localtest`; workers may start it with its scripts).
      Its BF2 container must run OpenBF2 with the module instead of `mm_webadmin.py`.
-3. **Policies and veto hooks.**
+3. **Policies and veto hooks.** Not started.
 
 TLS is part of phase 1 (B1).
 
@@ -691,6 +694,21 @@ authenticates. A bad value refuses the module's load, as for the bot channel's k
 - An overloaded link (WebAdmin not reading) drops events beyond `adminQueueBytes` and closes at four
   times that; WebAdmin then reconnects and gets a snapshot.
 - Measured: the admin channel adds 20-40 µs per tick (p99); 64 players at 30 Hz are about 108 KB/s.
+
+### Phase 2 notes
+
+- Map mods, noclip, freeze, gravity and the TV settings still use console lines, because a typed
+  `SpawnObject` gives most templates no networkable, so clients never see them. They need
+  `adminAllowConsole 1`.
+- Kick and ban from the web UI and Discord still go through ModManager's `iga` over classic rcon; the
+  typed `Kick`/`Ban` are used by the `.kick`/`.ban` chat commands only.
+- A changed `AdminKey` takes effect at the module's next retry (up to 60 s).
+- BF2WebAdmin's `ServerId` column is `nvarchar(20)`, one character short of the longest `ip:port`, and
+  it is now the module's server id.
+- The admin key is visible to admin users of the server edit form.
+- The bot channel's `Chat` delivered `§` as U+FFFD (fixed in v3).
+- Not exercised (needs a human client): Heli2v2 rounds (`rdy`/`go`), player chat, in-game `.o`, revive,
+  control points, a real kick or ban. The CD-key hash needs an internet server.
 
 ## Decisions
 
