@@ -954,6 +954,12 @@ TV launcher, aim and guide every tick; crews fight crew against crew. Over three
   not invalidated when the missile goes back into the object cache (`IObject::internal_assignNewObjectID`
   drops only the `IObject` block). The cache reuses the same object for the other launcher, so the old
   pointer resolves to it, and `isInProjectileCamera` refuses while the other gunner watches it.
+  **Sidecar workaround** (bf2-bots `76e4bca`, approved by the author): after each launch the gunner
+  presses alt fire twice (to the gun and back to the TV launcher). That clears its stale pointer and
+  leaves the projectile camera, while the missile keeps following `SetTargetDirection`. Results: 0 of 41
+  presses refused in a crew-vs-crew soak (v3: 6 of 30). The workaround doesn't help human gunners' launchers.
+  The author's two-human test on an OpenBF2 server fired two TVs at once, but did not test the
+  reuse sequence.
 - **Projectile ids are reused across flights.** The sidecar starts a new flight when the id was absent
   at the last update, its time to live went up, or its owner changed.
 
