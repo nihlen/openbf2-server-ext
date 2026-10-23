@@ -22,6 +22,9 @@ Summary:
   a sweeping aim, and killed an own bot's heli of the other team.
 - **Item 1 (button OR):** 240 of 240 one-tick camera presses survived one or two later `SetInput`s in
   the same tick; the module's stats line counted 360 superseded inputs, 300 of which kept a button.
+- **Addition (coordinator, from the BF2WebAdmin phase 2 worker): `Chat` text is converted from
+  Windows-1252 like the admin channel's**, so BF2's colour code `§` (byte 0xA7) arrives as U+00A7, not
+  U+FFFD. See [Chat text conversion](#chat-text-conversion-addition).
 
 ## Item 2: why the gunner bot launched no TV missile
 
@@ -219,10 +222,32 @@ Layout unchanged (33 bytes). Semantics:
 - The module logs the first 20 applied directions and every 300th, with the target object's
   position after the call.
 
+## Chat text conversion (addition)
+
+Requested by the coordinator after the BF2WebAdmin phase 2 worker found that the bot channel's
+`0x0306 Chat` delivered `§` as U+FFFD while the admin channel's chat event converted it correctly.
+
+- **Cause.** `proto::encodeChat` (v2) replaced control bytes and passed every other engine byte
+  through unchanged. Engine text is Windows-1252, so a lone 0xA7 is not valid UTF-8, and a UTF-8
+  decoder turns it into U+FFFD. The admin channel converts every engine string with
+  `admin::cp1252ToUtf8` (`src/AdminProtocol.cpp`).
+- **Change.** `encodeChat` now uses that same helper (shared, not copied): control bytes still become
+  `?`, bytes 0x80-0x9F map through the Windows-1252 table (0x80 → €), and 0xA0-0xFF become U+00A0-U+00FF.
+  The 255-byte cap now applies to the UTF-8 text and never splits a character, because a converted
+  character can be two or three bytes long. The layout is unchanged; only the text bytes differ for
+  non-ASCII input. ASCII chat is byte for byte as before.
+- **Unit tests.** `"§C1001rdy  é"` encodes to `"Â§C1001rdy â¬ Ã©"`, equal to
+  `admin::cp1252ToUtf8` of the same bytes; 254 ASCII bytes followed by two 0xA7 bytes are cut to the
+  254 ASCII bytes (the next character would end at byte 256). The v2 test (control bytes, the
+  255-byte cut) still passes.
+- **Runtime.** On a fresh server process (`bf2-chatcheck.log`), RCON `game.sayAll "§C1001rdy"` (sent
+  as Windows-1252) reached a bot-channel client as `Chat` channel 12 with text bytes
+  `c2 a7 43 31 30 30 31 72 64 79` (`§C1001rdy`, no U+FFFD). 0 `[FRONTIER]` lines.
+
 ## Design notes
 
 Files changed in this repo: `src/Protocol.h/.cpp` (version 3, the message, its parser and value
-check), `src/PendingInput.h` (new: the merge rule), `src/Channel.h`, `src/Session.cpp`,
+check, and the `Chat` text conversion), `src/PendingInput.h` (new: the merge rule), `src/Channel.h`, `src/Session.cpp`,
 `src/Module.cpp`, `tests/TestMain.cpp`, `tools/testclient/serverext_client.py`, `README.md`.
 
 - **Button OR.** Each bot keeps a `PendingInput`: axes latest wins, buttons ORed since the last
@@ -245,7 +270,7 @@ check), `src/PendingInput.h` (new: the merge rule), `src/Channel.h`, `src/Sessio
 - **Logs.** Launches (`projectile ... 'agm114_hellfire_tv' launched (net id ..., guided 1)`), the
   first 20 and every 300th applied direction with the resulting target position, and the stats line.
 
-Unit tests: `serverext_tests` 621,334 checks, 0 failures (v2: 621,268); `serverext_admin_tests` 12,823 checks, 0 failures. New: the
+Unit tests: `serverext_tests` 621,339 checks, 0 failures (v2: 621,268); `serverext_admin_tests` 12,823 checks, 0 failures. New: the
 `SetTargetDirection` parser (exact 29 bytes, one short, one and two long, empty, all zeros), the
 value check (NaN and ±infinity in each of the six coordinates, the world bounds on both points, the
 0.1 m minimum), the session (it becomes a command; before `Hello` it is `Error` 2; a malformed one is
@@ -260,14 +285,14 @@ apply, all 32 bits in one burst). The module builds without warnings.
 | Item | Value |
 |---|---|
 | OpenBF2 | worktree `serverext-r1`, branch `serverext/r1` at `873d1b1` (no change), built into `~/bf2-linux-serverext-v3` (`testenv/build-linux.sh`); `bf2` md5 `5c904e400db57415c38b09149da5d1bf` |
-| Module | `~/serverext-build/v3` (`build-module.sh`); `libserverext.so` md5 `da4f53cee62882b47fd6c8edec3de74e` |
+| Module | `~/serverext-build/v3` (`build-module.sh`); `libserverext.so` md5 `da4f53cee62882b47fd6c8edec3de74e` for every run below except the chat check, which used the build with the `Chat` conversion, md5 `61c5bee6c4121450f3951f51f8d3151f` |
 | Content | netsky `2v2-nocheck`, fresh run dir `~/serverext-v3/srv` (`prepare-content.sh`) |
 | Server | WSL, `start.sh` → `bf2` → `BF2::init` → `BF2Engine::startGame` → `GameServer`, `dalian_2_v_2` (`gpm_cq` 16). Game 16571/udp, gamespy 29903/udp, RCON 127.0.0.1:4723, bot channel 127.0.0.1:16701, admin dial-out 127.0.0.1:16710 (last four processes); `allowTeleport 1`, `allowRoundRestart 1`. The first two processes ran with `BF2_TRACE_TV_MISSILES=1` (the tree's opt-in TV trace). Ports 16567, 16569, 16573, 16700, 16703, 16711, 29901, 29905, 4300, 4721 and 4725 were not used; no container was created or touched |
 | Clients | `tools/testclient/serverext_client.py` and `tools/adminclient/adminclient.py` (own certificate and key in `~/serverext-v3/cert`, `admin.key`) in WSL, Python 3.10.6; logs `~/serverext-v3/*.log`, server console logs `~/serverext-v3/srv/bf2-*.log` |
 
-Six server processes ran, each stopped with SIGTERM: `run1` (`tv-1`), `run2` (`tv-2`, `tv-3`, `burst`,
-`fuzz`), `pre-soak` (admin `commands`), `soak-aborted`, `soak-a` and `soak-b` (the soaks below). The
-server is left stopped.
+Seven server processes ran, each stopped with SIGTERM: `run1` (`tv-1`), `run2` (`tv-2`, `tv-3`, `burst`,
+`fuzz`), `pre-soak` (admin `commands`), `soak-aborted`, `soak-a`, `soak-b` (the soaks below) and
+`chatcheck` (the `Chat` conversion). The server is left stopped.
 
 ### Item 2 and item 3 (`--scenario tv --team 2`, AH-1Z, pilot and gunner bots)
 
@@ -444,6 +469,6 @@ soak the client removed its bots mid-air, so the empty heli fell and burned
 
 ## Git
 
-- openbf2-server-ext, branch `master`: one commit with the module, tests, test client, README and this
-  file. Nothing was pushed; no remotes, issues or pull requests.
+- openbf2-server-ext, branch `master`: `86cabf3` (the module, tests, test client, README and this file),
+  then a second commit with the `Chat` text conversion, its tests and this file's record of it. Nothing was pushed; no remotes, issues or pull requests.
 - OpenBF2 `serverext/r1`: nothing to commit (no engine change).

@@ -1,5 +1,7 @@
 #include "Protocol.h"
 
+#include "AdminProtocol.h"   // cp1252ToUtf8, shared with the admin channel
+
 #include <cmath>
 #include <cstring>
 
@@ -389,12 +391,15 @@ void encodeKill(std::vector<uint8_t>& out, const KillEvent& e)
 void encodeChat(std::vector<uint8_t>& out, uint32_t tick, uint8_t flags, uint8_t sender, uint8_t team, uint8_t channel,
                 const std::string& text)
 {
-    std::string t = cut(text, 255);
-    for (size_t i = 0; i < t.size(); ++i)
+    // The engine's text is Windows-1252 (BF2's colour code is the byte 0xA7); convert it as the admin
+    // channel does, then cut at 255 bytes without splitting a UTF-8 sequence.
+    std::string t = admin::cp1252ToUtf8(text);
+    if (t.size() > 255)
     {
-        const unsigned char c = static_cast<unsigned char>(t[i]);
-        if (c < 0x20 || c == 0x7F)
-            t[i] = '?';
+        size_t n = 255;
+        while (n > 0 && (static_cast<unsigned char>(t[n]) & 0xC0) == 0x80)
+            --n;
+        t.resize(n);
     }
     Writer w(out);
     w.begin(MsgChat);

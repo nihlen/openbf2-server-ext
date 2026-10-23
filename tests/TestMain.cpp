@@ -14,6 +14,7 @@
 #include "Config.h"
 #include "Protocol.h"
 #include "Session.h"
+#include "AdminProtocol.h"
 #include "Neutral.h"
 #include "PendingInput.h"
 #include "SpawnPlan.h"
@@ -497,6 +498,35 @@ void testV2Encoders()
         std::string s;
         r.str(s);
         CHECK(r.done() && s.size() == 255 && s.substr(0, 7) == "rdy??go");
+    }
+    // Chat: Windows-1252 to UTF-8 as on the admin channel; BF2's colour code 0xA7 is U+00A7, not U+FFFD.
+    {
+        std::vector<uint8_t> b;
+        encodeChat(b, 14, 0, 0, 0, 12, std::string("\xa7" "C1001rdy \x80 \xe9"));
+        FrameDecoder d;
+        d.feed(b.data(), b.size());
+        Frame f;
+        CHECK(d.next(f) == FrameDecoder::GotFrame && f.type == MsgChat);
+        Reader r(f.payload.data(), f.payload.size());
+        r.u32(); r.u8(); r.u8(); r.u8(); r.u8();
+        std::string s;
+        r.str(s);
+        CHECK(r.done() && s == "\xc2\xa7" "C1001rdy \xe2\x82\xac \xc3\xa9");
+        CHECK(s == admin::cp1252ToUtf8(std::string("\xa7" "C1001rdy \x80 \xe9")));
+    }
+    // Chat: the 255-byte cut never splits a character (254 ASCII bytes, then a two-byte U+00A7).
+    {
+        std::vector<uint8_t> b;
+        encodeChat(b, 15, 0, 0, 0, 12, std::string(254, 'x') + "\xa7\xa7");
+        FrameDecoder d;
+        d.feed(b.data(), b.size());
+        Frame f;
+        CHECK(d.next(f) == FrameDecoder::GotFrame);
+        Reader r(f.payload.data(), f.payload.size());
+        r.u32(); r.u8(); r.u8(); r.u8(); r.u8();
+        std::string s;
+        r.str(s);
+        CHECK(r.done() && s == std::string(254, 'x'));
     }
     // RoundState
     {

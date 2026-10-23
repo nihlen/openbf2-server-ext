@@ -347,7 +347,8 @@ struct KillEvent
 
 void encodeKill(std::vector<uint8_t>& out, const KillEvent& e);
 
-// Chat text longer than 255 bytes is truncated (v2 item 7). sender is valid with kChatFromPlayer.
+// Chat text is the engine's Windows-1252, sent as UTF-8 like the admin channel's (control bytes become
+// '?'), cut to at most 255 bytes on a character boundary (v2 item 7). sender is valid with kChatFromPlayer.
 const uint8_t kChatFromPlayer = 1;
 void encodeChat(std::vector<uint8_t>& out, uint32_t tick, uint8_t flags, uint8_t sender, uint8_t team, uint8_t channel,
                 const std::string& text);
