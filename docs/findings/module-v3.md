@@ -236,7 +236,7 @@ Requested by the coordinator after the BF2WebAdmin phase 2 worker found that the
   The 255-byte cap now applies to the UTF-8 text and never splits a character, because a converted
   character can be two or three bytes long. The layout is unchanged; only the text bytes differ for
   non-ASCII input. ASCII chat is byte for byte as before.
-- **Unit tests.** `"§C1001rdy  é"` encodes to `"Â§C1001rdy â¬ Ã©"`, equal to
+- **Unit tests.** `"\xa7C1001rdy \x80 \xe9"` (C escapes) encodes to `"\xc2\xa7C1001rdy \xe2\x82\xac \xc3\xa9"`, equal to
   `admin::cp1252ToUtf8` of the same bytes; 254 ASCII bytes followed by two 0xA7 bytes are cut to the
   254 ASCII bytes (the next character would end at byte 256). The v2 test (control bytes, the
   255-byte cut) still passes.
