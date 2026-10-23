@@ -948,10 +948,12 @@ TV launcher, aim and guide every tick; crews fight crew against crew. Over three
 25 heli kills were TV kills, 0 tick gaps, 0 refused directions; no camera press needed repeating.
 
 - **Only one TV missile flies at a time on this server** (Q12): 19 of 85 fire presses launched nothing,
-  each while the other crew's TV missile was in flight. Every TV missile is the same pooled object
-  (projectile 1852), and `LPTargetComp::requestFire` refuses while its `m_currentProjectile` weak
-  pointer resolves (`LPTargetComp.cpp:322-336`, `disableFireWhenActiveMissile 1`). Suspected: the weak
-  pointer to an ended missile resolves again when the pool reuses the object for another launcher.
+  each while the other crew's TV missile was in flight. Cause (`docs/findings/q12-tv-refusal.md`): not
+  `LPTargetComp` but `ToggleCameraComp::requestFire` (`ToggleCameraComp.cpp:199-205`). Its
+  `m_projectile` is a weak pointer on the projectile's `IProjectileObject` face, whose control block is
+  not invalidated when the missile goes back into the object cache (`IObject::internal_assignNewObjectID`
+  drops only the `IObject` block). The cache reuses the same object for the other launcher, so the old
+  pointer resolves to it, and `isInProjectileCamera` refuses while the other gunner watches it.
 - **Projectile ids are reused across flights.** The sidecar starts a new flight when the id was absent
   at the last update, its time to live went up, or its owner changed.
 
@@ -1003,7 +1005,7 @@ splits a character.
 | Q9 | How the netsky and `mm_webadmin` Python treat `ai=1`, `connected=0` players | Answered (see "How these bots differ") |
 | Q10 | Which slots move, strafe and turn a soldier, and the look axes' range | Answered ([On foot](#on-foot)); look pitch sign unmeasured |
 | Q11 | Button bit table | Answered ([Buttons](#buttons)) |
-| Q12 | Why a TV launch is refused while another launcher's TV missile flies; does retail do the same | Open; investigation launched 2026-10-23 |
+| Q12 | Why a TV launch is refused while another launcher's TV missile flies; does retail do the same | Cause found in OpenBF2 source (stale `IProjectileObject` weak block after caching, `docs/findings/q12-tv-refusal.md`); retail unverified (no IDA/Ghidra); fix not implemented |
 
 Still unexercised at runtime: the three R1b guards, the enter-on-spawn path for a bot, yaw and roll
 input and any client connection. The `[FRONTIER]` comment at `SpawnPoint.cpp:211-214` is stale: the bodies below it are
