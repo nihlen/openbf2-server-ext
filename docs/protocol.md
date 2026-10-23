@@ -870,9 +870,10 @@ It levels and holds height, not position: expect 6-10 m/s of drift.
   them. The sidecar re-presses after 6 ticks if the view mode didn't change. A fix is proposed
   under [Later](#later).
 
-## v3 (approved 2026-10-23, not implemented yet)
+## v3 (approved and implemented 2026-10-23)
 
-Approved by the author on 2026-10-23. The protocol version becomes 3.
+Approved by the author on 2026-10-23. The protocol version becomes 3. Implemented and tested:
+`docs/findings/module-v3.md` (module `86cabf3`, `a2808c6`; no engine change, OpenBF2 stays at `873d1b1`).
 
 1. **Buttons survive a superseded `SetInput`.** When several `SetInput`s for one bot arrive before a
    tick, their buttons are ORed into the one applied; the axes stay latest-wins. The per-minute stats
@@ -885,6 +886,82 @@ Approved by the author on 2026-10-23. The protocol version becomes 3.
 3. **`SetTargetDirection`** (sidecar → module): guide the bot's own guided missile. The server steers
    it from the virtual `IWeaponObject::setTargetDirection`, as the client's `TargetDirectionEvent`
    does (`GameEvents/TargetDirectionEvent.cpp`), so no engine change is expected.
+
+### Wire format (protocol version 3)
+
+Written before the code; implemented unchanged. Framing, strings, error codes and every v2 message
+are unchanged unless listed. The module accepts only version 3; a v2 `Hello` is `Error` 1 and close.
+
+#### `0x0002 Welcome`
+
+Unchanged from v2 except the version field, 3.
+
+#### `0x0201 SetInput` (item 1)
+
+Layout unchanged (33 bytes). Semantics:
+
+- When several `SetInput`s for one bot arrive before a tick applies them, **the axes are the last
+  one's and the buttons are the OR of all of them**. A one-tick press is never lost to a later
+  `SetInput` in the same tick. Buttons are still pressed only for the one tick in which they are
+  applied.
+- A release cannot cancel a press in the same tick: `press` then `release` in one tick presses for
+  that tick.
+- The per-minute stats line counts superseded `SetInput`s and how many of them kept a button that
+  the later one did not press.
+
+#### `0x0202 SetTargetDirection` (sidecar → module, item 3)
+
+| Type | Field |
+|---|---|
+| `u8` | player id (a bot of this connection) |
+| `u32` | the tick number this direction was computed from, as `SetInput`'s (for logs) |
+| 3 × `f32` | start: the eye point, metres (a human client sends its camera position) |
+| 3 × `f32` | end: a point on the line of sight beyond start |
+
+29 bytes. It is a control stream like `SetInput`, not a request: no reply on success.
+
+- **Latest wins.** The module applies at most one per bot per tick, the last that arrived, in the
+  tick handler. The superseded ones are counted.
+- **Refusals** are `Error` with request id 0 (as `SetInput`), at most one per bot per tick:
+  - 4: not a bot of this connection;
+  - 7: a non-finite value, a point outside the world (|x| or |z| > 8192, y outside -1000..10000,
+    as `Teleport`), or start and end closer than 0.1 m;
+  - 6: the bot is not alive or is man-down, or none of its active weapons (`getActiveWeapon(0..2)`)
+    is TV-guided (`IWeaponObject::getTargetSystemType() == TSTVGuided`, 4), or that weapon has no
+    target object.
+- **What it does:** `IWeaponObject::setTargetDirection(start, end)` on that weapon, the virtual the
+  client's `TargetDirectionEvent::executeServer` calls (`GameEvents/TargetDirectionEvent.cpp:95-130`,
+  `IWeaponObject.h:140`). See "The target point a direction produces" for where the target lands.
+  No engine change.
+- It works with no missile in flight (it places the target the next launch flies to) and with one
+  (the missile turns to the new target, within its follow rates).
+- **Wire-guided weapons are refused**: on the server their target follows the player's camera every
+  tick (`LPTargetComp.cpp:271-298`), which would overwrite a direction at once. Neither 2v2 heli has
+  one.
+- The module logs the first 20 applied directions and every 300th, with the target object's
+  position after the call.
+
+### Chat text
+
+`Chat` text is converted from Windows-1252 to UTF-8 like the admin channel's (`§`, byte 0xA7, arrives
+as U+00A7). Control bytes still become `?`; the 255-byte cap applies to the UTF-8 text and never
+splits a character.
+
+### Notes for the sidecar (TV missiles)
+
+- The TV launcher is not selectable: one tick of **alt fire** (the seat's weapon toggle) switches the
+  gunner seat to it, and **fire** launches. Weapon select and next weapon can't reach it. v2's bot
+  never launched (it was not firing into the ground).
+- Sequence: toggle, wait for `TickState` to show the launcher in slot 0, send `SetTargetDirection`,
+  then fire. A direction sent before the launch holds; stream only while the launcher is active
+  (otherwise `Error` 6 every tick). A direction in the same tick as the toggle is refused.
+- Without a direction the missile flies straight along the airframe (about 4° up). Range is about
+  430 m (3.5 s). It turns at most about 1.5 rad/s, so aim early; late large retargets miss.
+- The aim ray stops at water (dalian sea level 141.4) and passes through own-team objects.
+- The gunner's view mode goes to 3 at launch for about 4 s (`useProjectileCamera`).
+- `ProjectileList`'s target field is 0 for a TV missile.
+- Eight missiles a sortie: after the eighth, the launcher shows 0 rounds, 1 magazine, not reloading.
+  Treat that as empty.
 
 ## Later
 
