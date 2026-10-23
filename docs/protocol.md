@@ -602,7 +602,8 @@ evidence in `module-v1.md`.
 
 Implemented and tested: `docs/findings/module-v2.md` (OpenBF2 `74e18d9`, module `5090e56`); all 11
 items pass on WSL and items 1, 2, 6, 8 and 11 also in Docker. Guided missiles and every client path
-(human chat, human spots) are not exercised yet.
+(human chat, human spots) are not exercised yet. The bf2-bots sidecar uses all of v2 (`30541e8`,
+`docs/serverext-backend.md` "Protocol v2"): every pulse fired a round, 0 gaps in a 10-minute play soak.
 
 Approved by the author on 2026-10-22, all items. Sources: the v1 sidecar (`bf2-bots/docs/serverext-backend.md`),
 the play mission and `docs/findings/q5-q9.md` (man-down flag). The damage event uses the same engine
@@ -859,12 +860,24 @@ It levels and holds height, not position: expect 6-10 m/s of drift.
 - Bots only: `RoundState` stays begin-round 1. Server chat is channels 12 and 13; human chat 0 and 1.
 - `Welcome` also carries `projectileRange` and a feature byte (teleport, round restart allowed).
 - Handing bots between connections is out of scope; each bot belongs to the connection that made it.
+- `WeaponState.flags`: only bit 0 (reloading) is defined; the others are 0. `Protocol.h`'s
+  `kWeaponSelected` is unused.
+- `Damage` keeps coming after a kill: a destroyed heli burns, with the killer still as attacker. The
+  module sends it; the sidecar ignores `Damage` with `before <= 0`.
+- A rocket hit is two `Damage` events in one tick (projectile and splash, same source template).
+- `Chat` control bytes are replaced with `?`.
+- 13-30% of one-tick camera presses changed nothing in two-bot play, probably latest-wins dropping
+  them. The sidecar re-presses after 6 ticks if the view mode didn't change. A fix is proposed
+  under [Later](#later).
 
 ## Later
 
 - The admin channel for BF2WebAdmin: approved 2026-10-22 as `docs/admin-channel-draft.md` draft 2
   (its own contract, not bound to `mm_webadmin`). It shares R5 with v2 item 8.
 - R3 stepped time and a `Step` message.
+- Proposed by the sidecar, not approved: a superseded `SetInput`'s buttons are ORed into the next one
+  for the same bot (axes stay latest-wins), and the stats line counts superseded inputs. No wire
+  change, but it changes the latest-wins semantics.
 - `SetTargetDirection`, to guide a TV or wire missile from a gunner bot. The server steers it from
   the virtual `IWeaponObject::setTargetDirection` (`GameEvents/TargetDirectionEvent.cpp`), so it needs
   no engine change. Launching one from the AH-1Z gunner seat did not work yet (findings/module-v2.md).
