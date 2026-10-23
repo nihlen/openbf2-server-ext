@@ -723,6 +723,10 @@ Entry:
 | 3 × `f32` | position |
 | 3 × `f32` | velocity |
 | `f32` | time to live, seconds |
+| `u32` | launch number: counts up from 1 for every launch the module tracks since it loaded, never reused. Added 2026-10-23 without a version change (dev phase, approved by the author) |
+
+The projectile id is reused across flights (the engine pools projectile objects: every TV missile so
+far was 1852). Use the launch number to tell flights apart.
 
 Which projectiles: those with a networkable id, a seek component or a detonation component
 (`IID_IProjectileDetonationComp`): missiles, rockets, grenades and explosive cannon shells. Ordinary
@@ -990,8 +994,7 @@ splits a character.
 - The admin channel for BF2WebAdmin: approved 2026-10-22 as `docs/admin-channel-draft.md` draft 2
   (its own contract, not bound to `mm_webadmin`). It shares R5 with v2 item 8.
 - R3 stepped time and a `Step` message.
-- Proposed by the sidecar, not approved: a per-flight id or launch counter in `ProjectileList`, since
-  pooled projectile ids are reused.
+
 
 
 - Hooks that can veto or change actions (damage, team selection).
