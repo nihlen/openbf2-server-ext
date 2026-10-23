@@ -83,6 +83,10 @@ public:
     void u32(uint32_t v);
     void f32(float v);
     void f64(double v);
+    void i16(int16_t v) { u16(static_cast<uint16_t>(v)); }
+    void i32(int32_t v) { u32(static_cast<uint32_t>(v)); }
+    void u64(uint64_t v);
+    void bytes(const uint8_t* data, size_t n) { m_out.insert(m_out.end(), data, data + n); }
     // u16 byte length then the bytes; longer strings are truncated to 65535 bytes.
     void str(const std::string& s);
 
@@ -102,6 +106,12 @@ public:
     uint16_t u16();
     uint32_t u32();
     float f32();
+    int16_t i16() { return static_cast<int16_t>(u16()); }
+    int32_t i32() { return static_cast<int32_t>(u32()); }
+    uint64_t u64();
+    double f64();
+    // Copies n raw bytes into out (zeros on failure).
+    void bytes(uint8_t* out, size_t n);
     void str(std::string& out);
 
     bool ok() const { return m_ok; }
@@ -130,7 +140,8 @@ class FrameDecoder
 public:
     enum Result { NeedMore, GotFrame, Oversize, BadReserved };
 
-    FrameDecoder() : m_pos(0) {}
+    // maxPayload: the largest accepted payload (the bot channel's 64 KiB by default).
+    explicit FrameDecoder(uint32_t maxPayload = kMaxPayload) : m_pos(0), m_max(maxPayload) {}
 
     void feed(const uint8_t* data, size_t size);
     // Extracts the next complete frame. Oversize and BadReserved are terminal for the stream.
@@ -141,6 +152,7 @@ public:
 private:
     std::vector<uint8_t> m_buf;
     size_t m_pos;
+    uint32_t m_max;
 };
 
 struct HelloMsg        { uint16_t version; std::string name; };

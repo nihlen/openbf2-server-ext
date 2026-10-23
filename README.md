@@ -4,17 +4,20 @@ A native module for the OpenBF2 dedicated server that gives out-of-process tools
 interface to the running game: per-tick state, bot players driven by external input, and later the
 admin events and commands that BF2WebAdmin uses today through `mm_webadmin.py`.
 
-Status: protocol v2 implemented for Linux x86-64 (`libserverext.so`) and tested on a WSL server;
+Status: bot channel protocol v2 implemented for Linux x86-64 (`libserverext.so`) and tested on a WSL server;
 see [docs/findings/module-v2.md](docs/findings/module-v2.md) (module-v1.md and module-v0.md for earlier versions). Start with
-the contract in [docs/protocol.md](docs/protocol.md).
+the contract in [docs/protocol.md](docs/protocol.md). The admin channel (phase 1 of
+[docs/admin-channel-draft.md](docs/admin-channel-draft.md)) is implemented beside it; its byte layouts, configuration and
+results are in [docs/findings/admin-phase1.md](docs/findings/admin-phase1.md).
 
 ## Layout and build
 
 | Path | Contents |
 |---|---|
-| `src/` | The module. `Protocol`, `Config`, `Channel` and `Session` are engine-free; `Module.cpp` is the engine side; `IoThread_posix.cpp` is the socket thread. |
-| `tests/` | Unit tests for the engine-free layer (framing, parsing, hostile input, config, queues). |
+| `src/` | The module. `Protocol`, `Config`, `Channel` and `Session` are engine-free; `Module.cpp` is the engine side; `IoThread_posix.cpp` is the socket thread. The admin channel: `AdminProtocol`, `AdminCrypto`, `AdminLink` and `AdminSession` (engine-free), `AdminIo_posix.cpp` (its dial-out and TLS thread) and `Admin.cpp` (its engine side). |
+| `tests/` | Unit tests for the engine-free layer (framing, parsing, hostile input, config, queues); `AdminTests.cpp` for the admin channel, TLS included; `fixtures/admin-v1-golden.txt`, the golden frames shared with the C# codec. |
 | `tools/testclient/` | `serverext_client.py`, a Python 3 stdlib test client: hover flight, `--fuzz`, the v1 scenarios (`--scenario` walk, buttons, blockpad, allblocked, wreck) and the v2 scenarios (view, weapons, damage, spot, round, teleport, multiconn, soak2; the watchdog neutral is q5). |
+| `tools/adminclient/` | `adminclient.py`, the reference WebAdmin for the admin channel: a TLS listener (it creates the certificate and prints its pin), the HMAC handshake, snapshot, subscriptions, every command, scenarios and `--fuzz`; `--write-golden` writes the fixtures. |
 | `testenv/` | WSL and Docker test-server scripts; `deploy-module.sh` installs the module into a run directory. |
 | `probe/` | The superseded `[TEMP]` R1 smoke probe, kept as the evidence behind `docs/findings/r1-smoke.md`. |
 
@@ -25,8 +28,9 @@ R1 engine changes, by default the `serverext-r1` worktree; override with `OPENBF
 ./build-module.sh [openbf2-checkout] [build-dir]
 ```
 
-That configures the `linux-x64` preset, builds `libserverext.so` and runs the unit tests. A Windows
-build (`serverext.dll`) is not implemented yet.
+That configures the `linux-x64` preset, builds `libserverext.so` and runs the unit tests. The admin
+channel needs OpenSSL 1.1.1 or 3.x (`libssl-dev` to build; `libssl3` or `libssl1.1` at run time, linked
+dynamically). A Windows build (`serverext.dll`) is not implemented yet.
 
 ## Related repos
 

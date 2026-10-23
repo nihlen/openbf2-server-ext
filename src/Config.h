@@ -3,6 +3,7 @@
 #ifndef SERVEREXT_CONFIG_H
 #define SERVEREXT_CONFIG_H
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -21,10 +22,27 @@ struct Config
     bool allowTeleport;          // v2: Teleport is refused unless set
     float projectileRange;       // v2: metres around an own bot within which projectiles are reported
 
+    // Admin channel (docs/findings/admin-phase1.md, Configuration). Off unless adminConnect is set.
+    bool adminEnabled;
+    std::string adminHost;           // host name or address WebAdmin listens on
+    int adminPort;
+    std::string adminServerId;
+    std::vector<uint8_t> adminKey;   // raw key, 16..64 bytes
+    bool adminTls;
+    std::vector<uint8_t> adminCertSha256;   // SPKI pin, 32 bytes
+    int adminSendIdentity;           // -1 until set: then 1 with TLS, 0 without
+    bool adminAllowConsole;
+    bool adminAllowObjects;
+    int adminQueueBytes;
+
     Config()
         : listenHost("127.0.0.1"), listenPort(16700), watchdogTicks(6), enterRange(30.0f),
           spawnFallbackSeconds(5), spawnBlockedSeconds(15), allowRoundRestart(false), maxConnections(4),
-          allowTeleport(false), projectileRange(1000.0f) {}
+          allowTeleport(false), projectileRange(1000.0f), adminEnabled(false), adminPort(0), adminTls(true),
+          adminSendIdentity(-1), adminAllowConsole(true), adminAllowObjects(true), adminQueueBytes(4 * 1024 * 1024) {}
+
+    // Whether players' IPs and CD-key hashes go to WebAdmin.
+    bool adminIdentity() const { return adminSendIdentity < 0 ? adminTls : adminSendIdentity != 0; }
 };
 
 // Parses the file's text. One "key value" or "key = value" per line; '#' and "//" start a comment.

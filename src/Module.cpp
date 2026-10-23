@@ -1,5 +1,6 @@
 // libserverext: the engine side of the bot channel, docs/protocol.md v2 (byte layouts in
-// docs/findings/module-v2.md).
+// docs/findings/module-v2.md). It also hosts the admin channel (Admin.cpp), whose per-tick work
+// runs from this module's tick handler.
 //
 // Everything in this file runs on the server's main thread: inside the EventManager category-7
 // event that the module re-posts every tick (Q1), the ECHud unload notification, the ECNetwork chat
@@ -42,8 +43,11 @@
 #include "Scene/Object/ObjectTypes/Game/IPlayerControlObject.h"
 #include "Scene/Object/PlayerManager.h"
 
+#include "Admin.h"
+#include "AdminProtocol.h"
 #include "Channel.h"
 #include "Config.h"
+#include "EngineUtil.h"
 #include "IoThread.h"
 #include "Neutral.h"
 #include "Protocol.h"
@@ -52,6 +56,7 @@
 using namespace dice::hfe;
 using namespace dice::hfe::world;
 using namespace serverext;
+using namespace serverext::engine;
 
 namespace {
 
@@ -106,13 +111,9 @@ void logLine(const char* fmt, ...)
     }
 }
 
-IObject* rootOf(IObject* o)
+void logPlain(const char* line)
 {
-    if (!o)
-        return 0;
-    while (o->getParent())
-        o = o->getParent();
-    return o;
+    logLine("%s", line);
 }
 
 float distance(const Vec3& a, const Vec3& b)
@@ -146,84 +147,6 @@ std::string sanitizeName(const std::string& in, size_t maxLen)
             out[i] = '?';
     }
     return out;
-}
-
-std::string templateName(IObject* o)
-{
-    return o && o->getTemplate() ? o->getTemplate()->getName() : std::string();
-}
-
-// The root's PlayerControlObject template interface (vehicle category and type), or null.
-IPlayerControlObjectTemplate* pcoTemplateOf(IObject* o)
-{
-    const IObjectTemplate* t = o ? o->getTemplate() : 0;
-    return t ? static_cast<IPlayerControlObjectTemplate*>(
-                   const_cast<IObjectTemplate*>(t)->queryInterface(IID_IPlayerControlObjectTemplate))
-             : 0;
-}
-
-uint32_t netIdOf(IObject* o)
-{
-    io::INetworkable* net = o ? o->getNetworkable() : 0;
-    return net ? net->m_networkableId : 0;
-}
-
-// A vehicle in protocol.md's sense: a root object with seats (IPlayerControlObject) that is not a
-// soldier. Cameras are excluded too: every player's MultiPlayerFreeCamera is a root
-// IPlayerControlObject that its player occupies while dead or spectating.
-IPlayerControlObject* vehiclePco(IObject* o)
-{
-    if (!o || o->getParent() || o->queryInterface(IID_ISoldier) || o->queryInterface(IID_ICameraObject))
-        return 0;
-    return static_cast<IPlayerControlObject*>(o->queryInterface(IID_IPlayerControlObject));
-}
-
-// The vehicle seat a player occupies, or null when on foot, dead or in a non-vehicle object.
-IPlayerControlObject* seatOf(world::IPlayer* p, IObject** rootOut)
-{
-    IObject* vehicle = p->getVehicle();
-    IObject* root = rootOf(vehicle);
-    if (rootOut)
-        *rootOut = root;
-    if (!p->getIsAlive() || !vehicle || !vehiclePco(root))
-        return 0;
-    return static_cast<IPlayerControlObject*>(vehicle->queryInterface(IID_IPlayerControlObject));
-}
-
-// Health of a vehicle root as 0..1 from its armour component, or -1 without one. destroyed is set
-// when the hit points are at or below 0.
-float healthOf(IObject* root, bool* destroyed)
-{
-    if (destroyed)
-        *destroyed = false;
-    IArmorGLComp* armor = static_cast<IArmorGLComp*>(root->queryComponent(IID_IArmorGLComp, IID_IArmorGLComp));
-    if (!armor)
-        return -1.0f;
-    const float hp = armor->getHitPoints();
-    if (destroyed)
-        *destroyed = !(hp > 0.0f);
-    const float maxHp = armor->getMaxHitPoints();
-    float h = maxHp > 0.0f ? hp / maxHp : 0.0f;
-    if (!(h >= 0.0f)) h = 0.0f;
-    if (h > 1.0f) h = 1.0f;
-    return h;
-}
-
-float yawOf(const Mat4& m)
-{
-    return std::atan2(m.m[8], m.m[10]) * 57.29577951f;
-}
-
-// Yaw, pitch and roll in protocol.md's conventions from an absolute transformation.
-void attitudeOf(const Mat4& m, float ypr[3])
-{
-    const float r2d = 57.29577951f;
-    float s = m.m[9];
-    if (s > 1.0f) s = 1.0f;
-    if (s < -1.0f) s = -1.0f;
-    ypr[0] = std::atan2(m.m[8], m.m[10]) * r2d;
-    ypr[1] = -std::asin(s) * r2d;
-    ypr[2] = std::atan2(m.m[1], m.m[5]) * r2d;
 }
 
 // Tick-cost histogram: 10 microsecond buckets up to 20 ms, plus an overflow count.
@@ -343,6 +266,7 @@ struct Tracked
 };
 
 class Module : public IEventListener,
+               public AdminHost,
                public IServerExtension::IDamageObserver,
                public IServerExtension::IProjectileObserver,
                public IServerExtension::ISpotObserver
@@ -352,7 +276,7 @@ public:
         : m_em(0), m_ext(0), m_players(0), m_objects(0), m_game(0), m_server(0), m_system(0),
           m_tick(0), m_unloadSeen(false), m_mask(humanMappingMask()),
           m_rejectedInputs(0), m_lastRejectLog(0), m_scanKey(0), m_scanFull(true),
-          m_lastRestart(0), m_restarted(false) {}
+          m_lastRestart(0), m_restarted(false), m_admin(0) {}
 
     bool init(ClassManager* cm)
     {
@@ -389,6 +313,16 @@ public:
 
         g_channel = new Channel();   // lives for the process, like the I/O thread
         std::string error;
+        // The admin channel first: it can still refuse the load before the bot channel listens.
+        if (m_config.adminEnabled)
+        {
+            m_admin = startAdminChannel(m_config, cm, this, &logPlain, error);
+            if (!m_admin)
+            {
+                logLine("admin channel: %s; refusing to load", error.c_str());
+                return false;
+            }
+        }
         if (!startIoThread(m_config, g_channel, error))
         {
             Channel* c = g_channel;
@@ -415,6 +349,7 @@ public:
              m_config.allowRoundRestart ? 1 : 0, m_config.allowTeleport ? 1 : 0, m_config.projectileRange,
              tickOk ? 1 : 0, handle, hudOk ? 1 : 0, chatOk ? 1 : 0, damageOk ? 1 : 0, projectileOk ? 1 : 0, spotOk ? 1 : 0,
              (void*)m_system);
+        logLine("%s", m_admin ? m_admin->describe().c_str() : "admin channel: off (no adminConnect in serverext.cfg)");
         // The listener is already up, so the module cannot back out once the hook is registered.
         return true;
     }
@@ -454,6 +389,8 @@ public:
         sendProjectiles();
         sendVehicleList();
         sendRoundState();
+        if (m_admin)
+            m_admin->tick(m_tick);
         m_unloadSeen = m_unloadSeen && hasMissingBots();
         const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
         m_cost.add(us);
@@ -595,6 +532,34 @@ private:
         std::vector<uint8_t> f;
         proto::encodeBotRemoved(f, static_cast<uint8_t>(b.id), reason);
         control(b.conn, f);
+    }
+
+    // ---------------------------------------------------------------- admin channel host (Admin.h)
+
+    virtual bool botChannelBot(int playerId, uint32_t* connection)
+    {
+        for (size_t i = 0; i < m_bots.size(); ++i)
+        {
+            if (m_bots[i].id != playerId || m_bots[i].removeCountdown >= 0)
+                continue;
+            if (connection)
+                *connection = m_bots[i].conn;
+            return true;
+        }
+        return false;
+    }
+
+    virtual void vehicleRoots(std::vector<IObject*>& out)
+    {
+        for (std::map<unsigned short, IObject*>::iterator it = m_vehicles.begin(); it != m_vehicles.end(); ++it)
+            if (IObject* o = liveVehicle(it->first, it->second))
+                out.push_back(o);
+    }
+
+    void adminBot(uint8_t kind, int id, int team, uint32_t conn)
+    {
+        if (m_admin)
+            m_admin->onBot(kind, id, team, conn);
     }
 
     // ---------------------------------------------------------------- bot lookup
@@ -843,6 +808,7 @@ private:
              m_tick, id, p->getName().c_str(), m.team, kDefaultKit, choice.home, m_bots.back().target, conn,
              p->getIsAIPlayer() ? 1 : 0, p->getIsConnected() ? 1 : 0);
         logGroups(m.team, m_groups, groupCount);
+        adminBot(admin::BotCreated, id, m.team, conn);
     }
 
     // The seat object with PCO id seat on vehicle root, if that seat is free and the vehicle's
@@ -991,6 +957,7 @@ private:
             logLine("tick %lu: bot %d removed on request", m_tick, copy.id);
             ack(conn, m.requestId);
             botRemoved(copy, proto::ReasonRemoveBot);
+            adminBot(admin::BotRemoved, copy.id, copy.team, conn);
             return;
         }
         error(conn, m.requestId, proto::ErrUnknownPlayer, "not a bot of this connection");
@@ -1335,6 +1302,7 @@ private:
                          reason == proto::ReasonMapChange ? "level unload" : "removed by the engine or an admin");
                     if (b.removeCountdown < 0)
                         botRemoved(b, reason);
+                    adminBot(admin::BotRemoved, b.id, b.team, b.conn);
                     m_bots.erase(m_bots.begin() + i);
                     continue;
                 }
@@ -1348,6 +1316,7 @@ private:
                 if (b.removeCountdown == 0)
                 {
                     logLine("tick %lu: bot %d removed after its sidecar disconnected", m_tick, b.id);
+                    adminBot(admin::BotRemoved, b.id, b.team, b.conn);
                     m_bots.erase(m_bots.begin() + i);
                     m_server->destroyPlayer(p);
                     continue;
@@ -1485,6 +1454,7 @@ private:
              b.id, old, team, p->getIsAlive() ? "alive" : "dead", b.home, b.target,
              ok ? "" : "; the team has no usable spawn group, retrying every second");
         logGroups(team, m_groups, listGroups(team));
+        adminBot(admin::BotTeamChange, b.id, team, b.conn);
     }
 
     // The target's fallback time is up: move to the next group in the order that is active now.
@@ -2045,6 +2015,7 @@ private:
     std::vector<proto::StateEntry> m_entries;
     std::vector<uint8_t> m_stateBuf;
     CostStats m_cost;
+    AdminChannel* m_admin;           // the admin channel, or null when adminConnect is not set
 };
 
 } // namespace

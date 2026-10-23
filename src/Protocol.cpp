@@ -50,6 +50,12 @@ void Writer::f64(double v)
         m_out.push_back(static_cast<uint8_t>(bits >> (8 * i)));
 }
 
+void Writer::u64(uint64_t v)
+{
+    for (int i = 0; i < 8; ++i)
+        m_out.push_back(static_cast<uint8_t>(v >> (8 * i)));
+}
+
 void Writer::str(const std::string& s)
 {
     const size_t n = s.size() > 0xFFFF ? 0xFFFF : s.size();
@@ -102,6 +108,36 @@ float Reader::f32()
     return v;
 }
 
+uint64_t Reader::u64()
+{
+    if (!need(8))
+        return 0;
+    uint64_t v = 0;
+    for (int i = 0; i < 8; ++i)
+        v |= static_cast<uint64_t>(m_data[m_pos + i]) << (8 * i);
+    m_pos += 8;
+    return v;
+}
+
+double Reader::f64()
+{
+    const uint64_t bits = u64();
+    double v;
+    std::memcpy(&v, &bits, sizeof(v));
+    return v;
+}
+
+void Reader::bytes(uint8_t* out, size_t n)
+{
+    if (!need(n))
+    {
+        std::memset(out, 0, n);
+        return;
+    }
+    std::memcpy(out, m_data + m_pos, n);
+    m_pos += n;
+}
+
 void Reader::str(std::string& out)
 {
     const uint16_t n = u16();
@@ -122,7 +158,7 @@ void FrameDecoder::feed(const uint8_t* data, size_t size)
         m_buf.clear();
         m_pos = 0;
     }
-    else if (m_pos > kMaxPayload)
+    else if (m_pos > m_max)
     {
         m_buf.erase(m_buf.begin(), m_buf.begin() + m_pos);
         m_pos = 0;
@@ -138,7 +174,7 @@ FrameDecoder::Result FrameDecoder::next(Frame& out)
     const uint8_t* h = &m_buf[m_pos];
     const uint32_t len = static_cast<uint32_t>(h[0]) | (static_cast<uint32_t>(h[1]) << 8) |
                          (static_cast<uint32_t>(h[2]) << 16) | (static_cast<uint32_t>(h[3]) << 24);
-    if (len > kMaxPayload)
+    if (len > m_max)
         return Oversize;
     const uint16_t reserved = static_cast<uint16_t>(h[6] | (h[7] << 8));
     if (reserved != 0)
