@@ -18,6 +18,8 @@ neutral is q5 with --q5-neutral module. See docs/findings/module-v2.md.
 v3 scenarios: burst (item 1, one-tick presses in superseded SetInputs), tv (items 2 and 3, the gunner's TV
 missile launched and steered with SetTargetDirection), soak3 (two bots, the gunner guiding TV missiles
 periodically). See docs/findings/module-v3.md.
+Q12 scenario: q12 (two crews: a TV launch while the other crew's TV missile flies). See
+docs/findings/q12-tv-refusal.md.
 Q5/Q9 scenarios: q5 (watchdog neutral in flight), q9 (what the server's Python sees). See
 docs/findings/q5-q9.md.
 """
@@ -2782,7 +2784,124 @@ def run_soak3(args):
     return cl.finish()
 
 
-SCENARIOS_V3 = {"burst": run_burst, "tv": run_tv, "soak3": run_soak3}
+def run_q12(args):
+    """Q12 (docs/findings/q12-tv-refusal.md): is a TV launch refused while another launcher's TV missile flies?
+    Two crews (pilot and gunner bots in each team's heli) hover seaward of their pads and fire unguided TV
+    missiles onto the sea: A then B while A's flies, the reverse, B after A's has ended, and both in one tick.
+    A refused press is retried once after the other missile has ended."""
+    cl = Client(args, "serverext testclient q12")
+    crews = {}
+    for team, tag in ((1, "A"), (2, "B")):
+        crew = board_crew(cl, team, f"{args.name} {tag}")
+        if not crew:
+            return cl.finish()
+        crews[tag] = crew
+    gunners = {tag: c[1] for tag, c in crews.items()}
+    for tag, g in gunners.items():
+        cl.pulses[g] = BTN_ALT_FIRE
+    cl.run_for(1.5)
+    for tag, g in gunners.items():
+        cl.check(f"gunner {tag} ({g}) on the TV launcher: {slot0_name(cl, g)}", has_tv(cl, g))
+    holder = Holder(cl)
+    for tag, (pilot, gunner, heli) in crews.items():
+        pad = cl.states[pilot]["pos"]
+        holder.hold(pilot, pad[1] + 60.0, seaward(pad))
+    ok = cl.run_for(60.0, lambda: all(
+        cl.in_vehicle(p) and abs(cl.states[p]["pos"][1] - holder.plans[p][1]["alt"]) < 4.0 and
+        math.sqrt(sum(c * c for c in cl.states[p]["vel"])) < 3.0 for p, _, _ in crews.values()))
+    if not cl.check("both crews hovering", ok):
+        holder.stop()
+        return cl.finish()
+
+    def flying(g):
+        return own_tv_missiles(cl, g)
+
+    def ready(g):
+        w = slot0(cl, g)
+        return has_tv(cl, g) and w["ammo"] > 0 and not w["reloading"] and not flying(g)
+
+    def all_quiet():
+        return not any(p["name"].lower() == TV_PROJECTILE for p in cl.projectiles)
+
+    def wait_ready(tags):
+        if not cl.run_for(25.0, lambda: all(ready(gunners[t]) for t in tags) and all_quiet()):
+            log(f"q12: not ready: {[(t, slot0(cl, gunners[t])) for t in tags]}")
+            return False
+        wait_ticks(cl, 15)
+        return True
+
+    def press(tags, label):
+        """One tick of fire for each gunner in tags (the same TickState); returns {tag: launch tick or None}."""
+        before = {t: bool(flying(gunners[t])) for t in tags}
+        for t in tags:
+            cl.pulses[gunners[t]] = BTN_FIRE
+        press_tick = cl.tick
+        out = {t: None for t in tags}
+
+        def seen():
+            for t in tags:
+                if out[t] is None and not before[t] and flying(gunners[t]):
+                    p = flying(gunners[t])[0]
+                    out[t] = cl.tick
+                    log(f"{label}: {t} launched missile {p['id']} at tick {cl.tick} (pressed after {press_tick}), "
+                        f"ttl {p['ttl']:.2f}")
+            return all(v is not None for v in out.values())
+        cl.run_for(1.5, seen)
+        others = [(p["id"], p["owner"], round(p["ttl"], 2)) for p in cl.projectiles if p["name"].lower() == TV_PROJECTILE]
+        for t in tags:
+            if out[t] is None:
+                log(f"{label}: {t} pressed after tick {press_tick}: NO launch; TV missiles in flight {others}; "
+                    f"slot 0 {slot0(cl, gunners[t])}")
+        return out
+
+    def in_flight_of(t):
+        return [(p["id"], round(p["ttl"], 2)) for p in flying(gunners[t])]
+
+    def overlap(first, second, label):
+        if not wait_ready([first, second]):
+            return cl.check(f"{label}: launchers ready", False)
+        r1 = press([first], f"{label} {first}")
+        if not cl.check(f"{label}: {first} launched", r1[first] is not None):
+            return False
+        wait_ticks(cl, 15)
+        mid = in_flight_of(first)
+        log(f"{label}: {first}'s missile in flight before {second} presses: {mid}")
+        r2 = press([second], f"{label} {second}")
+        launched = r2[second] is not None
+        cl.check(f"{label}: {second} launched while {first}'s missile flew ({mid}): {launched}", launched)
+        if not launched:
+            cl.run_for(10.0, lambda: not flying(gunners[first]))
+            wait_ticks(cl, 15)
+            r3 = press([second], f"{label} {second} retry")
+            cl.check(f"{label}: {second}'s retry after {first}'s missile ended launched", r3[second] is not None)
+        cl.run_for(10.0, all_quiet)
+        return launched
+
+    overlap("A", "B", "case 1 (A, then B in flight)")
+    overlap("B", "A", "case 2 (B, then A in flight)")
+
+    label = "case 3 (B after A's ended)"
+    if cl.check(f"{label}: launchers ready", wait_ready(["A", "B"])):
+        r1 = press(["A"], f"{label} A")
+        cl.check(f"{label}: A launched", r1["A"] is not None)
+        cl.run_for(10.0, lambda: not flying(gunners["A"]))
+        wait_ticks(cl, 30)
+        r2 = press(["B"], f"{label} B")
+        cl.check(f"{label}: B launched after A's missile ended", r2["B"] is not None)
+        cl.run_for(10.0, all_quiet)
+
+    label = "case 4 (A and B in one tick)"
+    if cl.check(f"{label}: launchers ready", wait_ready(["A", "B"])):
+        r = press(["A", "B"], label)
+        cl.check(f"{label}: both launched: {r}", all(v is not None for v in r.values()))
+        cl.run_for(10.0, all_quiet)
+
+    holder.stop()
+    cl.check(f"q12: {len(cl.errors0)} errors without a request", not cl.errors0)
+    return cl.finish()
+
+
+SCENARIOS_V3 = {"burst": run_burst, "tv": run_tv, "soak3": run_soak3, "q12": run_q12}
 
 
 # ------------------------------------------------------------------------------------- fuzz
@@ -3055,7 +3174,7 @@ def main():
     ap.add_argument("--vehicle-log-every", type=float, default=60.0, help="seconds between VehicleList summaries")
     ap.add_argument("--scenario", choices=["hover", "walk", "buttons", "blockpad", "allblocked", "wreck", "q9", "q5", "teamswitch",
                                            "view", "weapons", "damage", "spot", "round", "teleport", "multiconn", "soak2",
-                                           "burst", "tv", "soak3"],
+                                           "burst", "tv", "soak3", "q12"],
                     default="hover")
     ap.add_argument("--rcon-port", type=int, default=4723, help="q9: ModManager RCON port")
     ap.add_argument("--rcon-password", default="", help="q9: ModManager RCON password")
