@@ -2,8 +2,8 @@
 
 Status: **approved by the author on 2026-10-22**, with the decisions in [Decisions](#decisions).
 **Phase 1 implemented 2026-10-23** (OpenBF2 `873d1b1`, module `f62ae97`..`0aab582`,
-`docs/findings/admin-phase1.md`). The wire format below is phase 1's and awaits the author's review
-before the C# side (phase 2) starts. It replaces draft 1, which kept
+`docs/findings/admin-phase1.md`). The wire format below was approved by the author on 2026-10-23;
+phase 2 (C#) builds against it. It replaces draft 1, which kept
 `mm_webadmin.py`'s text protocol.
 The author has decided that the BF2WebAdmin C# side may change as much as needed, and that the
 author keeps deployments from running `mm_webadmin.py` and the native channel at the same time.
@@ -701,7 +701,7 @@ authenticates. A bad value refuses the module's load, as for the bot channel's k
 | B3 | Plain snapshots or deltas | Plain, at a per-stream rate. Deltas can come later without changing events or commands (below) |
 | B4 | Bot management from WebAdmin | Maybe, later. The channel must not rule it out; no messages yet |
 | B5 | Raw console by default | Yes, with a per-server switch to turn it off |
-| B6 | Player key when the CD-key hash is empty (LAN and test servers, and possibly BF2Hub on OpenBF2) | Open; awaiting the author |
+| B6 | Player key when the CD-key hash is empty (LAN and test servers, and possibly BF2Hub on OpenBF2) | Decided 2026-10-23: the hash when present; otherwise the player name, stored as a distinct name key and accepted only on servers marked as test servers |
 
 **Why plain streams (B3).** CPU is not the cost: diffing 64 players against the last frame takes
 microseconds on the I/O thread. The cost is correctness on both sides: a baseline per subscriber,

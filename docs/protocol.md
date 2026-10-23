@@ -870,17 +870,29 @@ It levels and holds height, not position: expect 6-10 m/s of drift.
   them. The sidecar re-presses after 6 ticks if the view mode didn't change. A fix is proposed
   under [Later](#later).
 
+## v3 (approved 2026-10-23, not implemented yet)
+
+Approved by the author on 2026-10-23. The protocol version becomes 3.
+
+1. **Buttons survive a superseded `SetInput`.** When several `SetInput`s for one bot arrive before a
+   tick, their buttons are ORed into the one applied; the axes stay latest-wins. The per-minute stats
+   line counts superseded inputs. Motivation: 13-30% of one-tick camera presses were lost in two-bot
+   play (bf2-bots `docs/serverext-backend.md`, "Protocol v2").
+2. **TV-missile launch from a bot.** Find why the AH-1Z gunner bot launched no TV missile in v2
+   (weapon select 2 left the active slot at the gun; alt fire launched nothing). The author suspects it
+   may be firing into the ground. Fix whatever the module or sidecar needs; the launch must appear in
+   `ProjectileList` with the seek flag.
+3. **`SetTargetDirection`** (sidecar → module): guide the bot's own guided missile. The server steers
+   it from the virtual `IWeaponObject::setTargetDirection`, as the client's `TargetDirectionEvent`
+   does (`GameEvents/TargetDirectionEvent.cpp`), so no engine change is expected.
+
 ## Later
 
 - The admin channel for BF2WebAdmin: approved 2026-10-22 as `docs/admin-channel-draft.md` draft 2
   (its own contract, not bound to `mm_webadmin`). It shares R5 with v2 item 8.
 - R3 stepped time and a `Step` message.
-- Proposed by the sidecar, not approved: a superseded `SetInput`'s buttons are ORed into the next one
-  for the same bot (axes stay latest-wins), and the stats line counts superseded inputs. No wire
-  change, but it changes the latest-wins semantics.
-- `SetTargetDirection`, to guide a TV or wire missile from a gunner bot. The server steers it from
-  the virtual `IWeaponObject::setTargetDirection` (`GameEvents/TargetDirectionEvent.cpp`), so it needs
-  no engine change. Launching one from the AH-1Z gunner seat did not work yet (findings/module-v2.md).
+
+
 - Hooks that can veto or change actions (damage, team selection).
 
 ## Open questions
