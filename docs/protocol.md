@@ -989,6 +989,51 @@ splits a character.
 - Eight missiles a sortie: after the eighth, the launcher shows 0 rounds, 1 magazine, not reloading.
   Treat that as empty.
 
+## Bot chat (approved 2026-10-24, protocol version stays 3)
+
+Approved by the author on 2026-10-24 for the 2v2 round flow (BF2WebAdmin's Heli2v2 starts a round on the
+gunners' "rdy"/"go"). Dev-phase policy for non-engine changes: no version bump. Implemented in module
+`100d53e` with no engine change (`docs/findings/bot-chat.md`).
+
+#### `0x010B Say` (sidecar → module)
+
+| Type | Field |
+|---|---|
+| `u32` | request id |
+| `u8` | player id (a bot of this connection) |
+| `u8` | channel: 0 Global or 1 Team |
+| string | text |
+
+Reply `Ack` or `Error`. Error 4: the player is not a live bot of this connection. Error 7: another
+channel, or a text that is empty, longer than 100 bytes or not printable ASCII (0x20-0x7E). Error 6: a
+second `Say` from the same bot within a second. The bot can be in any state. The engine's own rules
+apply: a dead or man-down sender reaches only dead receivers (`GameServer::playerMessageEvent`), and the
+sender's spam counter is used (`Player::getIsThisASpam`).
+
+The module posts the line as the event that a client's chat becomes (`StringManager::addStringDataChunk`,
+`Game/Common/StringManager.cpp:169-207`). That event is a `StringReceivedEvent` (event 11 on `ECNetwork`)
+with the bot's player id as the sender, type 2 (the only type a client may send), target 0 and flags 0.
+The module posts it with `EventManager::postEventNextUpdate`, so the engine dispatches it at the next
+update, outside the module's tick handler. `GameServer::handleStringReceivedEvent`
+(`Game/GameServer/GameServer.cpp:4289-4334`) then handles it as it handles a client's line:
+
+- `playerMessageEvent` relays it to every started connection. On channel 0, `filterMessage` only checks
+  `sender != receiver` (`:4473-4474`).
+- Python event 39 runs with `(sender id, text, "Global", 0)`. That reaches the netsky `onChatMessage` hook
+  (in begin-round 3 only, `Python/PythonHost.cpp:930-935`) and the admin channel's `ChatMessage` from
+  that player.
+- This module's own `Chat` forwarding sees it like any other line.
+
+`GameServer::say`/`sayAll` cannot do this: they always use the local human player as the sender, and a
+dedicated server has none (`GameServer.cpp:4778-4793`).
+
+### Sidecar on bot chat
+
+- In an all-bot crew, the gunner types the line once the crew is full and waiting on its pad and its
+  team has not said it yet. The line is "go" when the other team has already said it, otherwise "rdy"
+  (bf2-bots `RoundFlow`, docs/serverext-missions.md "Round flow"). In a mixed crew the bot never types:
+  the human's line counts.
+
 ## Later
 
 - The admin channel for BF2WebAdmin: approved 2026-10-22 as `docs/admin-channel-draft.md` draft 2
