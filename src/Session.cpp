@@ -106,6 +106,11 @@ bool Session::handleFrame(const Frame& frame, std::vector<uint8_t>& reply)
             return fail(reply, ErrMalformed, "malformed Spot");
         c.kind = Command::Spot;
         break;
+    case MsgSay:
+        if (!parseSay(frame.payload, c.say))
+            return fail(reply, ErrMalformed, "malformed Say");
+        c.kind = Command::Say;
+        break;
     case MsgSetTargetDirection:
         if (!parseSetTargetDirection(frame.payload, c.targetDirection))
             return fail(reply, ErrMalformed, "malformed SetTargetDirection");

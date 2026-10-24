@@ -262,6 +262,31 @@ bool parseSpot(const std::vector<uint8_t>& p, SpotMsg& out)
     return r.done();
 }
 
+bool parseSay(const std::vector<uint8_t>& p, SayMsg& out)
+{
+    Reader r(p.data(), p.size());
+    out.requestId = r.u32();
+    out.playerId = r.u8();
+    out.channel = r.u8();
+    r.str(out.text);
+    return r.done();
+}
+
+const char* checkSay(const SayMsg& m)
+{
+    if (m.channel != 0 && m.channel != 1)
+        return "Say channel must be 0 (Global) or 1 (Team)";
+    if (m.text.empty() || m.text.size() > kMaxSayText)
+        return "Say text must be 1 to 100 bytes";
+    for (size_t i = 0; i < m.text.size(); ++i)
+    {
+        const unsigned char ch = static_cast<unsigned char>(m.text[i]);
+        if (ch < 0x20 || ch > 0x7E)
+            return "Say text must be printable ASCII";
+    }
+    return 0;
+}
+
 bool parseSetTargetDirection(const std::vector<uint8_t>& p, SetTargetDirectionMsg& out)
 {
     Reader r(p.data(), p.size());
@@ -304,6 +329,7 @@ bool isClientMessage(uint16_t type)
     case MsgRestartRound:
     case MsgTeleport:
     case MsgSpot:
+    case MsgSay:
     case MsgSetTargetDirection:
         return true;
     default:

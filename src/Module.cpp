@@ -14,6 +14,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdarg>
+#include <cstddef>
 #include <cstdio>
 #include <deque>
 #include <map>
@@ -78,6 +79,8 @@ const int kMaxSpawnGroups = 64;
 const int kGameStatusPlaying = 1;               // the only status in which dead players respawn
 const unsigned long kSpottedTicks = 12 * 30;    // the client's minimap marker lifetime (Bf2MenuMapNode.cpp:842)
 const unsigned long kSpotMinTicks = 30;         // at most one Spot per bot per second
+const unsigned long kSayMinTicks = 30;          // at most one Say per bot per second
+const int kChatTypePlayer = 2;                  // a client's chat type (StringManager::addStringDataChunk drops others)
 const size_t kMaxTrackedProjectiles = 256;
 const unsigned int kCachedObjectFlag = 0x20;    // ObjectCache: a disabled, recycled object
 const int kCategoryHelicopter = 3;              // VCHelicopter (ModuleWorldObjTemplGame.cpp); every heli's vehicleCategory
@@ -244,7 +247,49 @@ struct Bot
     bool firing;
     bool manDown;                 // last man-down state seen (logged)
     unsigned long lastSpot;       // tick of the last accepted Spot, 0 if none
+    unsigned long lastSay;        // tick of the last accepted Say, 0 if none
 };
+
+// A bot's chat line (Say), posted as the StringReceivedEvent a client's chat becomes
+// (StringManager::addStringDataChunk, StringManager.cpp:199-206). StringReceivedEvent's constructor
+// and vtable live in the engine image, which exports no symbols to modules, so this is a
+// layout-compatible copy built in the module: the engine reads the node only through
+// static_cast<StringReceivedEvent*> fields (GameServer::handleStringReceivedEvent, StringMessageEW)
+// and the virtual getType (11) and release; the asserts below hold the layout to the engine header.
+class BotChatEvent : public EventNode
+{
+public:
+    BotChatEvent(int senderId, int channel, const std::string& text)
+        : m_senderId(senderId), m_targetId(0), m_flags(0), m_channel(channel), m_type(kChatTypePlayer),
+          m_messageLength(static_cast<unsigned int>(text.size())), m_message(new unsigned char[text.size() + 1])
+    {
+        for (size_t i = 0; i < text.size(); ++i)
+            m_message[i] = static_cast<unsigned char>(text[i]);
+        m_message[text.size()] = 0;   // as GameServer::say does
+    }
+    virtual ~BotChatEvent() { delete[] m_message; }
+    virtual int getType() const { return 11; }
+
+    int            m_senderId;
+    int            m_targetId;
+    int            m_flags;
+    int            m_channel;
+    int            m_type;
+    unsigned int   m_messageLength;
+    unsigned char* m_message;
+};
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Winvalid-offsetof"
+static_assert(sizeof(BotChatEvent) == sizeof(StringReceivedEvent), "StringReceivedEvent layout");
+static_assert(offsetof(BotChatEvent, m_senderId) == offsetof(StringReceivedEvent, m_senderId), "m_senderId");
+static_assert(offsetof(BotChatEvent, m_targetId) == offsetof(StringReceivedEvent, m_targetId), "m_targetId");
+static_assert(offsetof(BotChatEvent, m_flags) == offsetof(StringReceivedEvent, m_flags), "m_flags");
+static_assert(offsetof(BotChatEvent, m_channel) == offsetof(StringReceivedEvent, m_channel), "m_channel");
+static_assert(offsetof(BotChatEvent, m_type) == offsetof(StringReceivedEvent, m_type), "m_type");
+static_assert(offsetof(BotChatEvent, m_messageLength) == offsetof(StringReceivedEvent, m_messageLength), "m_messageLength");
+static_assert(offsetof(BotChatEvent, m_message) == offsetof(StringReceivedEvent, m_message), "m_message");
+#pragma GCC diagnostic pop
 
 // One sidecar connection (protocol.md v2 item 3).
 struct Conn
@@ -701,6 +746,7 @@ private:
             case Command::RestartRound: onRestartRound(c.conn, c.restartRound); break;
             case Command::Teleport:     onTeleport(c.conn, c.teleport); break;
             case Command::Spot:         onSpot(c.conn, c.spot); break;
+            case Command::Say:          onSay(c.conn, c.say); break;
             case Command::SetTargetDirection: onSetTargetDirection(c.conn, c.targetDirection); break;
             default: break;
             }
@@ -809,6 +855,7 @@ private:
         b.firing = false;
         b.manDown = false;
         b.lastSpot = 0;
+        b.lastSay = 0;
         resetFallback(b);
         b.target = choice.target;
         b.groupsPending = false;
@@ -1221,6 +1268,35 @@ private:
         b->lastSpot = m_tick;
         logLine("tick %lu: bot %d spotted '%s' (net id %u, team %d)", m_tick, b->id, templateName(target).c_str(), rootNet,
              targetTeam);
+        ack(conn, m.requestId);
+    }
+
+    // Say: the bot chats as itself. The event goes through the engine's own chat path next update,
+    // exactly as a client's line does: GameServer::handleStringReceivedEvent relays it to the clients
+    // (playerMessageEvent: spam check, dead-to-dead rule, filterMessage) and runs Python event 39
+    // (onChatMessage, the admin channel's ChatMessage); this module's onChat forwards it as Chat.
+    void onSay(uint32_t conn, const proto::SayMsg& m)
+    {
+        Bot* b = ownBot(m.playerId, conn);
+        world::IPlayer* p = b ? live(*b) : 0;
+        if (!p)
+        {
+            error(conn, m.requestId, proto::ErrUnknownPlayer, "not a bot of this connection");
+            return;
+        }
+        if (const char* why = proto::checkSay(m))
+        {
+            error(conn, m.requestId, proto::ErrInvalidValue, why);
+            return;
+        }
+        if (b->lastSay && m_tick - b->lastSay < kSayMinTicks)
+        {
+            error(conn, m.requestId, proto::ErrRefused, "at most one Say per bot per second");
+            return;
+        }
+        m_em->postEventNextUpdate(ECNetwork, new BotChatEvent(p->getId(), m.channel, m.text));
+        b->lastSay = m_tick;
+        logLine("tick %lu: bot %d says on channel %d: %s", m_tick, b->id, m.channel, m.text.c_str());
         ack(conn, m.requestId);
     }
 

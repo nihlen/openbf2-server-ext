@@ -87,6 +87,17 @@ std::vector<uint8_t> spotPayload(uint32_t requestId, uint8_t id, uint32_t target
     return p;
 }
 
+std::vector<uint8_t> sayPayload(uint32_t requestId, uint8_t id, uint8_t channel, const std::string& text)
+{
+    std::vector<uint8_t> p;
+    Writer w(p);
+    w.u32(requestId);
+    w.u8(id);
+    w.u8(channel);
+    w.str(text);
+    return p;
+}
+
 std::vector<uint8_t> directionPayload(uint8_t id, uint32_t tick, float sx, float sy, float sz, float ex, float ey,
                                       float ez)
 {
@@ -295,6 +306,38 @@ void testParsers()
     CHECK(!parseSpot(std::vector<uint8_t>(), sp));
 
     CHECK(isClientMessage(MsgTeleport) && isClientMessage(MsgSpot));
+
+    // Say: u32 request id, u8 player id, u8 channel, string; exact length only.
+    SayMsg sy;
+    CHECK(parseSay(sayPayload(9, 3, 0, "rdy"), sy) && sy.requestId == 9 && sy.playerId == 3 && sy.channel == 0 &&
+          sy.text == "rdy");
+    CHECK(sayPayload(0, 0, 0, "go").size() == 10);
+    {
+        std::vector<uint8_t> t = sayPayload(9, 3, 0, "rdy");
+        t.push_back(0);
+        CHECK(!parseSay(t, sy));
+        t.pop_back();
+        t.pop_back();
+        CHECK(!parseSay(t, sy));
+        CHECK(!parseSay(std::vector<uint8_t>(), sy));
+    }
+    CHECK(parseSay(sayPayload(9, 3, 0, "rdy"), sy) && checkSay(sy) == 0);
+    sy.channel = 1;
+    CHECK(checkSay(sy) == 0);
+    sy.channel = 12;   // server channels are the server's
+    CHECK(checkSay(sy) != 0);
+    sy.channel = 0;
+    sy.text = "";
+    CHECK(checkSay(sy) != 0);
+    sy.text = std::string(kMaxSayText, 'a');
+    CHECK(checkSay(sy) == 0);
+    sy.text += 'a';
+    CHECK(checkSay(sy) != 0);
+    sy.text = "rdy\n";
+    CHECK(checkSay(sy) != 0);
+    sy.text = "r\xA7" "dy";
+    CHECK(checkSay(sy) != 0);
+    CHECK(isClientMessage(MsgSay));
 
     // v3: SetTargetDirection (29 bytes), exact length only; values are checked separately.
     SetTargetDirectionMsg td;

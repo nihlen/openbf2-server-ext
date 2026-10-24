@@ -30,6 +30,7 @@ enum MsgType : uint16_t
     MsgRestartRound = 0x0108,
     MsgTeleport     = 0x0109,
     MsgSpot         = 0x010A,
+    MsgSay          = 0x010B,   // bot chat (no version change, approved 2026-10-24)
     MsgSetInput     = 0x0201,
     MsgSetTargetDirection = 0x0202,   // v3 item 3
     MsgTickState    = 0x0301,
@@ -165,6 +166,8 @@ struct RestartRoundMsg { uint32_t requestId; };
 struct TeleportMsg     { uint32_t requestId; uint8_t playerId; float pos[3]; float yaw; };
 // v2 item 6: the bot spots the root object with networkable id targetId.
 struct SpotMsg         { uint32_t requestId; uint8_t playerId; uint32_t targetId; };
+// The bot sends a chat line as itself on channel 0 (Global) or 1 (Team).
+struct SayMsg          { uint32_t requestId; uint8_t playerId; uint8_t channel; std::string text; };
 
 // Axis order on the wire: cyclic pitch, cyclic roll, collective, pedals, look yaw, look pitch.
 enum Axis
@@ -199,12 +202,18 @@ bool parseSetInput(const std::vector<uint8_t>& p, SetInputMsg& out);
 bool parseRestartRound(const std::vector<uint8_t>& p, RestartRoundMsg& out);
 bool parseTeleport(const std::vector<uint8_t>& p, TeleportMsg& out);
 bool parseSpot(const std::vector<uint8_t>& p, SpotMsg& out);
+bool parseSay(const std::vector<uint8_t>& p, SayMsg& out);
 bool parseSetTargetDirection(const std::vector<uint8_t>& p, SetTargetDirectionMsg& out);
 
 // Checks a SetTargetDirection's values (v3 item 3): finite, both points inside the world (|x| and
 // |z| at most 8192, y in -1000..10000) and at least 0.1 m apart. Returns null when valid, else the
 // reason for the Error 7 message.
 const char* checkTargetDirection(const SetTargetDirectionMsg& m);
+
+// Checks a Say's values: channel 0 or 1, text 1..kMaxSayText bytes of printable ASCII (0x20-0x7E).
+// Returns null when valid, else the reason for the Error 7 message.
+const size_t kMaxSayText = 100;
+const char* checkSay(const SayMsg& m);
 
 // True for the message types a sidecar may send.
 bool isClientMessage(uint16_t type);
