@@ -5,7 +5,7 @@ cmake_minimum_required(VERSION 3.21)
 # has no socket. Linux x86-64 only. See docs/findings/r1-smoke.md.
 #
 # Build (WSL):
-#   cmake -S probe -B ~/serverext-probe-build -G Ninja -DOPENBF2_SRC=/mnt/c/.../OpenBF2/serverext-r1
+#   cmake -S probe -B ~/serverext-probe-build -G Ninja -DOPENBF2_SRC=/mnt/c/Data/Projects/OpenBF2
 #   cmake --build ~/serverext-probe-build
 #
 # The module compiles against the OpenBF2 headers with the same image define, force-includes and

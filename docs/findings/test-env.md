@@ -41,7 +41,7 @@ Run these from WSL. Set the two paths once:
 
 ```bash
 T=/mnt/c/Data/Projects/openbf2-server-ext/testenv
-SRC=/mnt/c/Users/Alex/.t3/worktrees/OpenBF2/serverext-test-env
+SRC=/mnt/c/Data/Projects/OpenBF2      # the default checkout (main); this run used the serverext-test-env worktree at ccf3099
 sed -i 's/\r$//' $T/*.sh          # only if a Windows checkout gave the scripts CRLF endings
 ```
 

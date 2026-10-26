@@ -21,8 +21,9 @@ results are in [docs/findings/admin-phase1.md](docs/findings/admin-phase1.md).
 | `testenv/` | WSL and Docker test-server scripts; `deploy-module.sh` installs the module into a run directory. |
 | `probe/` | The superseded `[TEMP]` R1 smoke probe, kept as the evidence behind `docs/findings/r1-smoke.md`. |
 
-Build in WSL (needs the tools from `testenv/tools-linux.sh` and an OpenBF2 checkout carrying the
-R1 engine changes, by default the `serverext-r1` worktree; override with `OPENBF2_SRC`):
+Build in WSL. It needs the tools from `testenv/tools-linux.sh` and an OpenBF2 checkout carrying the
+`IServerExtension` engine changes. By default that is `C:\Data\Projects\OpenBF2`, branch `main`; override it with
+the first argument or `OPENBF2_SRC`:
 
 ```
 ./build-module.sh [openbf2-checkout] [build-dir]
@@ -34,12 +35,15 @@ dynamically). A Windows build (`serverext.dll`) is not implemented yet.
 
 ## Related repos
 
+How they fit together, and how to build, deploy and test across them: [docs/system.md](docs/system.md)
+(`C:\Data\Projects\openbf2-server-ext\docs\system.md`).
+
 | Repo | Local path | Relationship |
 |---|---|---|
-| OpenBF2 | `C:\Data\Projects\OpenBF2` | The server this module loads into. A local branch carries the engine changes the module needs. |
+| OpenBF2 | `C:\Data\Projects\OpenBF2` | The server this module loads into. Local commits on `main` carry the engine changes the module needs (`docs/server-extension.md` there). |
 | bf2-bots | `C:\Data\Projects\bf2-bots` | The bot sidecar, a client of the bot channel. |
-| BF2WebAdmin | `C:\Data\Projects\DotNet\BF2WebAdmin` | Future client of the admin channel. |
-| BF2WebAdmin-localtest | `C:\Data\Projects\DotNet\BF2WebAdmin-localtest` | Existing local `dalian_2_v_2` setup on the retail netsky server; a reference for content and ports, not a host for this module. |
+| BF2WebAdmin | `C:\Data\Projects\DotNet\BF2WebAdmin` | The admin channel's client: branch `admin-channel` (not merged into `master`) replaces `mm_webadmin.py` with it. |
+| BF2WebAdmin-localtest | `C:\Data\Projects\DotNet\BF2WebAdmin-localtest` | The local test environment. Its OpenBF2 variant runs this module on `dalian_2_v_2` with WebAdmin and the bots attached. |
 | OpenBF2-BF2Hub | `C:\Data\Projects\_ext\OpenBF2-BF2Hub` | Reference for a module's layout, presets and loading. |
 
 ## License
