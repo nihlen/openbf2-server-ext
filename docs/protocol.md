@@ -356,7 +356,7 @@ outside `AI/`, and Python's `getIsAIGame()` would report true. Design:
 - The same interface carries anything else the module later needs from `gameLogic` or
   `spawnManager`, since neither is a registered singleton.
 - Implemented and tested on OpenBF2 branch `serverext/r1` (`docs/findings/r1-smoke.md`,
-  `docs/findings/module-v0.md`); committed and merged into the local OpenBF2 `main` on 2026-10-26.
+  `docs/findings/module-v0.md`); committed on OpenBF2 branch `serverext/r1`, which is checked out in `C:\Data\Projects\OpenBF2` and not merged into `main`.
 
 **R1b. Null guards for the AI couriers.** These are required, because R1 alone can crash the server.
 An AI-flagged player reaches three courier pointers that only the AIDLL fills. Each guard behaves

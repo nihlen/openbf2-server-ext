@@ -23,7 +23,7 @@ anything outside this repo's unit tests.
 ## Working with OpenBF2
 
 - OpenBF2's `AGENTS.md` governs any change inside `C:\Data\Projects\OpenBF2`. Read it in full before
-  touching that repo. Work on its `main` branch in that checkout. Changes there are local only, kept as small as
+  touching that repo. Work on its `serverext/r1` branch, checked out in that folder; `main` is upstream's and stays free of these changes. Changes there are local only, kept as small as
   possible, and marked `[CHOSEN, not recovered]`. Its `docs/server-extension.md` describes the engine side of this
   module.
 - Prefer typed virtual calls on engine interfaces. Do not patch raw addresses or hard-code vtable
