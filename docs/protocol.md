@@ -440,13 +440,16 @@ to an empty server ticking on `dalian_2_v_2` for over 5 minutes, in both WSL and
 
 ### Ports
 
+The port map for every server, channel and test instance is in [system.md](system.md#ports). The fixed points:
+
 - Port 16567 is reserved for the author's sessions.
-- The BF2WebAdmin local test environment uses `16569/udp`, gamespy `29901/udp`, RCON
-  `127.0.0.1:4721` and WebAdmin `4300`. Do not reuse those either.
-- This project: game `16571/udp`, gamespy `29903/udp`, RCON `127.0.0.1:4723`, bot channel an unused
-  port in `127.0.0.1:16700-16709`. On the author's machine 16700 is held by a stale `wslrelay`, so
-  WSL runs use 16701 and Docker uses 16702. The server also binds VoIP UDP 55124 and 55126, so two WSL test servers at
-  once collide.
+- The localtest's play session uses game `16569/udp`, gamespy `29901/udp`, RCON `127.0.0.1:4721`, the bot channel
+  `127.0.0.1:16705` and the admin listener `4310`. Its separate test instance (`test-instance.ps1`) defaults to
+  `16571`, `29903`, `4723`, `16706` and `4312`, the same game, gamespy and RCON ports as the `testenv/` servers below,
+  so run one or the other, or pick other ports.
+- `testenv/` servers: game `16571/udp`, gamespy `29903/udp`, RCON `127.0.0.1:4723`, bot channel an unused port in
+  `127.0.0.1:16700-16709`. On the author's machine 16700 is held by a stale `wslrelay`, so WSL runs use 16701 and
+  Docker uses 16702. The server also binds VoIP UDP 55124 and 55126, so two WSL test servers at once collide.
 
 ### Checks
 
@@ -1069,5 +1072,8 @@ implemented.
 
 1. A worker that finds the contract wrong stops and reports instead of working around it.
 2. The coordinator or the author edits this file. Until the first implementation exists, answers to
-   the open questions and wire changes keep version 0; after that, every wire change bumps it.
+   the open questions and wire changes keep version 0. While the project is in its dev phase (nothing outside this
+   effort uses the channels), a wire change that needs no engine change keeps the current version and is recorded in
+   its section with the date, as `Say` and the launch number were (author, 2026-10-23). A change that needs the engine
+   bumps the version.
 3. Every affected repo gets the change in a new brief. Repos never redefine messages locally.

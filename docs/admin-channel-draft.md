@@ -1,4 +1,4 @@
-# Admin channel: proposal (draft 2)
+# Admin channel (approved draft 2, implemented)
 
 Status: **approved by the author on 2026-10-22**, with the decisions in [Decisions](#decisions).
 **Phase 1 implemented 2026-10-23** (OpenBF2 `873d1b1`, module `f62ae97`..`0aab582`,
