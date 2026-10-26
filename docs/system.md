@@ -253,7 +253,7 @@ Do not delete the author's data in the localtest: `secrets\`, `.env`, `app\`, `l
 - **Protocol changes:** the contracts are `docs/protocol.md` (bot channel) and `docs/admin-channel-draft.md` (admin
   channel). Code follows them; a worker who finds them wrong stops and reports. In the current development phase a
   wire change that does not touch the engine keeps the protocol version (the author's rule, as for `0x010B Say` and
-  the launch number; it overrides "every wire change bumps it" in protocol.md "Changing this contract").
+  the launch number; protocol.md "Changing this contract" states the same rule).
 - **Q12 engine fix is deferred** by the author (2026-10-23): do not fix it; the sidecar's workaround stays.
 - Main-thread module code never blocks; a malformed or hostile client must never crash or stall the server.
 
@@ -298,6 +298,6 @@ Collected from the findings and per-repo docs on 2026-10-26; the source of each 
   by this work). README; findings/r1-smoke.md.
 - **Q8** (does unrecovered retail code use EventManager category 7) needs IDA/Ghidra; the three R1b guards, the
   enter-on-spawn path for a bot, and yaw/roll input have never run. protocol.md "Open questions".
-- **Stale statements in older docs:** BF2WebAdmin admin-channel.md still says bots cannot chat and that bot-channel
-  `Chat` breaks `§` (both fixed: `Say` 0x010B, v3 text conversion); protocol.md line 358 calls R1 uncommitted;
-  findings/docker-v1.md item 6 says the admin channel is missing. The later documents win.
+- **Stale statements in older docs:** BF2WebAdmin admin-channel.md's "Problems found" still lists bot-channel `Chat`
+  breaking `§` (fixed by the v3 text conversion); findings/docker-v1.md item 6 says the admin channel is missing.
+  The later documents win.
