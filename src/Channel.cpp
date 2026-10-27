@@ -186,6 +186,7 @@ void Channel::releaseStepping()
     m_stepBudget = 0;
     m_realTimeOrigin = std::chrono::steady_clock::now();
     m_realTimeTicks = 0;
+    m_stepWake.notify_one();
 }
 
 bool Channel::step(uint32_t conn, uint32_t ticks, std::string& why)
@@ -209,28 +210,49 @@ bool Channel::step(uint32_t conn, uint32_t ticks, std::string& why)
     }
     m_stepOwner = conn;
     m_stepBudget = ticks >= kMaxStepBudget - m_stepBudget ? kMaxStepBudget : m_stepBudget + ticks;
+    m_stepWake.notify_one();
     return true;
 }
 
 int Channel::takeTicks(int maxTicks)
 {
-    std::lock_guard<std::mutex> lock(m_mutex);
+    typedef std::chrono::steady_clock Clock;
+    std::unique_lock<std::mutex> lock(m_mutex);
     if (maxTicks <= 0)
         return 0;
-    if (m_stepOwner != 0)
+    const Clock::time_point deadline = Clock::now() + std::chrono::microseconds(kStepWaitMicros);
+    for (;;)
     {
-        const uint32_t n = m_stepBudget < static_cast<uint32_t>(maxTicks) ? m_stepBudget : static_cast<uint32_t>(maxTicks);
-        m_stepBudget -= n;
-        return static_cast<int>(n);
+        const Clock::time_point now = Clock::now();
+        if (m_stepOwner != 0)
+        {
+            if (m_stepBudget > 0)
+            {
+                const uint32_t n = m_stepBudget < static_cast<uint32_t>(maxTicks) ? m_stepBudget : static_cast<uint32_t>(maxTicks);
+                m_stepBudget -= n;
+                return static_cast<int>(n);
+            }
+            if (now >= deadline)
+                return 0;
+            m_stepWake.wait_until(lock, deadline);
+            continue;
+        }
+        const double elapsed = std::chrono::duration<double>(now - m_realTimeOrigin).count();
+        const uint64_t due = static_cast<uint64_t>(elapsed * 30.0);
+        if (due > m_realTimeTicks)
+        {
+            const uint64_t n = due - m_realTimeTicks;
+            // A backlog beyond one frame's cap is dropped, as TickCalculator::compute does
+            m_realTimeTicks = due;
+            return n > static_cast<uint64_t>(maxTicks) ? maxTicks : static_cast<int>(n);
+        }
+        if (now >= deadline)
+            return 0;
+        // The next real-time tick, or a Step that starts stepping, whichever comes first
+        const Clock::time_point next = m_realTimeOrigin + std::chrono::duration_cast<Clock::duration>(
+            std::chrono::duration<double>(static_cast<double>(m_realTimeTicks + 1) / 30.0));
+        m_stepWake.wait_until(lock, next < deadline ? next : deadline);
     }
-    const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - m_realTimeOrigin).count();
-    const uint64_t due = static_cast<uint64_t>(elapsed * 30.0);
-    if (due <= m_realTimeTicks)
-        return 0;
-    const uint64_t n = due - m_realTimeTicks;
-    // A backlog beyond one frame's cap is dropped, as TickCalculator::compute does
-    m_realTimeTicks = due;
-    return n > static_cast<uint64_t>(maxTicks) ? maxTicks : static_cast<int>(n);
 }
 
 } // namespace serverext

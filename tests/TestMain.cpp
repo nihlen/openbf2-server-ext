@@ -947,6 +947,31 @@ void testStepping()
         std::vector<uint8_t> bad = frame(MsgStep, std::vector<uint8_t>(3, 0));
         CHECK(!a.onBytes(bad.data(), bad.size(), reply) && errorCode(reply) == ErrMalformed);
     }
+    // An empty budget waits up to kStepWaitMicros for a grant; a Step from the I/O thread wakes it at once
+    {
+        Channel ch;
+        ch.enableStepping();
+        Session a(&ch, 1);
+        std::vector<uint8_t> reply;
+        std::vector<uint8_t> h = frame(MsgHello, helloPayload(4, "x"));
+        std::vector<uint8_t> one = frame(MsgStep, stepPayload(1));
+        CHECK(a.onBytes(h.data(), h.size(), reply) && a.onBytes(one.data(), one.size(), reply) && ch.takeTicks(10) == 1);
+        typedef std::chrono::steady_clock Clock;
+        Clock::time_point t0 = Clock::now();
+        CHECK(ch.takeTicks(10) == 0);   // nothing granted: the whole wait
+        const double waited = std::chrono::duration<double, std::micro>(Clock::now() - t0).count();
+        CHECK(waited >= Channel::kStepWaitMicros * 0.9 && waited < Channel::kStepWaitMicros * 10);
+        std::thread grant([&]() {
+            std::this_thread::sleep_for(std::chrono::microseconds(300));
+            std::vector<uint8_t> r;
+            a.onBytes(one.data(), one.size(), r);
+        });
+        t0 = Clock::now();
+        const int n = ch.takeTicks(10);
+        const double woke = std::chrono::duration<double, std::micro>(Clock::now() - t0).count();
+        grant.join();
+        CHECK(n == 1 && woke < Channel::kStepWaitMicros);
+    }
     // Step 0 and a close release: real time again, at most maxTicks a frame
     {
         Channel ch;

@@ -59,7 +59,9 @@ These rules are part of the contract, because breaking them causes server hitche
    - drain the inbound queue and apply commands and inputs;
    - build one state snapshot and push it to the outbound queue.
 4. No blocking calls on the main thread: no socket writes, no disk I/O, no waiting on the sidecar.
-   If the sidecar is slow, the server keeps ticking and the watchdog applies.
+   If the sidecar is slow, the server keeps ticking and the watchdog applies. One exception, stepped time
+   ([v4](#v4-stepped-time-approved-and-implemented-2026-10-27), amended 2026-10-27): the tick source may wait up
+   to 2 ms per frame for a grant or the next real-time tick, in place of the engine's frame sleep.
 
 ### The per-tick hook (Q1, answered)
 
@@ -1083,6 +1085,12 @@ version; nothing else changes for a version 3 client, and `Step` from one is `Er
 | `u32` | ticks granted: added to the budget (capped at 300); 0 releases stepping (real time again) |
 
 No reply. Handled on the I/O thread (the main thread does not tick while the budget is empty).
+
+Waiting for a grant (amended and approved by the author 2026-10-27): with an empty budget the tick source waits up to
+2 ms for one, and the I/O thread wakes it as soon as a `Step` arrives; without a stepping connection it waits up to 2 ms
+for the next 30 Hz tick. Before, it returned 0 at once and the engine slept 1 ms (`System::sleep`'s smallest step), so
+every stepped tick took about 1.1 ms (970 ticks/s at most). The engine is unchanged: it still sleeps 1 ms after a frame
+with no ticks, which now happens only when a wait ran out.
 `Error` 6 and close: `stepMode` is 0, or another connection is stepping. Wrong length: `Error` 2.
 
 ## Later

@@ -9,6 +9,7 @@
 #include <chrono>
 #include <deque>
 #include <map>
+#include <condition_variable>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -83,6 +84,8 @@ public:
 
     // --- stepped time (docs/protocol.md "v4: stepped time", R3) ---
     static const uint32_t kMaxStepBudget = 300;
+    // How long takeTicks waits for a grant or the next real-time tick (us), in place of the engine's 1 ms frame sleep
+    static const int kStepWaitMicros = 2000;
     // Main thread, once at load (serverext.cfg stepMode 1): from now on takeTicks decides the ticks.
     void enableStepping();
     bool steppingEnabled() const;
@@ -91,7 +94,8 @@ public:
     bool step(uint32_t conn, uint32_t ticks, std::string& why);
     // Main thread, once per frame (the engine's tick source): the ticks this frame runs, 0..maxTicks.
     // From the stepping connection's budget; without one, 30 Hz of a steady clock (a backlog beyond
-    // maxTicks is dropped, as TickCalculator does).
+    // maxTicks is dropped, as TickCalculator does). With none due it waits up to kStepWaitMicros: for a
+    // grant (step wakes it) or for the next real-time tick (docs/protocol.md v4, "Waiting for a grant").
     int takeTicks(int maxTicks);
     // The stepping connection, 0 if none.
     uint32_t steppingConnection() const;
@@ -126,6 +130,7 @@ private:
     int m_wake[2];
 
     // Stepped time, under m_mutex
+    std::condition_variable m_stepWake;   // step() and closeConnection() wake a waiting takeTicks
     bool m_stepEnabled;
     uint32_t m_stepOwner;
     uint32_t m_stepBudget;
