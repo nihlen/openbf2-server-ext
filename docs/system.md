@@ -214,6 +214,7 @@ protocol.md "Testing". Their run dirs are agent-owned (`~/serverext-<task>/srv`)
 | WebAdmin `dotnet test test\BF2WebAdmin.Tests\BF2WebAdmin.Tests.csproj` (220 tests on 2026-10-26) | the C# admin codec (golden file), handshake, TLS pin, session ordering/resync, Heli2v2 | a live module |
 | `tools\hubclient` (localtest) | WebAdmin from the web UI's side: `--watch`, chat commands, `--rcon`, `--get-server`, `--set-admin-key` | the Blazor pages themselves |
 | Test instance (`test-instance.ps1`) | the whole chain on a real server and a real WebAdmin with its own DB, without touching the play session; Heli2v2 rounds stored in `bf2test` | a human client |
+| Stepped time (protocol v4: `serverext.cfg stepMode 1`, sidecar `--step`) | bot tests faster than real time in lockstep; the game-bf2 test queue (bf2-bots docs/serverext-test.md) runs them | anything with a human client: a stepped server runs only as fast as its sidecar |
 | A play session (`play-2v2.ps1`) | the author plays | for the author only; agents check Status and leave it alone |
 
 Nothing has been tested with a human client on an OpenBF2 server with the module yet (see "Open issues").
