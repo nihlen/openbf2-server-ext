@@ -374,8 +374,26 @@ the UseAI first-wave refusal (`:1930-1938`, `gpm_coop` only) do not block a bot 
 A human teammate pressing E prefers an AI-occupied seat and can evict the bot
 (`PlayerControlObjectHelpers.cpp:456-466`), as with retail bots.
 
-**R3 (later). Stepped time** for training: advance N ticks on command without the wall-clock wait
-and the 10-tick catch-up cap. Not part of v0.
+**R3. Stepped time** (approved by the author 2026-10-27, for bot tests faster than real time; design
+in [v4](#v4-stepped-time-approved-and-implemented-2026-10-27)). A test server can have the module decide
+how many ticks each frame runs. Engine side, all in the dedicated server's frame loop
+(`Game/Main/BF2Engine.cpp`, `BF2Engine::mainLoop`):
+
+- `IServerExtension` gains, appended, `setTickSource(ITickSource*)`, where `ITickSource` is a header-only
+  interface with `int takeTicks(int maxTicks)`. Null (the default) leaves the retail loop unchanged.
+- With a source set, each frame asks it for the ticks to run (at most 10, the retail per-frame cap),
+  advances the exact clock by exactly that many ticks with `System::advanceExactTime(unsigned
+  microseconds)` (the demo recorder's fixed-step path, `Core/System.cpp:270`) instead of the wall
+  clock, passes that count to `game->update` instead of `TickCalculator::compute`, and skips the 30 Hz
+  frame limiter. A frame with no ticks sleeps 1 ms.
+- The source is set once, in the module's `initDll`, and never cleared while the server runs:
+  switching back to the wall clock would leave `System`'s wall reference behind the stepped clock
+  (`advanceExactTime(unsigned)` moves it). Without a stepping sidecar the module itself grants ticks
+  at 30 Hz from a steady clock, so the server then runs in real time as before.
+- Unchanged: the fixed 1/30 s step, everything driven by ticks or `getExactTime` (physics, projectiles,
+  round time, Python timers). Still on the wall clock: network timeouts, the end-of-round wait for
+  clients' acknowledgements (`GameServer.cpp:1137-1146`), the ban list. A stepped server is for bot
+  tests without human clients.
 
 ### How these bots differ from retail AIDLL bots
 
@@ -1037,11 +1055,40 @@ dedicated server has none (`GameServer.cpp:4778-4793`).
   (bf2-bots `RoundFlow`, docs/serverext-missions.md "Round flow"). In a mixed crew the bot never types:
   the human's line counts.
 
+## v4: stepped time (approved and implemented 2026-10-27)
+
+Approved by the author on 2026-10-27: bot tests faster than real time, in lockstep with the sidecar, on
+test servers (the game-bf2 test queue, bf2-bots `docs/serverext-test.md`). Engine change R3, so the
+version is 4. The module accepts `Hello` version 3 or 4 and answers `Welcome` with the client's
+version; nothing else changes for a version 3 client, and `Step` from one is `Error` 3.
+
+- `serverext.cfg` `stepMode 1` (default 0) installs the module's tick source (R3) at load. Never on a
+  server humans play on: the game then runs only as fast as a stepping sidecar allows.
+- `Welcome` features bit 2: stepping available (`stepMode 1`).
+- Without a stepping connection the module grants ticks at 30 Hz from a steady clock (at most 10 a
+  frame, a longer backlog dropped as `TickCalculator` does), so the server runs in real time.
+- A connection's first `Step` makes it the stepping connection. From then on the server runs a tick
+  only when that connection has granted it. It stays so until `Step` 0 or the connection closes; then
+  real time resumes at once.
+- Lockstep: the sidecar grants one tick after it has sent its inputs for the last `TickState`. The
+  module's I/O thread queues those inputs before it counts the grant (one connection, one thread, in
+  order), so every input sent before a `Step` is applied in the tick that `Step` grants. Granting more
+  than one tick ahead trades that for speed.
+- The watchdog and every tick-counted limit are unchanged: they count ticks, not seconds.
+
+#### `0x010C Step` (sidecar → module)
+
+| Type | Field |
+|---|---|
+| `u32` | ticks granted: added to the budget (capped at 300); 0 releases stepping (real time again) |
+
+No reply. Handled on the I/O thread (the main thread does not tick while the budget is empty).
+`Error` 6 and close: `stepMode` is 0, or another connection is stepping. Wrong length: `Error` 2.
+
 ## Later
 
 - The admin channel for BF2WebAdmin: approved 2026-10-22 as `docs/admin-channel-draft.md` draft 2
   (its own contract, not bound to `mm_webadmin`). It shares R5 with v2 item 8.
-- R3 stepped time and a `Step` message.
 
 
 

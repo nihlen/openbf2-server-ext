@@ -6,6 +6,7 @@
 #define SERVEREXT_CHANNEL_H
 
 #include <cstdint>
+#include <chrono>
 #include <deque>
 #include <map>
 #include <mutex>
@@ -80,6 +81,21 @@ public:
     // Moves pending log lines into out; returns the number dropped since the last call.
     size_t drainLogs(std::deque<std::string>& out);
 
+    // --- stepped time (docs/protocol.md "v4: stepped time", R3) ---
+    static const uint32_t kMaxStepBudget = 300;
+    // Main thread, once at load (serverext.cfg stepMode 1): from now on takeTicks decides the ticks.
+    void enableStepping();
+    bool steppingEnabled() const;
+    // I/O thread: conn grants ticks (0 releases stepping). The first grant makes conn the stepping
+    // connection. @return False with why when stepping is off or another connection steps.
+    bool step(uint32_t conn, uint32_t ticks, std::string& why);
+    // Main thread, once per frame (the engine's tick source): the ticks this frame runs, 0..maxTicks.
+    // From the stepping connection's budget; without one, 30 Hz of a steady clock (a backlog beyond
+    // maxTicks is dropped, as TickCalculator does).
+    int takeTicks(int maxTicks);
+    // The stepping connection, 0 if none.
+    uint32_t steppingConnection() const;
+
     // The read end the I/O thread polls; one byte is written to the write end per send.
     int wakeReadFd() const { return m_wake[0]; }
 
@@ -100,6 +116,7 @@ private:
     };
 
     void wake();
+    void releaseStepping();
 
     mutable std::mutex m_mutex;
     std::deque<Command> m_commands;
@@ -107,6 +124,13 @@ private:
     std::deque<std::string> m_logs;
     size_t m_logsDropped;
     int m_wake[2];
+
+    // Stepped time, under m_mutex
+    bool m_stepEnabled;
+    uint32_t m_stepOwner;
+    uint32_t m_stepBudget;
+    std::chrono::steady_clock::time_point m_realTimeOrigin;
+    uint64_t m_realTimeTicks;   // ticks granted since m_realTimeOrigin
 };
 
 } // namespace serverext

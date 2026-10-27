@@ -6,7 +6,8 @@
 namespace serverext {
 
 Channel::Channel()
-    : m_logsDropped(0)
+    : m_logsDropped(0), m_stepEnabled(false), m_stepOwner(0), m_stepBudget(0),
+      m_realTimeOrigin(std::chrono::steady_clock::now()), m_realTimeTicks(0)
 {
     m_wake[0] = m_wake[1] = -1;
     if (::pipe(m_wake) == 0)
@@ -103,6 +104,8 @@ void Channel::closeConnection(uint32_t conn)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
     m_out.erase(conn);
+    if (conn == m_stepOwner)
+        releaseStepping();
     // The main thread ignores commands of a closed connection anyway; dropping them keeps a flood
     // from a closed connection from counting against the others. Lifecycle events stay.
     std::deque<Command> kept;
@@ -154,6 +157,80 @@ size_t Channel::drainLogs(std::deque<std::string>& out)
     const size_t dropped = m_logsDropped;
     m_logsDropped = 0;
     return dropped;
+}
+
+void Channel::enableStepping()
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_stepEnabled = true;
+    m_realTimeOrigin = std::chrono::steady_clock::now();
+    m_realTimeTicks = 0;
+}
+
+bool Channel::steppingEnabled() const
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_stepEnabled;
+}
+
+uint32_t Channel::steppingConnection() const
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_stepOwner;
+}
+
+// Under m_mutex: real time again from now, with no backlog
+void Channel::releaseStepping()
+{
+    m_stepOwner = 0;
+    m_stepBudget = 0;
+    m_realTimeOrigin = std::chrono::steady_clock::now();
+    m_realTimeTicks = 0;
+}
+
+bool Channel::step(uint32_t conn, uint32_t ticks, std::string& why)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_stepEnabled)
+    {
+        why = "stepping is off (serverext.cfg stepMode 0)";
+        return false;
+    }
+    if (m_stepOwner != 0 && m_stepOwner != conn)
+    {
+        why = "another connection is stepping";
+        return false;
+    }
+    if (ticks == 0)
+    {
+        if (m_stepOwner == conn)
+            releaseStepping();
+        return true;
+    }
+    m_stepOwner = conn;
+    m_stepBudget = ticks >= kMaxStepBudget - m_stepBudget ? kMaxStepBudget : m_stepBudget + ticks;
+    return true;
+}
+
+int Channel::takeTicks(int maxTicks)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (maxTicks <= 0)
+        return 0;
+    if (m_stepOwner != 0)
+    {
+        const uint32_t n = m_stepBudget < static_cast<uint32_t>(maxTicks) ? m_stepBudget : static_cast<uint32_t>(maxTicks);
+        m_stepBudget -= n;
+        return static_cast<int>(n);
+    }
+    const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - m_realTimeOrigin).count();
+    const uint64_t due = static_cast<uint64_t>(elapsed * 30.0);
+    if (due <= m_realTimeTicks)
+        return 0;
+    const uint64_t n = due - m_realTimeTicks;
+    // A backlog beyond one frame's cap is dropped, as TickCalculator::compute does
+    m_realTimeTicks = due;
+    return n > static_cast<uint64_t>(maxTicks) ? maxTicks : static_cast<int>(n);
 }
 
 } // namespace serverext

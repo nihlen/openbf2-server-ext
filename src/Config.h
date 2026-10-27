@@ -21,6 +21,7 @@ struct Config
     int maxConnections;          // v2: sidecar connections open at once
     bool allowTeleport;          // v2: Teleport is refused unless set
     float projectileRange;       // v2: metres around an own bot within which projectiles are reported
+    bool stepMode;               // v4: the module decides each frame's ticks (R3; test servers only)
 
     // Admin channel (docs/findings/admin-phase1.md, Configuration). Off unless adminConnect is set.
     bool adminEnabled;
@@ -38,7 +39,7 @@ struct Config
     Config()
         : listenHost("127.0.0.1"), listenPort(16700), watchdogTicks(6), enterRange(30.0f),
           spawnFallbackSeconds(5), spawnBlockedSeconds(15), allowRoundRestart(false), maxConnections(4),
-          allowTeleport(false), projectileRange(1000.0f), adminEnabled(false), adminPort(0), adminTls(true),
+          allowTeleport(false), projectileRange(1000.0f), stepMode(false), adminEnabled(false), adminPort(0), adminTls(true),
           adminSendIdentity(-1), adminAllowConsole(true), adminAllowObjects(true), adminQueueBytes(4 * 1024 * 1024) {}
 
     // Whether players' IPs and CD-key hashes go to WebAdmin.

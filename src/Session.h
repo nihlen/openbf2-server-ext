@@ -16,7 +16,8 @@ namespace serverext {
 class Session
 {
 public:
-    Session(Channel* channel, uint32_t conn) : m_channel(channel), m_conn(conn), m_helloSeen(false), m_frames(0) {}
+    Session(Channel* channel, uint32_t conn)
+        : m_channel(channel), m_conn(conn), m_helloSeen(false), m_version(0), m_frames(0) {}
 
     // Consumes received bytes and queues every complete, valid command.
     // @param reply Receives an Error frame to send before closing, if any.
@@ -34,6 +35,7 @@ private:
     Channel* m_channel;
     uint32_t m_conn;
     bool m_helloSeen;
+    uint16_t m_version;   // the Hello's protocol version
     uint64_t m_frames;
     proto::FrameDecoder m_decoder;
     proto::Frame m_frame;

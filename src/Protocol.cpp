@@ -272,6 +272,13 @@ bool parseSay(const std::vector<uint8_t>& p, SayMsg& out)
     return r.done();
 }
 
+bool parseStep(const std::vector<uint8_t>& p, uint32_t& ticks)
+{
+    Reader r(p.data(), p.size());
+    ticks = r.u32();
+    return r.done();
+}
+
 const char* checkSay(const SayMsg& m)
 {
     if (m.channel != 0 && m.channel != 1)
@@ -330,6 +337,7 @@ bool isClientMessage(uint16_t type)
     case MsgTeleport:
     case MsgSpot:
     case MsgSay:
+    case MsgStep:
     case MsgSetTargetDirection:
         return true;
     default:
@@ -341,12 +349,12 @@ namespace {
 std::string cut(const std::string& s, size_t n) { return s.size() > n ? s.substr(0, n) : s; }
 }
 
-void encodeWelcome(std::vector<uint8_t>& out, float tickRate, uint32_t tick, const std::string& map,
+void encodeWelcome(std::vector<uint8_t>& out, uint16_t version, float tickRate, uint32_t tick, const std::string& map,
                    const std::string& mode, float enterRange, float projectileRange, uint8_t features)
 {
     Writer w(out);
     w.begin(MsgWelcome);
-    w.u16(kVersion);
+    w.u16(version);
     w.f32(tickRate);
     w.u32(tick);
     w.str(map);

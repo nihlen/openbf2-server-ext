@@ -317,14 +317,15 @@ class Module : public IEventListener,
                public AdminHost,
                public IServerExtension::IDamageObserver,
                public IServerExtension::IProjectileObserver,
-               public IServerExtension::ISpotObserver
+               public IServerExtension::ISpotObserver,
+               public IServerExtension::ITickSource
 {
 public:
     Module()
         : m_em(0), m_ext(0), m_players(0), m_objects(0), m_game(0), m_server(0), m_system(0),
           m_tick(0), m_unloadSeen(false), m_mask(humanMappingMask()),
           m_rejectedInputs(0), m_lastRejectLog(0), m_scanKey(0), m_scanFull(true),
-          m_lastRestart(0), m_restarted(false), m_admin(0) {}
+          m_lastRestart(0), m_restarted(false), m_admin(0), m_stepOwnerLogged(0) {}
 
     bool init(ClassManager* cm)
     {
@@ -398,8 +399,34 @@ public:
              tickOk ? 1 : 0, handle, hudOk ? 1 : 0, chatOk ? 1 : 0, damageOk ? 1 : 0, projectileOk ? 1 : 0, spotOk ? 1 : 0,
              (void*)m_system);
         logLine("%s", m_admin ? m_admin->describe().c_str() : "admin channel: off (no adminConnect in serverext.cfg)");
+        // v4 stepped time (R3): installed once, for the life of the server (IServerExtension::setTickSource)
+        if (m_config.stepMode)
+        {
+            if (m_ext->setTickSource(this))
+            {
+                g_channel->enableStepping();
+                logLine("stepped time: on (serverext.cfg stepMode 1): real time until a sidecar steps");
+            }
+            else
+                logLine("stepped time: the engine refused the tick source; real time");
+        }
         // The listener is already up, so the module cannot back out once the hook is registered.
         return true;
+    }
+
+    // IServerExtension::ITickSource (R3): once per frame on the main thread
+    virtual int takeTicks(int maxTicks)
+    {
+        const uint32_t owner = g_channel->steppingConnection();
+        if (owner != m_stepOwnerLogged)
+        {
+            if (owner != 0)
+                logLine("tick %lu: connection %u steps the server", m_tick, owner);
+            else
+                logLine("tick %lu: stepping released: real time", m_tick);
+            m_stepOwnerLogged = owner;
+        }
+        return g_channel->takeTicks(maxTicks);
     }
 
     virtual void handleEvent(EventCategory category, unsigned int id, EventNode* node, void*)
@@ -778,9 +805,10 @@ private:
         const std::string map = m_game->getCurrentMapName();
         const std::string mode = m_game->getCurrentMapGameMode();
         const uint8_t features = (m_config.allowTeleport ? proto::kFeatureTeleport : 0) |
-                                 (m_config.allowRoundRestart ? proto::kFeatureRoundRestart : 0);
+                                 (m_config.allowRoundRestart ? proto::kFeatureRoundRestart : 0) |
+                                 (g_channel->steppingEnabled() ? proto::kFeatureStepping : 0);
         std::vector<uint8_t> f;
-        proto::encodeWelcome(f, kTickRate, static_cast<uint32_t>(m_tick), map, mode, m_config.enterRange,
+        proto::encodeWelcome(f, m.version, kTickRate, static_cast<uint32_t>(m_tick), map, mode, m_config.enterRange,
                              m_config.projectileRange, features);
         control(conn, f);
         Conn& c = m_conns[conn];
@@ -2204,6 +2232,7 @@ private:
     std::vector<uint8_t> m_stateBuf;
     CostStats m_cost;
     AdminChannel* m_admin;           // the admin channel, or null when adminConnect is not set
+    uint32_t m_stepOwnerLogged;   // the stepping connection last logged (R3)
 };
 
 } // namespace

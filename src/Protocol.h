@@ -12,7 +12,9 @@
 namespace serverext {
 namespace proto {
 
-const uint16_t kVersion = 3;
+const uint16_t kVersion = 4;
+// The oldest Hello version still accepted: v4 only adds Step (docs/protocol.md "v4: stepped time")
+const uint16_t kMinVersion = 3;
 const size_t kHeaderSize = 8;
 const uint32_t kMaxPayload = 64 * 1024;
 
@@ -31,6 +33,7 @@ enum MsgType : uint16_t
     MsgTeleport     = 0x0109,
     MsgSpot         = 0x010A,
     MsgSay          = 0x010B,   // bot chat (no version change, approved 2026-10-24)
+    MsgStep         = 0x010C,   // v4 stepped time (R3, approved 2026-10-27)
     MsgSetInput     = 0x0201,
     MsgSetTargetDirection = 0x0202,   // v3 item 3
     MsgTickState    = 0x0301,
@@ -203,6 +206,8 @@ bool parseRestartRound(const std::vector<uint8_t>& p, RestartRoundMsg& out);
 bool parseTeleport(const std::vector<uint8_t>& p, TeleportMsg& out);
 bool parseSpot(const std::vector<uint8_t>& p, SpotMsg& out);
 bool parseSay(const std::vector<uint8_t>& p, SayMsg& out);
+// v4 Step: the ticks granted (0 releases stepping)
+bool parseStep(const std::vector<uint8_t>& p, uint32_t& ticks);
 bool parseSetTargetDirection(const std::vector<uint8_t>& p, SetTargetDirectionMsg& out);
 
 // Checks a SetTargetDirection's values (v3 item 3): finite, both points inside the world (|x| and
@@ -221,8 +226,9 @@ bool isClientMessage(uint16_t type);
 // Welcome feature bits (v2).
 const uint8_t kFeatureTeleport = 1;
 const uint8_t kFeatureRoundRestart = 2;
+const uint8_t kFeatureStepping = 4;   // v4: serverext.cfg stepMode 1
 
-void encodeWelcome(std::vector<uint8_t>& out, float tickRate, uint32_t tick, const std::string& map,
+void encodeWelcome(std::vector<uint8_t>& out, uint16_t version, float tickRate, uint32_t tick, const std::string& map,
                    const std::string& mode, float enterRange, float projectileRange, uint8_t features);
 void encodeBotCreated(std::vector<uint8_t>& out, uint32_t requestId, uint8_t playerId);
 void encodeAck(std::vector<uint8_t>& out, uint32_t requestId);

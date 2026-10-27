@@ -195,6 +195,18 @@ bool parseConfig(const std::string& text, Config& out, std::vector<std::string>&
                 out.spawnBlockedSeconds = seconds;
             }
         }
+        else if (key == "stepMode")
+        {
+            if (value != "0" && value != "1")
+            {
+                diagnostics.push_back(std::string(where) + key + " must be 0 or 1, got '" + value + "'");
+                ok = false;
+            }
+            else
+            {
+                out.stepMode = value == "1";
+            }
+        }
         else if (key == "allowRoundRestart" || key == "allowTeleport")
         {
             if (value != "0" && value != "1")

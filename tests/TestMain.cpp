@@ -9,6 +9,8 @@
 #include <random>
 #include <string>
 #include <vector>
+#include <thread>
+#include <chrono>
 
 #include "Channel.h"
 #include "Config.h"
@@ -627,13 +629,13 @@ void testV2Encoders()
 void testEncoders()
 {
     std::vector<uint8_t> b;
-    encodeWelcome(b, 30.0f, 123, "dalian_2_v_2", "gpm_cq", 30.0f, 1000.0f, kFeatureTeleport);
+    encodeWelcome(b, 3, 30.0f, 123, "dalian_2_v_2", "gpm_cq", 30.0f, 1000.0f, kFeatureTeleport);
     FrameDecoder d;
     d.feed(b.data(), b.size());
     Frame f;
     CHECK(d.next(f) == FrameDecoder::GotFrame && f.type == MsgWelcome);
     Reader r(f.payload.data(), f.payload.size());
-    CHECK(r.u16() == 3);   // v3: the version is the only Welcome change
+    CHECK(r.u16() == 3);   // the client's version (v4 accepts v3 clients)
     CHECK(r.f32() == 30.0f);
     CHECK(r.u32() == 123);
     std::string map, mode;
@@ -886,6 +888,88 @@ void testConfig()
     }
 }
 
+std::vector<uint8_t> stepPayload(uint32_t ticks)
+{
+    std::vector<uint8_t> p;
+    Writer w(p);
+    w.u32(ticks);
+    return p;
+}
+
+// v4 stepped time (docs/protocol.md "v4: stepped time"): Step on the I/O thread, the budget, real time
+void testStepping()
+{
+    // Off (stepMode 0): Step is refused and closes
+    {
+        Channel ch;
+        Session s(&ch, 1);
+        std::vector<uint8_t> reply;
+        std::vector<uint8_t> h = frame(MsgHello, helloPayload(4, "x"));
+        std::vector<uint8_t> st = frame(MsgStep, stepPayload(1));
+        CHECK(s.onBytes(h.data(), h.size(), reply) && reply.empty());
+        CHECK(!s.onBytes(st.data(), st.size(), reply) && errorCode(reply) == ErrRefused);
+    }
+    // A v3 client: Hello accepted, Step is unknown
+    {
+        Channel ch;
+        ch.enableStepping();
+        Session s(&ch, 1);
+        std::vector<uint8_t> reply;
+        std::vector<uint8_t> h = frame(MsgHello, helloPayload(3, "x"));
+        std::vector<uint8_t> st = frame(MsgStep, stepPayload(1));
+        CHECK(s.onBytes(h.data(), h.size(), reply) && reply.empty());
+        CHECK(!s.onBytes(st.data(), st.size(), reply) && errorCode(reply) == ErrUnknownType);
+        CHECK(ch.steppingConnection() == 0);
+    }
+    // Lockstep: grants are counted, taken at most maxTicks a frame, and nothing runs without one
+    {
+        Channel ch;
+        ch.enableStepping();
+        Session a(&ch, 1), b(&ch, 2);
+        std::vector<uint8_t> reply;
+        std::vector<uint8_t> h = frame(MsgHello, helloPayload(4, "x"));
+        CHECK(a.onBytes(h.data(), h.size(), reply) && b.onBytes(h.data(), h.size(), reply) && reply.empty());
+        std::vector<uint8_t> one = frame(MsgStep, stepPayload(1)), many = frame(MsgStep, stepPayload(12));
+        CHECK(a.onBytes(one.data(), one.size(), reply) && reply.empty() && ch.steppingConnection() == 1);
+        CHECK(ch.takeTicks(10) == 1 && ch.takeTicks(10) == 0 && ch.takeTicks(10) == 0);
+        CHECK(a.onBytes(many.data(), many.size(), reply) && ch.takeTicks(10) == 10 && ch.takeTicks(10) == 2);
+        // Another connection can't step meanwhile
+        CHECK(!b.onBytes(one.data(), one.size(), reply) && errorCode(reply) == ErrRefused);
+        // The budget is capped
+        std::vector<uint8_t> huge = frame(MsgStep, stepPayload(0xFFFFFFFFu));
+        reply.clear();
+        CHECK(a.onBytes(huge.data(), huge.size(), reply) && reply.empty());
+        int total = 0;
+        for (int i = 0; i < 100; ++i)
+            total += ch.takeTicks(10);
+        CHECK(total == static_cast<int>(Channel::kMaxStepBudget));
+        // Malformed
+        std::vector<uint8_t> bad = frame(MsgStep, std::vector<uint8_t>(3, 0));
+        CHECK(!a.onBytes(bad.data(), bad.size(), reply) && errorCode(reply) == ErrMalformed);
+    }
+    // Step 0 and a close release: real time again, at most maxTicks a frame
+    {
+        Channel ch;
+        ch.enableStepping();
+        Session a(&ch, 1);
+        std::vector<uint8_t> reply;
+        std::vector<uint8_t> h = frame(MsgHello, helloPayload(4, "x"));
+        std::vector<uint8_t> one = frame(MsgStep, stepPayload(5)), zero = frame(MsgStep, stepPayload(0));
+        CHECK(a.onBytes(h.data(), h.size(), reply) && a.onBytes(one.data(), one.size(), reply) && ch.steppingConnection() == 1);
+        CHECK(a.onBytes(zero.data(), zero.size(), reply) && ch.steppingConnection() == 0);
+        CHECK(a.onBytes(one.data(), one.size(), reply) && ch.steppingConnection() == 1);
+        ch.closeConnection(1);
+        CHECK(ch.steppingConnection() == 0);
+        std::this_thread::sleep_for(std::chrono::milliseconds(120));
+        const int n = ch.takeTicks(10);
+        CHECK(n >= 2 && n <= 5);   // ~3.6 ticks of real time
+        CHECK(ch.takeTicks(10) <= 1);
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        CHECK(ch.takeTicks(10) == 10);   // a longer backlog is dropped
+        CHECK(ch.takeTicks(10) <= 1);
+    }
+}
+
 void testSession()
 {
     // Hello must come first.
@@ -919,7 +1003,7 @@ void testSession()
         Channel ch;
         Session s(&ch, 1);
         std::vector<uint8_t> reply;
-        std::vector<uint8_t> f = frame(MsgHello, helloPayload(4, "x"));
+        std::vector<uint8_t> f = frame(MsgHello, helloPayload(5, "x"));   // newer than the server
         CHECK(!s.onBytes(f.data(), f.size(), reply));
         CHECK(errorCode(reply) == ErrVersion);
     }
@@ -1357,6 +1441,7 @@ int main()
     testConditioning();
     testConfig();
     testSession();
+    testStepping();
     testFuzz();
     testChannel();
     testSpawnPlan();

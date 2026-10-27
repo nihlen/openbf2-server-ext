@@ -55,14 +55,16 @@ bool Session::handleFrame(const Frame& frame, std::vector<uint8_t>& reply)
             return fail(reply, ErrMalformed, "the first message must be Hello");
         if (!parseHello(frame.payload, c.hello))
             return fail(reply, ErrMalformed, "malformed Hello");
-        if (c.hello.version != kVersion)
+        if (c.hello.version < kMinVersion || c.hello.version > kVersion)
         {
-            char msg[80];
-            std::snprintf(msg, sizeof(msg), "protocol version %u is not supported; the server speaks %u",
-                          static_cast<unsigned>(c.hello.version), static_cast<unsigned>(kVersion));
+            char msg[96];
+            std::snprintf(msg, sizeof(msg), "protocol version %u is not supported; the server speaks %u to %u",
+                          static_cast<unsigned>(c.hello.version), static_cast<unsigned>(kMinVersion),
+                          static_cast<unsigned>(kVersion));
             return fail(reply, ErrVersion, msg);
         }
         m_helloSeen = true;
+        m_version = c.hello.version;
         c.kind = Command::Hello;
         return push(c, reply);
     }
@@ -111,6 +113,20 @@ bool Session::handleFrame(const Frame& frame, std::vector<uint8_t>& reply)
             return fail(reply, ErrMalformed, "malformed Say");
         c.kind = Command::Say;
         break;
+    case MsgStep:
+    {
+        // v4 stepped time: counted here on the I/O thread, after every frame before it was queued, because
+        // the main thread does not tick while the budget is empty (docs/protocol.md "v4: stepped time")
+        if (m_version < 4)
+            return fail(reply, ErrUnknownType, "Step needs protocol version 4");
+        uint32_t ticks = 0;
+        if (!parseStep(frame.payload, ticks))
+            return fail(reply, ErrMalformed, "malformed Step");
+        std::string refused;
+        if (!m_channel->step(m_conn, ticks, refused))
+            return fail(reply, ErrRefused, refused);
+        return true;
+    }
     case MsgSetTargetDirection:
         if (!parseSetTargetDirection(frame.payload, c.targetDirection))
             return fail(reply, ErrMalformed, "malformed SetTargetDirection");
