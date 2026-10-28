@@ -149,9 +149,10 @@ Live test (WSL server as above with the new engine and module, `tools/testclient
 The first run found one timing fault, fixed before the second: without a rewind the sweep meets a target where the
 tick leaves it, not where it started, so a sample's tested pose is then the next sample's current pose. Admin
 cost during the scan: p99 20 µs per tick, max 103 µs. `adminclient.py --fuzz`: pass. Not exercised: the per-tick
-collision cap (never reached), a human client, BF2WebAdmin (its C# codec does not know the new fields yet; the
-`PlayerState` field changes every frame that carries it, so WebAdmin must be updated before it runs against this
-module).
+collision cap (never reached), a human client, BF2WebAdmin end to end. Its C# codec decodes the new
+`PlayerState` field and both events (BF2WebAdmin `admin-channel` `ec8ef64`, golden frames byte for byte, 241 tests);
+it must be deployed together with this module, because the `PlayerState` field changes every frame that carries it.
+Nothing in WebAdmin subscribes to stream 20 yet.
 
 ## For the viewer
 
