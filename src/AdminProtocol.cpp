@@ -106,6 +106,16 @@ ProjectileState::ProjectileState()
     zero3(pos); zero3(rot); zero3(vel);
 }
 
+AimState::AimState() : player(0), flags(0)
+{
+    zero3(cameraPos); zero3(cameraRot); zero3(weaponPos); zero3(weaponRot);
+}
+
+WeaponFireEvent::WeaponFireEvent() : shooter(-1), rootNetId(0), rounds(0)
+{
+    zero3(origin); zero3(velocity);
+}
+
 ObjectInfo::ObjectInfo() : objectId(kNoObjectId), netId(0), health(-1.0f), flags(0)
 {
     zero3(pos); zero3(rot);
@@ -501,6 +511,26 @@ void encodeGameStream(std::vector<uint8_t>& out, uint32_t tick, double time, con
     w.finish();
 }
 
+void encodeAimStream(std::vector<uint8_t>& out, uint32_t tick, double time, const std::vector<AimState>& a)
+{
+    Writer w(out);
+    w.begin(MsgAimStream);
+    w.u32(tick);
+    w.f64(time);
+    const size_t n = a.size() > 255 ? 255 : a.size();
+    w.u8(static_cast<uint8_t>(n));
+    for (size_t k = 0; k < n; ++k)
+    {
+        w.u8(a[k].player);
+        w.u8(a[k].flags);
+        writeVec3(w, a[k].cameraPos);
+        writeVec3(w, a[k].cameraRot);
+        writeVec3(w, a[k].weaponPos);
+        writeVec3(w, a[k].weaponRot);
+    }
+    w.finish();
+}
+
 // ---------------------------------------------------------------- replies
 
 void encodeOk(std::vector<uint8_t>& out, uint32_t requestId)
@@ -840,6 +870,36 @@ void encodeBot(std::vector<uint8_t>& out, uint32_t seq, uint32_t tick, uint8_t p
     w.finish();
 }
 
+void encodeWeaponFire(std::vector<uint8_t>& out, uint32_t seq, uint32_t tick, const WeaponFireEvent& e)
+{
+    Writer w(out);
+    beginEvent(w, EvWeaponFire, seq, tick);
+    w.i16(e.shooter);
+    w.u32(e.rootNetId);
+    w.str(e.weapon);
+    w.str(e.projectile);
+    w.u8(e.rounds);
+    writeVec3(w, e.origin);
+    writeVec3(w, e.velocity);
+    w.finish();
+}
+
+void encodeWeapons(std::vector<uint8_t>& out, uint32_t seq, uint32_t tick, uint8_t player,
+                   const std::vector<WeaponSlot>& slots)
+{
+    Writer w(out);
+    beginEvent(w, EvWeapons, seq, tick);
+    w.u8(player);
+    const size_t n = slots.size() > kMaxWeaponSlots ? kMaxWeaponSlots : slots.size();
+    w.u8(static_cast<uint8_t>(n));
+    for (size_t k = 0; k < n; ++k)
+    {
+        w.u8(slots[k].slot);
+        w.str(slots[k].templateName);
+    }
+    w.finish();
+}
+
 // ---------------------------------------------------------------- inbound
 
 bool isWebAdminMessage(uint16_t type)
@@ -900,13 +960,16 @@ bool parseCommand(uint16_t type, const uint8_t* p, size_t n, Command& out, std::
         if (!r.done())
             return false;
         const uint8_t s = out.target;
-        const bool eventStream = s == StreamDamageEvents || s == StreamProjectileEvents;
-        if (s != StreamPlayers && s != StreamVehicles && s != StreamProjectiles && s != StreamGame && !eventStream)
+        const bool eventStream = s == StreamDamageEvents || s == StreamProjectileEvents ||
+                                 s == StreamWeaponFireEvents || s == StreamWeaponEvents;
+        if (s != StreamPlayers && s != StreamVehicles && s != StreamProjectiles && s != StreamGame && s != StreamAim &&
+            !eventStream)
             return bad(badValue, "unknown stream");
         if (!eventStream && (out.value8 < 1 || out.value8 > 30))
             return bad(badValue, "rate must be 1..30 Hz");
         const bool needsFilters = s == StreamProjectiles || s == StreamProjectileEvents;
-        if (needsFilters ? out.filters.empty() : !out.filters.empty())
+        const bool anyFilters = s == StreamWeaponFireEvents;
+        if (!anyFilters && (needsFilters ? out.filters.empty() : !out.filters.empty()))
             return bad(badValue, needsFilters ? "this stream needs at least one template filter"
                                               : "this stream takes no filters");
         if (out.filters.size() > kMaxFilters)

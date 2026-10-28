@@ -2906,7 +2906,78 @@ def run_q12(args):
     return cl.finish()
 
 
-SCENARIOS_V3 = {"burst": run_burst, "tv": run_tv, "soak3": run_soak3, "q12": run_q12}
+def run_viewer(args):
+    """Drives the admin channel's viewer additions (adminclient.py --scenario viewer reads them): a pilot
+    and a gunner share a heli over the sea. The pilot cycles its camera views, fires rockets and flares;
+    the gunner sweeps its turret, fires its gun, cycles its views and toggles to the TV launcher and back."""
+    cl = Client(args, "serverext testclient viewer")
+    pilot = cl.create_bot(args.name, args.team)
+    gunner = cl.create_bot(args.name + " gunner", args.team)
+    cl.check("pilot spawned", cl.wait_alive(pilot))
+    if not cl.check("pilot boarded", ensure_boarded(cl, pilot, args.team, "pilot")):
+        return cl.finish()
+    heli = cl.states[pilot]["root"]
+    if not cl.check("gunner boarded seat 1", ensure_boarded(cl, gunner, args.team, "gunner", seat=1, vehicle_id=heli,
+                                                            spinup=0.5)):
+        return cl.finish()
+    cl.pulses[pilot] = BTN_WEAPON[0]
+    cl.run_for(1.0)
+    pad = cl.states[pilot]["pos"]
+    hdg = seaward(pad)
+    ap = Autopilot()
+    alt = pad[1] + 60.0
+    if not climb_to(cl, pilot, ap, alt, "viewer", heading=hdg):
+        return cl.finish()
+    t0 = time.time()
+    seconds = args.viewer_seconds
+    # (seconds into the run, bot, one-tick button)
+    pulses = [(2, pilot, BTN_CAMERA_MODE[1]), (4, pilot, BTN_CAMERA_MODE[2]), (6, pilot, BTN_CAMERA_MODE[3]),
+              (8, pilot, BTN_CAMERA_MODE[0]), (3, pilot, BTN_FLARE), (25, pilot, BTN_FLARE),
+              (16, gunner, BTN_TOGGLE_CAMERA), (18, gunner, BTN_CAMERA_MODE[0]),
+              (28, gunner, BTN_ALT_FIRE), (32, gunner, BTN_ALT_FIRE)]
+    done = set()
+    flown = dict(rockets=0, gun=0)
+
+    def ctl():
+        t = time.time() - t0
+        e = cl.states.get(pilot)
+        if e and cl.in_vehicle(pilot):
+            buttons = 0
+            mode = dict(alt=alt, heading=hdg)
+            if 5.0 < t < 8.0:
+                mode["pitch_cmd"] = 10.0   # nose down only while the rockets fire
+                if cl.tick % 6 < 3:
+                    buttons |= BTN_FIRE
+                    flown["rockets"] += 1
+            cp, cr, c, ped = ap.step(e, cl.tick, **mode)
+            cl.inputs[pilot] = dict(pitch=cp, roll=cr, coll=c, ped=ped, buttons=buttons)
+        if cl.in_vehicle(gunner):
+            buttons = 0
+            if 10.0 < t < 14.0 or 20.0 < t < 24.0:
+                buttons |= BTN_FIRE
+                flown["gun"] += 1
+            cl.inputs[gunner] = dict(look_yaw=0.4 * math.sin(t * 0.8), look_pitch=0.3 * math.sin(t * 0.5),
+                                     buttons=buttons)
+        for i, (at, bot, btn) in enumerate(pulses):
+            if i not in done and t >= at:
+                done.add(i)
+                cl.pulses[bot] = btn
+                log(f"viewer t={t:.1f}: bot {bot} button {btn:#x}")
+
+    cl.before_send = ctl
+    try:
+        while time.time() - t0 < seconds:
+            cl.pump(0.2)
+    finally:
+        cl.before_send = None
+        cl.inputs[pilot] = {}
+        cl.inputs[gunner] = {}
+    log(f"viewer: fire held for {flown['rockets']} pilot ticks and {flown['gun']} gunner ticks")
+    cl.check("both bots still seated", cl.in_vehicle(pilot) and cl.in_vehicle(gunner))
+    return cl.finish()
+
+
+SCENARIOS_V3 = {"burst": run_burst, "tv": run_tv, "soak3": run_soak3, "q12": run_q12, "viewer": run_viewer}
 
 
 # ------------------------------------------------------------------------------------- fuzz
@@ -3179,7 +3250,7 @@ def main():
     ap.add_argument("--vehicle-log-every", type=float, default=60.0, help="seconds between VehicleList summaries")
     ap.add_argument("--scenario", choices=["hover", "walk", "buttons", "blockpad", "allblocked", "wreck", "q9", "q5", "teamswitch",
                                            "view", "weapons", "damage", "spot", "round", "teleport", "multiconn", "soak2",
-                                           "burst", "tv", "soak3", "q12"],
+                                           "burst", "tv", "soak3", "q12", "viewer"],
                     default="hover")
     ap.add_argument("--rcon-port", type=int, default=4723, help="q9: ModManager RCON port")
     ap.add_argument("--rcon-password", default="", help="q9: ModManager RCON password")
@@ -3212,6 +3283,7 @@ def main():
     ap.add_argument("--max-connections", type=int, default=4, help="multiconn/fuzz: the server's maxConnections")
     ap.add_argument("--expect-teleport-refused", action="store_true", help="teleport/fuzz: the server has allowTeleport 0")
     ap.add_argument("--soak-seconds", type=float, default=600.0)
+    ap.add_argument("--viewer-seconds", type=float, default=40.0, help="viewer: seconds of firing and camera changes")
     ap.add_argument("--burst-presses", type=int, default=60, help="burst: one-tick camera presses per pattern")
     ap.add_argument("--tv-target", action="store_true", help="tv: also steer a missile onto an own bot of the other team")
     ap.add_argument("--tv-range", type=float, default=250.0, help="tv: metres from the heli to the aim points")

@@ -8,6 +8,10 @@ phase 2 (C#) builds against it. **Phase 2 implemented 2026-10-23** in BF2WebAdmi
 the BF2WebAdmin localtest with an OpenBF2 container (OpenBF2 `873d1b1`, module `0aab582`, Debian 11
 with OpenSSL 1.1.1w) and bots. It replaces draft 1, which kept
 `mm_webadmin.py`'s text protocol.
+**Viewer additions approved by the author on 2026-10-28** (for a 3D viewer in WebAdmin): the view mode in
+`PlayerState`, the aim stream (5), and the `WeaponFire` (18) and `Weapons` (19) event streams. The admin
+protocol version stays 1; module and WebAdmin are deployed together. Implemented and tested on a WSL server
+with a firing bot crew: `docs/findings/admin-viewer.md`.
 The author has decided that the BF2WebAdmin C# side may change as much as needed, and that the
 author keeps deployments from running `mm_webadmin.py` and the native channel at the same time.
 Evidence for the engine side: `docs/findings/admin-channel-a1-a4.md`. Inventory of today's
@@ -445,6 +449,28 @@ seats that is not a soldier or a camera, including pooled entries at 0/0/0 with 
 Only projectiles whose template is in a projectile subscription are tracked (`Subscribe` stream 3 or
 17), at most 256 at once.
 
+**`AimState`** (per living player, in `AimStream`; added 2026-10-28 for a 3D viewer)
+
+| Type | Field |
+|---|---|
+| `u8` | player id |
+| `u8` | flags: bit 0 the camera fields are set, bit 1 the weapon fields are set |
+| `Vec3` | camera position: the absolute transform of the player's camera object (`IPlayer::getCamera()` as `IObject`), 0/0/0 without bit 0 |
+| `Rot` | camera rotation, the same matrix |
+| `Vec3` | weapon position: the absolute transform of the active weapon in slot 0 of the player's seat (`IPlayerControlObject::getActiveWeapon(0)`; on foot the soldier's), 0/0/0 without bit 1 |
+| `Rot` | weapon rotation, the same matrix |
+
+- These are the two transforms the server fires along (`FireComp::getProjectileOrigin`,
+  `Game/Objects/Weapons/FireComponents/FireComp.cpp:807-865`): the weapon's own, or the camera object's
+  when the weapon fires in camera DOF (`fire.fireInCameraDof`) or the shooter is a soldier. The template's
+  `projectileStartPosition` offset is added to it (`:874-885`) and is not included here.
+- The camera is the server's copy of the view (see the view mode under `PlayerState`): the eye in views 1 and 2, the
+  external camera in views 3-7.
+- Open: whether a soldier's weapon transform follows its aim pitch on the server. Soldiers fire from the camera
+  object, so a viewer should use the camera for a soldier's aim.
+
+**`WeaponSlot`** (in `Weapons`): `u8` slot (0-2), string weapon template.
+
 **`0x1101 Snapshot`** (module → WebAdmin): after `Welcome`, and in reply to `RequestSnapshot`.
 
 | Type | Field |
@@ -466,10 +492,12 @@ Only projectiles whose template is in a projectile subscription are tracked (`Su
 | Type | Field |
 |---|---|
 | `u32` | request id |
-| `u8` | stream: 1 players, 2 vehicles, 3 projectiles, 4 game; event streams 16 `Damage`, 17 `ProjectileFired`/`ProjectileHit` |
-| `u8` | rate, Hz, 1..30 (ignored for 16 and 17) |
+| `u8` | stream: 1 players, 2 vehicles, 3 projectiles, 4 game, 5 aim; event streams 16 `Damage`, 17 `ProjectileFired`/`ProjectileHit`, 18 `WeaponFire`, 19 `Weapons` |
+| `u8` | rate, Hz, 1..30 (ignored for 16-19) |
 | `u8` | filters F |
-| F × string | template names, compared without case. Streams 3 and 17 need at least one; the others take none |
+| F × string | template names, compared without case. Streams 3 and 17 need at least one; stream 18 takes any number (none: every launch; else launches whose weapon or projectile template matches one); the others take none |
+
+Subscribing to stream 19 reports every player's weapons at once (below).
 
 A new `Subscribe` for a stream replaces the old one. The module sends a stream frame every
 `round(30 / rate)` ticks.
@@ -484,6 +512,7 @@ A new `Subscribe` for a stream replaces the old one. The module sends a stream f
 | `0x1112 VehicleStream` | `u32` tick, `f64` time, `u16` N, N × `VehicleState` |
 | `0x1113 ProjectileStream` | `u32` tick, `f64` time, `u16` N, N × `ProjectileState` |
 | `0x1114 GameStream` | `u32` tick, `f64` time, `GameState` |
+| `0x1115 AimStream` | `u32` tick, `f64` time, `u8` N, N × `AimState` (living players only) |
 
 #### Events (`0x12xx`, module → WebAdmin)
 
@@ -515,6 +544,25 @@ reads the objects during the callback, before Python's handlers run.
 | `0x1214` | Kick | `u8` player, string name | R4 17 (`BanList::alertOnKicked`: every kick, ban and vote kick) |
 | `0x1215` | Ban | `u8` player, string name, `u8` ban type (0 timed, 1 permanent, 2 round), `u32` expiry (Unix time; 0 permanent) | R4 16 (`BanList::alertOnBanned`) |
 | `0x1216` | Bot | `u8` player, `u8` kind (1 created, 2 removed, 3 team change), `u8` team, `u32` bot-channel connection | the module's bot channel |
+| `0x1217` | WeaponFire | see below; only while subscribed (stream 18) | the v2 projectile observer |
+| `0x1218` | Weapons | `u8` player, `u8` W, W × `WeaponSlot`: the weapons in the active slots 0-2 of the player's seat (on foot the soldier's), as the bot channel's weapon list; W = 0 when dead | only while subscribed (stream 19): polled per tick, sent when a player's set changes, and for every player on `Subscribe` and after every `Snapshot` |
+
+**`WeaponFire`** (one per shooter and weapon per tick in which it launched; added 2026-10-28):
+
+| Type | Field |
+|---|---|
+| `i16` | shooter player, -1 if none |
+| `u32` | networkable id of the shooter's root vehicle (the launching vehicle's root), 0 if none |
+| string | weapon template (the projectile's launcher weapon), empty if none |
+| string | projectile template |
+| `u8` | rounds: projectiles this weapon launched in the tick, batches (shotguns) included, at most 255 |
+| `Vec3` | origin: the first of them at launch |
+| `Vec3` | velocity: the first one's at launch, the muzzle velocity plus the vehicle's (`FireComp.cpp:941-956`) |
+
+- The source is the projectile observer in `FireComp::setupProjectile` (`FireComp.cpp:1120-1129`): every projectile
+  the server launches, bullets and flares included (the 2v2 helis' `*_FlareLauncher` are `GenericFireArm`s with a
+  `GenericProjectile`). Tracer copies are made after it and are not counted (`:1131-1160`).
+- The event's tick is the tick of the launch. The module sends it with its next tick's events.
 
 **`Kill`** (for one victim, `Kill` precedes `Death`: the engine raises event 1 before it calls
 `killPlayer`, `GameLogicDamage.cpp:484-507`):

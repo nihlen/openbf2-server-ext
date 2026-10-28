@@ -24,6 +24,7 @@
 #include "Game/IGame.h"
 #include "Game/IGameServer.h"
 #include "Game/Objects/IControlPoint.h"
+#include "Game/Objects/IWeaponObject.h"
 #include "IO/Console/Console.h"
 #include "Physics/IPhysicsNode.h"
 #include "Scene/Object/ObjectManager.h"
@@ -55,6 +56,7 @@ const unsigned int kUnloadHudEventId = 3;     // ECHud: GameServer::unload
 const int kStatusPlaying = 1, kStatusEndGame = 2, kStatusPaused = 4;
 const size_t kMaxCommandsPerTick = 64;
 const size_t kMaxTrackedProjectiles = 256;
+const size_t kMaxPendingFires = 512;      // WeaponFire aggregates per tick; more are dropped and counted
 const unsigned int kCachedObjectFlag = 0x20;
 const uint32_t kNoNetIdBase = 0x10000;
 const unsigned long kStatsPeriodTicks = 1800;
@@ -175,7 +177,8 @@ public:
         : m_config(config), m_host(host), m_logFn(log), m_em(0), m_ext(0), m_players(0), m_objects(0), m_game(0),
           m_server(0), m_system(0), m_console(0), m_templates(0), m_link(0), m_io(0), m_session(0), m_seq(0),
           m_tick(0), m_lastStatus(-2), m_lastBeginRound(-2), m_cpsScanned(false), m_lastCpScan(0), m_damageEvents(false),
-          m_projectileEvents(false), m_r4(false), m_eventsSent(0), m_eventsDropped(0), m_commands(0)
+          m_projectileEvents(false), m_fireEvents(false), m_weaponEvents(false), m_firesDropped(0), m_r4(false),
+          m_eventsSent(0), m_eventsDropped(0), m_commands(0)
     {
         for (int i = 0; i < kCategories; ++i)
             m_bytes[i] = 0;
@@ -256,9 +259,14 @@ public:
                 scanControlPoints();
             flushControlPointEvents();
             pollPlayers();
+            flushFireEvents();
+            if (m_weaponEvents)
+                pollWeapons();
             updateProjectiles();
             sendStreams();
         }
+        else
+            m_fires.clear();
         const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
         m_cost.add(us);
         if (m_tick % kStatsPeriodTicks == 0)
@@ -284,6 +292,7 @@ public:
             m_cpEvents.clear();
             m_cpsScanned = false;
             m_projectiles.clear();
+            m_fires.clear();
             logf("tick %lu: admin: level unload; control points and projectiles forgotten", m_tick);
             return;
         }
@@ -366,11 +375,15 @@ public:
         event(f);
     }
 
-    virtual void onProjectileLaunched(IObject* projectile, world::IPlayer*)
+    virtual void onProjectileLaunched(IObject* projectile, world::IPlayer* shooter)
     {
-        if (!m_session || !projectile || m_projectiles.size() >= kMaxTrackedProjectiles)
+        if (!m_session || !projectile)
             return;
         const std::string name = templateName(projectile);
+        if (m_fireEvents)
+            addFire(projectile, shooter, name);
+        if (m_projectiles.size() >= kMaxTrackedProjectiles)
+            return;
         const bool streamed = m_streams[StreamProjectiles].on && contains(m_streams[StreamProjectiles].filters, name);
         const bool evented = m_projectileEvents && contains(m_projectileEventFilters, name);
         if (!streamed && !evented)
@@ -428,6 +441,25 @@ private:
         int16_t owner;
     };
 
+    // One WeaponFire event being gathered: a shooter's launches from one weapon in one tick.
+    struct PendingFire
+    {
+        world::IPlayer* shooter;   // identity only
+        IObject* weapon;           // identity only
+        uint32_t tick;
+        std::string projectileTemplate;   // engine bytes, the aggregation key
+        WeaponFireEvent e;
+    };
+
+    // The weapons last reported for a player (Weapons event).
+    struct WeaponTrack
+    {
+        world::IPlayer* player;        // identity only
+        IObject* weapons[kMaxWeaponSlots];
+        bool reported;
+        WeaponTrack() : player(0), reported(false) { for (size_t i = 0; i < kMaxWeaponSlots; ++i) weapons[i] = 0; }
+    };
+
     struct StreamSub
     {
         bool on;
@@ -437,7 +469,8 @@ private:
         StreamSub() : on(false), period(1), due(0) {}
     };
 
-    enum Category { CatEvents = 0, CatReplies, CatPlayers, CatVehicles, CatProjectiles, CatGame, kCategories };
+    enum Category { CatEvents = 0, CatReplies, CatPlayers, CatVehicles, CatProjectiles, CatGame, CatAim, CatFire,
+                    kCategories };
 
     // ---------------------------------------------------------------- logging and output
 
@@ -495,11 +528,13 @@ private:
     void reportStats()
     {
         const double seconds = kStatsPeriodTicks / 30.0;
-        logf("tick %lu: admin: session %u, events %llu sent %llu dropped, commands %llu; B/s events %.0f replies %.0f players %.0f vehicles %.0f projectiles %.0f game %.0f; admin cost (us) p50 %.0f p99 %.0f max %.0f",
+        logf("tick %lu: admin: session %u, events %llu sent %llu dropped, commands %llu; B/s events %.0f (fire %.0f) replies %.0f players %.0f vehicles %.0f projectiles %.0f game %.0f aim %.0f; fires dropped %llu; admin cost (us) p50 %.0f p99 %.0f max %.0f",
              m_tick, m_session, static_cast<unsigned long long>(m_eventsSent), static_cast<unsigned long long>(m_eventsDropped),
-             static_cast<unsigned long long>(m_commands), m_bytes[CatEvents] / seconds, m_bytes[CatReplies] / seconds,
-             m_bytes[CatPlayers] / seconds, m_bytes[CatVehicles] / seconds, m_bytes[CatProjectiles] / seconds,
-             m_bytes[CatGame] / seconds, m_cost.pct(0.5), m_cost.pct(0.99), m_cost.max());
+             static_cast<unsigned long long>(m_commands), m_bytes[CatEvents] / seconds, m_bytes[CatFire] / seconds,
+             m_bytes[CatReplies] / seconds, m_bytes[CatPlayers] / seconds, m_bytes[CatVehicles] / seconds,
+             m_bytes[CatProjectiles] / seconds, m_bytes[CatGame] / seconds, m_bytes[CatAim] / seconds,
+             static_cast<unsigned long long>(m_firesDropped), m_cost.pct(0.5), m_cost.pct(0.99), m_cost.max());
+        m_firesDropped = 0;
         for (int i = 0; i < kCategories; ++i)
             m_bytes[i] = 0;
         m_cost.reset();
@@ -804,10 +839,12 @@ private:
         m_session = session;
         m_seq = 0;
         m_pending.clear();
-        for (int i = 0; i < 5; ++i)
+        for (int i = 0; i <= StreamAim; ++i)
             m_streams[i] = StreamSub();
-        m_damageEvents = m_projectileEvents = false;
+        m_damageEvents = m_projectileEvents = m_fireEvents = m_weaponEvents = false;
         m_projectileEventFilters.clear();
+        m_fireFilters.clear();
+        m_fires.clear();
         m_projectiles.clear();
         m_lastStatus = m_ext->getGameStatus();
         m_lastBeginRound = m_ext->getBeginRoundState();
@@ -878,6 +915,7 @@ private:
         m_session = 0;
         m_pending.clear();
         m_projectiles.clear();
+        m_fires.clear();
     }
 
     void baseline(world::IPlayer* p, Track& t)
@@ -928,6 +966,7 @@ private:
         encodeSnapshot(f, requestId, m_seq, tickNumber(), now(), g, players, vehicles, cps, projectiles);
         const size_t n = f.size();
         reply(f);
+        forgetWeapons();   // the next pollWeapons reports every player again
         return n;
     }
 
@@ -1171,6 +1210,159 @@ private:
             m_frame.clear();
             encodeGameStream(m_frame, t, time, g);
             latest(AdminLink::SlotGame, CatGame);
+        }
+        if (due(StreamAim))
+        {
+            m_aims.clear();
+            const std::list<world::IPlayer*>& players = m_players->getPlayers();
+            for (std::list<world::IPlayer*>::const_iterator it = players.begin(); it != players.end(); ++it)
+            {
+                if (!*it || !(*it)->getIsAlive())
+                    continue;
+                m_aims.push_back(AimState());
+                fillAim(*it, m_aims.back());
+            }
+            m_frame.clear();
+            encodeAimStream(m_frame, t, time, m_aims);
+            latest(AdminLink::SlotAim, CatAim);
+        }
+    }
+
+    // ---------------------------------------------------------------- aim and weapons
+
+    // The PCO of the object the player controls (its seat, or its soldier on foot); null for a camera.
+    static IPlayerControlObject* holderPco(world::IPlayer* p)
+    {
+        IObject* holder = p->getVehicle();
+        if (!holder || holder->queryInterface(IID_ICameraObject))
+            return 0;
+        return static_cast<IPlayerControlObject*>(holder->queryInterface(IID_IPlayerControlObject));
+    }
+
+    void fillAim(world::IPlayer* p, AimState& a)
+    {
+        a.player = static_cast<uint8_t>(p->getId());
+        world::ICameraObject* cam = p->getCamera();
+        IObject* camObject = cam ? static_cast<IObject*>(cam->queryInterface(IID_IObject)) : 0;
+        if (camObject)
+        {
+            placeOf(camObject, a.cameraPos, a.cameraRot);
+            a.flags |= kAimCamera;
+        }
+        IPlayerControlObject* pco = holderPco(p);
+        IObject* weapon = pco ? pco->getActiveWeapon(0) : 0;
+        if (weapon)
+        {
+            placeOf(weapon, a.weaponPos, a.weaponRot);
+            a.flags |= kAimWeapon;
+        }
+    }
+
+    // Runs inside the fire path: adds the launch to this tick's WeaponFire for its shooter and weapon.
+    void addFire(IObject* projectile, world::IPlayer* shooter, const std::string& projectileTemplate)
+    {
+        IServerExtension::ProjectileInfo info;
+        info.launcherWeapon = info.launcherVehicle = 0;
+        info.ownerPlayerId = -1;
+        if (!m_ext->getProjectileInfo(projectile, info))
+            return;
+        const uint32_t tick = static_cast<uint32_t>(m_tick);   // the next handler's tickNumber()
+        for (size_t i = 0; i < m_fires.size(); ++i)
+        {
+            PendingFire& f = m_fires[i];
+            if (f.shooter == shooter && f.weapon == info.launcherWeapon && f.tick == tick &&
+                f.projectileTemplate == projectileTemplate)
+            {
+                if (f.e.rounds < 255)
+                    ++f.e.rounds;
+                return;
+            }
+        }
+        const std::string weaponTemplate = templateName(info.launcherWeapon);
+        if (!m_fireFilters.empty() && !contains(m_fireFilters, weaponTemplate) &&
+            !contains(m_fireFilters, projectileTemplate))
+            return;
+        if (m_fires.size() >= kMaxPendingFires)
+        {
+            ++m_firesDropped;
+            return;
+        }
+        m_fires.push_back(PendingFire());
+        PendingFire& f = m_fires.back();
+        f.shooter = shooter;
+        f.weapon = info.launcherWeapon;
+        f.tick = tick;
+        f.projectileTemplate = projectileTemplate;
+        const int shooterId = shooter ? shooter->getId() : info.ownerPlayerId;
+        f.e.shooter = static_cast<int16_t>(shooterId >= 0 && shooterId <= 255 ? shooterId : -1);
+        f.e.rootNetId = netIdOf(rootOf(info.launcherVehicle));
+        f.e.weapon = cp1252ToUtf8(weaponTemplate);
+        f.e.projectile = cp1252ToUtf8(projectileTemplate);
+        f.e.rounds = 1;
+        const Mat4& m = projectile->getAbsoluteTransformation();
+        f.e.origin[0] = m.m[12]; f.e.origin[1] = m.m[13]; f.e.origin[2] = m.m[14];
+        velocityOf(projectile, f.e.velocity);
+    }
+
+    void flushFireEvents()
+    {
+        for (size_t i = 0; i < m_fires.size(); ++i)
+        {
+            std::vector<uint8_t> f;
+            encodeWeaponFire(f, ++m_seq, m_fires[i].tick, m_fires[i].e);
+            m_bytes[CatFire] += f.size();
+            event(f);
+        }
+        m_fires.clear();
+    }
+
+    void forgetWeapons()
+    {
+        for (size_t i = 0; i < 256; ++i)
+            m_weaponTracks[i] = WeaponTrack();
+    }
+
+    // Reports each player whose active weapons changed since the last report (by object identity).
+    void pollWeapons()
+    {
+        const std::list<world::IPlayer*>& players = m_players->getPlayers();
+        for (std::list<world::IPlayer*>::const_iterator it = players.begin(); it != players.end(); ++it)
+        {
+            world::IPlayer* p = *it;
+            if (!p)
+                continue;
+            const int id = p->getId();
+            if (id < 0 || id > 255)
+                continue;
+            IObject* current[kMaxWeaponSlots] = { 0, 0, 0 };
+            IPlayerControlObject* pco = p->getIsAlive() ? holderPco(p) : 0;
+            if (pco)
+                for (size_t s = 0; s < kMaxWeaponSlots; ++s)
+                {
+                    IObject* w = pco->getActiveWeapon(static_cast<int>(s));
+                    current[s] = w && w->queryInterface(IID_IWeaponObject) ? w : 0;
+                }
+            WeaponTrack& t = m_weaponTracks[id];
+            bool same = t.reported && t.player == p;
+            for (size_t s = 0; same && s < kMaxWeaponSlots; ++s)
+                same = t.weapons[s] == current[s];
+            if (same)
+                continue;
+            t.player = p;
+            t.reported = true;
+            std::vector<WeaponSlot> slots;
+            for (size_t s = 0; s < kMaxWeaponSlots; ++s)
+            {
+                t.weapons[s] = current[s];
+                if (!current[s])
+                    continue;
+                slots.push_back(WeaponSlot());
+                slots.back().slot = static_cast<uint8_t>(s);
+                slots.back().templateName = cp1252ToUtf8(templateName(current[s]));
+            }
+            std::vector<uint8_t> f;
+            encodeWeapons(f, ++m_seq, tickNumber(), static_cast<uint8_t>(id), slots);
+            event(f);
         }
     }
 
@@ -1551,6 +1743,16 @@ private:
             m_projectileEvents = true;
             m_projectileEventFilters = filters;
         }
+        else if (c.target == StreamWeaponFireEvents)
+        {
+            m_fireEvents = true;
+            m_fireFilters = filters;
+        }
+        else if (c.target == StreamWeaponEvents)
+        {
+            m_weaponEvents = true;
+            forgetWeapons();   // this tick's pollWeapons, after the Ok, reports every player
+        }
         else
         {
             StreamSub& s = m_streams[c.target];
@@ -1575,7 +1777,15 @@ private:
             m_projectileEvents = false;
             m_projectileEventFilters.clear();
         }
-        else if (c.target >= StreamPlayers && c.target <= StreamGame)
+        else if (c.target == StreamWeaponFireEvents)
+        {
+            m_fireEvents = false;
+            m_fireFilters.clear();
+            m_fires.clear();
+        }
+        else if (c.target == StreamWeaponEvents)
+            m_weaponEvents = false;
+        else if (c.target >= StreamPlayers && c.target <= StreamAim)
             m_streams[c.target] = StreamSub();
         else
         {
@@ -2060,7 +2270,7 @@ private:
     int m_lastBeginRound;
     std::deque<Command> m_inbox;
     std::deque<Command> m_pending;
-    StreamSub m_streams[5];       // indexed by stream 1..4
+    StreamSub m_streams[StreamAim + 1];   // indexed by stream 1..5
     std::map<int, Track> m_tracks;
     std::vector<int> m_seen;
     std::vector<ControlPoint> m_cps;
@@ -2072,6 +2282,13 @@ private:
     bool m_damageEvents;
     bool m_projectileEvents;
     std::vector<std::string> m_projectileEventFilters;
+    bool m_fireEvents;
+    bool m_weaponEvents;
+    std::vector<std::string> m_fireFilters;   // lowered; empty: every launch
+    std::vector<PendingFire> m_fires;
+    uint64_t m_firesDropped;
+    WeaponTrack m_weaponTracks[256];
+    std::vector<AimState> m_aims;
     bool m_r4;
 
     std::vector<IObject*> m_vehicleRoots;

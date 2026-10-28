@@ -453,6 +453,27 @@ void testSnapshotAndStreams()
     out.clear();
     encodePlayerStream(out, 5, 1.0, manyIds, many);
     CHECK(out.size() == 8 + 13 + 64 * 57);
+
+    // Aim: 50 bytes per living player.
+    std::vector<AimState> aims(2);
+    aims[0].player = 7; aims[0].flags = kAimCamera | kAimWeapon;
+    aims[0].cameraPos[1] = 100.0f; aims[0].weaponRot[0] = 90.0f;
+    aims[1].player = 255;
+    out.clear();
+    encodeAimStream(out, 5, 1.0, aims);
+    f = frames(out);
+    CHECK(f.size() == 1 && f[0].type == MsgAimStream && f[0].payload.size() == 4 + 8 + 1 + 2 * 50);
+    {
+        Reader r(&f[0].payload[0], f[0].payload.size());
+        CHECK(r.u32() == 5 && r.f64() == 1.0 && r.u8() == 2 && r.u8() == 7 && r.u8() == 3);
+        float v[3];
+        readVec3(r, v);
+        CHECK(v[1] == 100.0f);
+        readVec3(r, v);
+        readVec3(r, v);
+        readVec3(r, v);
+        CHECK(v[0] == 90.0f && r.u8() == 255 && r.u8() == 0);
+    }
 }
 
 void testEvents()
@@ -498,21 +519,51 @@ void testEvents()
     encodeKick(out, 20, 10, 3, "x");
     encodeBan(out, 21, 10, 3, "x", 1, 0);
     encodeBot(out, 22, 10, 255, BotCreated, 1, 2);
+    WeaponFireEvent fire;
+    fire.shooter = 255; fire.rootNetId = 1819; fire.weapon = "ahe_z10_30mm"; fire.projectile = "ahe_z10_30mm_projectile";
+    fire.rounds = 2;
+    encodeWeaponFire(out, 23, 10, fire);
+    std::vector<WeaponSlot> slots(2);
+    slots[0].slot = 0; slots[0].templateName = "ahe_z10_30mm";
+    slots[1].slot = 1; slots[1].templateName = "ahe_z10_FlareLauncher";
+    encodeWeapons(out, 24, 10, 255, slots);
     const std::vector<proto::Frame> f = frames(out);
-    CHECK(f.size() == 22);
+    CHECK(f.size() == 24);
     for (size_t i = 0; i < f.size(); ++i)
     {
         Reader r(&f[i].payload[0], f[i].payload.size());
         CHECK(r.u32() == i + 1 && r.u32() == 10);
-        CHECK(f[i].type >= 0x1201 && f[i].type <= 0x1216);
+        CHECK(f[i].type >= 0x1201 && f[i].type <= 0x1218);
     }
     // Event types in table order.
-    const uint16_t expected[22] = { EvGameState, EvRoundStart, EvRoundEnd, EvPlayerConnect, EvPlayerDisconnect, EvSpawn,
+    const uint16_t expected[24] = { EvGameState, EvRoundStart, EvRoundEnd, EvPlayerConnect, EvPlayerDisconnect, EvSpawn,
                                     EvDeath, EvRevive, EvTeamChange, EvScoreChange, EvKill, EvDamage, EvEnterVehicle,
                                     EvExitVehicle, EvVehicleDestroyed, EvControlPoint, EvChat, EvProjectileFired,
-                                    EvProjectileHit, EvKick, EvBan, EvBot };
-    for (size_t i = 0; i < f.size() && i < 22; ++i)
+                                    EvProjectileHit, EvKick, EvBan, EvBot, EvWeaponFire, EvWeapons };
+    for (size_t i = 0; i < f.size() && i < 24; ++i)
         CHECK(f[i].type == expected[i]);
+    {
+        Reader r(&f[22].payload[8], f[22].payload.size() - 8);   // WeaponFire
+        std::string sv;
+        CHECK(r.i16() == 255 && r.u32() == 1819);
+        r.str(sv);
+        CHECK(sv == "ahe_z10_30mm");
+        r.str(sv);
+        CHECK(sv == "ahe_z10_30mm_projectile" && r.u8() == 2);
+        float v[3];
+        readVec3(r, v);
+        readVec3(r, v);
+        CHECK(r.done());
+    }
+    {
+        Reader r(&f[23].payload[8], f[23].payload.size() - 8);   // Weapons
+        std::string sv;
+        CHECK(r.u8() == 255 && r.u8() == 2 && r.u8() == 0);
+        r.str(sv);
+        CHECK(sv == "ahe_z10_30mm" && r.u8() == 1);
+        r.str(sv);
+        CHECK(sv == "ahe_z10_FlareLauncher" && r.done());
+    }
     // Field checks for the denser ones.
     {
         Reader r(&f[10].payload[8], f[10].payload.size() - 8);   // Kill
@@ -640,6 +691,10 @@ std::vector<Case> validCommands()
     w.u32(24); w.u64(99); CASE(MsgPing);
     w.u32(25); w.u64(99); CASE(MsgPong);
     w.u32(26); w.u16(6); w.str("x"); CASE(MsgError);
+    w.u32(27); w.u8(StreamAim); w.u8(10); w.u8(0); CASE(MsgSubscribe);
+    w.u32(28); w.u8(StreamWeaponFireEvents); w.u8(0); w.u8(0); CASE(MsgSubscribe);
+    w.u32(29); w.u8(StreamWeaponFireEvents); w.u8(0); w.u8(1); w.str("ahe_z10_FlareLauncher"); CASE(MsgSubscribe);
+    w.u32(30); w.u8(StreamWeaponEvents); w.u8(0); w.u8(0); CASE(MsgSubscribe);
 #undef CASE
     return cs;
 }
@@ -694,6 +749,10 @@ void testCommandParsing()
     w.u32(1); w.u8(StreamPlayers); w.u8(31); w.u8(0); BAD(MsgSubscribe);                      // rate 31
     w.u32(1); w.u8(StreamProjectiles); w.u8(5); w.u8(0); BAD(MsgSubscribe);                   // no filter
     w.u32(1); w.u8(StreamPlayers); w.u8(5); w.u8(1); w.str("x"); BAD(MsgSubscribe);           // filter where none fits
+    w.u32(1); w.u8(StreamAim); w.u8(0); w.u8(0); BAD(MsgSubscribe);                           // aim rate 0
+    w.u32(1); w.u8(StreamAim); w.u8(5); w.u8(1); w.str("x"); BAD(MsgSubscribe);               // aim takes no filter
+    w.u32(1); w.u8(StreamWeaponEvents); w.u8(0); w.u8(1); w.str("x"); BAD(MsgSubscribe);      // weapons takes none
+    w.u32(1); w.u8(20); w.u8(0); w.u8(0); BAD(MsgSubscribe);                                  // unknown event stream
     w.u32(1); w.str(""); BAD(CmdConsole);
     w.u32(1); w.str("a\nb"); BAD(CmdConsole);
     w.u32(1); w.str(std::string(4097, 'a')); BAD(CmdConsole);
@@ -1473,7 +1532,7 @@ void testGolden()
 {
     const std::string path = std::string(SERVEREXT_FIXTURES) + "/admin-v1-golden.txt";
     std::map<std::string, std::vector<uint8_t> > golden = readGolden(path);
-    CHECK(golden.size() == 60);
+    CHECK(golden.size() == 64);
     if (golden.empty())
     {
         std::printf("  no golden fixtures at %s\n", path.c_str());
@@ -1564,6 +1623,29 @@ void testGolden()
     encodeKick(mine["ev_kick"], 20, 10, 3, "x");
     encodeBan(mine["ev_ban"], 21, 10, 3, "x", 1, 0);
     encodeBot(mine["ev_bot"], 22, 10, 255, 1, 1, 2);
+    {
+        std::vector<AimState> aims(1);
+        aims[0].player = 7; aims[0].flags = kAimCamera | kAimWeapon;
+        set3(aims[0].cameraPos, 1.5f, 101.5f, -3.0f);
+        set3(aims[0].cameraRot, 90.0f, -10.0f, 0.0f);
+        set3(aims[0].weaponPos, 1.5f, 99.0f, -1.0f);
+        set3(aims[0].weaponRot, 85.0f, -12.5f, 2.5f);
+        encodeAimStream(mine["aim_stream"], 5, 1.0, aims);
+    }
+    {
+        WeaponFireEvent e;
+        e.shooter = 255; e.rootNetId = 1819; e.weapon = "ahe_z10_30mm"; e.projectile = "ahe_z10_30mm_projectile";
+        e.rounds = 3;
+        set3(e.origin, 1.0f, 2.0f, 3.0f);
+        set3(e.velocity, 400.0f, -5.0f, 10.0f);
+        encodeWeaponFire(mine["ev_weapon_fire"], 23, 10, e);
+    }
+    {
+        std::vector<WeaponSlot> slots(2);
+        slots[0].slot = 0; slots[0].templateName = "ahe_z10_30mm";
+        slots[1].slot = 1; slots[1].templateName = "ahe_z10_FlareLauncher";
+        encodeWeapons(mine["ev_weapons"], 24, 10, 255, slots);
+    }
     encodeOk(mine["ok"], 9);
     {
         std::vector<std::string> lines;
@@ -1609,9 +1691,10 @@ void testGolden()
         CHECK(ok);
         parsed[it->first] = c;
     }
-    CHECK(parsed.size() == 22);
+    CHECK(parsed.size() == 23);
     Command c;
     c = parsed["cmd_request_snapshot"]; CHECK(c.type == MsgRequestSnapshot && c.requestId == 1);
+    c = parsed["cmd_subscribe_fire"]; CHECK(c.requestId == 25 && c.target == 18 && c.filters.size() == 1 && c.filters[0] == "ahe_z10_FlareLauncher");
     c = parsed["cmd_subscribe"]; CHECK(c.requestId == 3 && c.target == 3 && c.value8 == 5 && c.filters.size() == 1 && c.filters[0] == "agm114_hellfire_tv");
     c = parsed["cmd_unsubscribe"]; CHECK(c.requestId == 5 && c.target == 2);
     c = parsed["cmd_console"]; CHECK(c.requestId == 6 && c.text == "sv.serverName");

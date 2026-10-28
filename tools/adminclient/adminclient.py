@@ -22,6 +22,7 @@ Scenarios: listen, commands, resync, stall, soak, wrongkey, mapchange. Port 1656
 import argparse
 import hashlib
 import hmac
+import math
 import os
 import random
 import socket
@@ -38,11 +39,13 @@ VERSION = 1
 HELLO, CHALLENGE, AUTH, WELCOME = 0x1001, 0x1002, 0x1003, 0x1004
 SNAPSHOT, REQUEST_SNAPSHOT, SUBSCRIBE, UNSUBSCRIBE = 0x1101, 0x1102, 0x1103, 0x1104
 PLAYER_STREAM, VEHICLE_STREAM, PROJECTILE_STREAM, GAME_STREAM = 0x1111, 0x1112, 0x1113, 0x1114
+AIM_STREAM = 0x1115
 EV_GAME_STATE, EV_ROUND_START, EV_ROUND_END, EV_PLAYER_CONNECT = 0x1201, 0x1202, 0x1203, 0x1204
 EV_PLAYER_DISCONNECT, EV_SPAWN, EV_DEATH, EV_REVIVE, EV_TEAM_CHANGE = 0x1205, 0x1206, 0x1207, 0x1208, 0x1209
 EV_SCORE_CHANGE, EV_KILL, EV_DAMAGE, EV_ENTER_VEHICLE, EV_EXIT_VEHICLE = 0x120A, 0x120B, 0x120C, 0x120D, 0x120E
 EV_VEHICLE_DESTROYED, EV_CONTROL_POINT, EV_CHAT, EV_PROJECTILE_FIRED = 0x120F, 0x1210, 0x1211, 0x1212
 EV_PROJECTILE_HIT, EV_KICK, EV_BAN, EV_BOT = 0x1213, 0x1214, 0x1215, 0x1216
+EV_WEAPON_FIRE, EV_WEAPONS = 0x1217, 0x1218
 CMD_CONSOLE, CMD_SAY, CMD_TELEPORT, CMD_SET_HEALTH, CMD_KILL_PLAYER = 0x1301, 0x1302, 0x1303, 0x1304, 0x1305
 CMD_SET_TEAM, CMD_SET_SCORE, CMD_RANK, CMD_MEDAL, CMD_GAME_EVENT = 0x1306, 0x1307, 0x1308, 0x1309, 0x130A
 CMD_HUD_EVENT, CMD_KICK, CMD_BAN, CMD_MAP, CMD_LIST_OBJECTS = 0x130B, 0x130C, 0x130D, 0x130E, 0x130F
@@ -52,9 +55,11 @@ PING, PONG, ERROR = 0x1501, 0x1502, 0xFFFF
 
 NAMES = {v: k for k, v in list(globals().items()) if isinstance(v, int) and k.isupper() and 0x1000 <= v <= 0xFFFF
          and k not in ("VERSION",)}
-EVENT_TYPES = range(0x1201, 0x1217)
+EVENT_TYPES = range(0x1201, 0x1219)
 
-STREAMS = {"players": 1, "vehicles": 2, "projectiles": 3, "game": 4, "damage": 16, "projectile-events": 17}
+STREAMS = {"players": 1, "vehicles": 2, "projectiles": 3, "game": 4, "aim": 5, "damage": 16, "projectile-events": 17,
+           "fire": 18, "weapons": 19}
+AIM_CAMERA, AIM_WEAPON = 1, 2
 REF_PLAYER, REF_NET, REF_CONSOLE = 1, 2, 3
 ERR_VERSION, ERR_MALFORMED, ERR_UNKNOWN_TYPE, ERR_UNKNOWN_PLAYER = 1, 2, 3, 4
 ERR_UNAVAILABLE, ERR_REFUSED, ERR_INVALID, ERR_AUTH, ERR_DISABLED = 5, 6, 7, 8, 9
@@ -203,6 +208,16 @@ def r_proj(r):
             "pos": r.vec3(), "rot": r.vec3(), "vel": r.vec3(), "ttl": r.f32()}
 
 
+def w_aim(w, a):
+    w.u8(a["player"]).u8(a["flags"]).vec3(a["camera_pos"]).vec3(a["camera_rot"]).vec3(a["weapon_pos"])
+    w.vec3(a["weapon_rot"])
+
+
+def r_aim(r):
+    return {"player": r.u8(), "flags": r.u8(), "camera_pos": r.vec3(), "camera_rot": r.vec3(), "weapon_pos": r.vec3(),
+            "weapon_rot": r.vec3()}
+
+
 def decode(t, payload):
     """Decodes a module -> WebAdmin message into a dict. Raises ValueError on a malformed payload."""
     r = R(payload)
@@ -234,6 +249,9 @@ def decode(t, payload):
         m["projectiles"] = [r_proj(r) for _ in range(r.u16())]
     elif t == GAME_STREAM:
         m.update(tick=r.u32(), time=r.f64(), game=r_game(r))
+    elif t == AIM_STREAM:
+        m.update(tick=r.u32(), time=r.f64())
+        m["aims"] = [r_aim(r) for _ in range(r.u8())]
     elif t in EVENT_TYPES:
         m.update(seq=r.u32(), tick=r.u32())
         if t == EV_GAME_STATE:
@@ -286,6 +304,12 @@ def decode(t, payload):
             m.update(player=r.u8(), name=r.s(), ban_type=r.u8(), expiry=r.u32())
         elif t == EV_BOT:
             m.update(player=r.u8(), kind=r.u8(), team=r.u8(), connection=r.u32())
+        elif t == EV_WEAPON_FIRE:
+            m.update(shooter=r.i16(), root_net=r.u32(), weapon=r.s(), projectile=r.s(), rounds=r.u8(),
+                     origin=r.vec3(), velocity=r.vec3())
+        elif t == EV_WEAPONS:
+            m.update(player=r.u8())
+            m["slots"] = [(r.u8(), r.s()) for _ in range(r.u8())]
     elif t == OK:
         m.update(request=r.u32())
     elif t == CONSOLE_RESULT:
@@ -468,6 +492,13 @@ def golden_samples():
     s["ev_kick"] = (EV_KICK, ev(20).u8(3).s("x").b)
     s["ev_ban"] = (EV_BAN, ev(21).u8(3).s("x").u8(1).u32(0).b)
     s["ev_bot"] = (EV_BOT, ev(22).u8(255).u8(1).u8(1).u32(2).b)
+    w = W().u32(5).f64(1.0).u8(1)
+    w_aim(w, {"player": 7, "flags": AIM_CAMERA | AIM_WEAPON, "camera_pos": (1.5, 101.5, -3.0),
+              "camera_rot": (90.0, -10.0, 0.0), "weapon_pos": (1.5, 99.0, -1.0), "weapon_rot": (85.0, -12.5, 2.5)})
+    s["aim_stream"] = (AIM_STREAM, w.b)
+    s["ev_weapon_fire"] = (EV_WEAPON_FIRE, ev(23).i16(255).u32(1819).s("ahe_z10_30mm").s("ahe_z10_30mm_projectile")
+                           .u8(3).vec3((1.0, 2.0, 3.0)).vec3((400.0, -5.0, 10.0)).b)
+    s["ev_weapons"] = (EV_WEAPONS, ev(24).u8(255).u8(2).u8(0).s("ahe_z10_30mm").u8(1).s("ahe_z10_FlareLauncher").b)
 
     s["ok"] = (OK, W().u32(9).b)
     s["console_result"] = (CONSOLE_RESULT, W().u32(10).u8(1).u16(3).s("a").s("").s("§").b)
@@ -501,6 +532,7 @@ def golden_samples():
     s["cmd_spawn_object"] = (CMD_SPAWN_OBJECT, p_spawn(22, "ahe_ah1z", (2, 2, 2), (2, 2, 2), 1))
     s["cmd_delete_object"] = (CMD_DELETE_OBJECT, p_object_ref(23, REF_NET, 5))
     s["cmd_ping"] = (PING, p_ping(24, 99))
+    s["cmd_subscribe_fire"] = (SUBSCRIBE, p_subscribe(25, 18, 0, ["ahe_z10_FlareLauncher"]))
     return s
 
 
@@ -568,6 +600,7 @@ class Link:
         self.last_game_stream = None
         self.stream_frames = {}
         self.mark = None
+        self.on_frame = None   # called with every decoded message
 
     # -- framing
     def send(self, t, payload=b""):
@@ -628,8 +661,10 @@ class Link:
             self.last_vehicle_stream = m
         elif t == GAME_STREAM:
             self.last_game_stream = m
-        if t in (PLAYER_STREAM, VEHICLE_STREAM, PROJECTILE_STREAM, GAME_STREAM):
+        if t in (PLAYER_STREAM, VEHICLE_STREAM, PROJECTILE_STREAM, GAME_STREAM, AIM_STREAM):
             self.stream_frames[t] = self.stream_frames.get(t, 0) + 1
+        if self.on_frame:
+            self.on_frame(m)
         return m
 
     def check_seq(self, m):
@@ -841,6 +876,8 @@ def subscribe_all(link, args):
         filters = []
         if stream in (3, 17):
             filters = args.projectile_templates.split(",")
+        elif stream == 18 and args.fire_templates:
+            filters = args.fire_templates.split(",")
         r = link.request(SUBSCRIBE, p_subscribe(link.next_request(), stream, int(rate or 1), filters))
         log("  Subscribe %s -> %s" % (spec, r["name"]))
 
@@ -1233,6 +1270,142 @@ def scenario_mapchange(lst, args):
     return c.summary("mapchange")
 
 
+def forward(rot):
+    """The unit forward axis of a Rot (yaw, pitch, roll degrees; positive pitch is nose down)."""
+    y, p = math.radians(rot[0]), math.radians(rot[1])
+    return (math.sin(y) * math.cos(p), -math.sin(p), math.cos(y) * math.cos(p))
+
+
+def angle_deg(a, b):
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(x * x for x in b))
+    if na < 1e-6 or nb < 1e-6:
+        return float("nan")
+    d = sum(x * y for x, y in zip(a, b)) / (na * nb)
+    return math.degrees(math.acos(max(-1.0, min(1.0, d))))
+
+
+def median(xs):
+    xs = sorted(x for x in xs if x == x)
+    return xs[len(xs) // 2] if xs else float("nan")
+
+
+def scenario_viewer(lst, args):
+    """The viewer additions against a firing crew (serverext_client.py --scenario viewer): view mode in
+    PlayerState, AimStream, WeaponFire and Weapons. Each launch's direction (its velocity less the root's)
+    is compared with the shooter's weapon and camera forward axes at that tick."""
+    c = Checks()
+    link = lst.accept(args.accept_timeout)
+    rq = link.next_request
+    aims = {}      # tick -> {player: aim}
+    states = {}    # tick -> {player: state}
+    alive_at = {}  # tick -> set of living players (player stream)
+    weapons = []   # (time, event)
+
+    def on_frame(m):
+        if m["type"] == AIM_STREAM:
+            aims[m["tick"]] = {a["player"]: a for a in m["aims"]}
+        elif m["type"] == PLAYER_STREAM:
+            states[m["tick"]] = {pid: st for pid, st in m["players"]}
+            alive_at[m["tick"]] = {pid for pid, st in m["players"] if st["life"] != 0}
+        elif m["type"] == EV_WEAPONS:
+            weapons.append((time.time(), m))
+    link.on_frame = on_frame
+
+    players = [p["id"] for p in link.snapshot["players"]]
+    for spec in ("players:30", "aim:30", "vehicles:5"):
+        name, _, rate = spec.partition(":")
+        r = link.request(SUBSCRIBE, p_subscribe(rq(), STREAMS[name], int(rate)))
+        c.check(r["name"] == "OK", "Subscribe %s -> %s" % (spec, r["name"]))
+    r = link.request(SUBSCRIBE, p_subscribe(rq(), 18, 0, args.fire_templates.split(",") if args.fire_templates else []))
+    c.check(r["name"] == "OK", "Subscribe fire -> %s" % r["name"])
+    r = link.request(SUBSCRIBE, p_subscribe(rq(), 19, 0))
+    t_sub = time.time()
+    link.pump(1.0)
+    first = {m["player"] for t, m in weapons if t >= t_sub}
+    c.check(r["name"] == "OK" and set(players) <= first,
+            "Subscribe weapons -> %s; Weapons for every snapshot player %s: %s" % (r["name"], sorted(players), sorted(first)))
+    r = link.request(SUBSCRIBE, p_subscribe(rq(), 5, 10, ["x"]))
+    c.check(r["name"] == "ERROR" and r["code"] == ERR_INVALID, "Subscribe aim with a filter -> Error 7 (%s)" % r.get("message"))
+
+    t0 = time.time()
+    resynced = False
+    while time.time() - t0 < args.seconds:
+        link.pump(1.0)
+        if not resynced and time.time() - t0 > args.seconds / 2:
+            resynced = True
+            t_snap = time.time()
+            s = link.request(REQUEST_SNAPSHOT, W().u32(rq()).b, timeout=10)
+            link.pump(0.5)
+            after = {m["player"] for t, m in weapons if t >= t_snap}
+            snap_players = {p["id"] for p in s["players"]}
+            c.check(snap_players <= after, "after RequestSnapshot every player's Weapons again: %s of %s" % (
+                sorted(after), sorted(snap_players)))
+    seconds = time.time() - t0
+    link.on_frame = None
+
+    # Aim stream: rate and contents.
+    n_aim = link.stream_frames.get(AIM_STREAM, 0)
+    c.check(n_aim > 0, "AimStream frames: %d (%.1f per second over the whole link)" % (n_aim, n_aim / max(seconds, 1)))
+    dead_entries = [(t, p) for t, a in aims.items() if t in alive_at for p in a if p not in alive_at[t]]
+    c.check(not dead_entries, "AimStream has living players only (%d entries of dead players)" % len(dead_entries))
+    flags = {}
+    for a in aims.values():
+        for p, x in a.items():
+            flags.setdefault(p, set()).add(x["flags"])
+    log("aim flags per player: %s" % {p: sorted(f) for p, f in flags.items()})
+
+    # View modes seen in the player stream.
+    views = {}
+    for st in states.values():
+        for pid, s in st.items():
+            views.setdefault(pid, set()).add(s["view_mode"])
+    log("view modes per player: %s" % {p: sorted(v) for p, v in views.items()})
+    c.check(any(len(v - {255}) >= 3 for v in views.values()), "some player went through at least three view modes")
+
+    # WeaponFire: per template, rounds, and the launch direction against the aim.
+    fires = [m for m in link.events if m["type"] == EV_WEAPON_FIRE]
+    by = {}
+    for f in fires:
+        k = (f["weapon"], f["projectile"])
+        g = by.setdefault(k, dict(events=0, rounds=0, weapon=[], camera=[], speed=[]))
+        g["events"] += 1
+        g["rounds"] += f["rounds"]
+        st = states.get(f["tick"]) or states.get(f["tick"] - 1) or {}
+        root_vel = st.get(f["shooter"], {}).get("vel", (0.0, 0.0, 0.0)) if f["shooter"] >= 0 else (0.0, 0.0, 0.0)
+        own = tuple(v - r for v, r in zip(f["velocity"], root_vel))
+        g["speed"].append(math.sqrt(sum(x * x for x in own)))
+        a = None
+        for dt in (0, -1, 1, -2, 2):
+            a = (aims.get(f["tick"] + dt) or {}).get(f["shooter"])
+            if a:
+                break
+        if a and a["flags"] & AIM_WEAPON:
+            g["weapon"].append(angle_deg(own, forward(a["weapon_rot"])))
+        if a and a["flags"] & AIM_CAMERA:
+            g["camera"].append(angle_deg(own, forward(a["camera_rot"])))
+    c.check(bool(fires), "WeaponFire events: %d" % len(fires))
+    for (wt, pt), g in sorted(by.items()):
+        log("  %s / %s: %d events, %d rounds, own speed median %.0f m/s; launch vs weapon axis median %.1f max %.1f deg, "
+            "vs camera axis median %.1f max %.1f deg (%d/%d with aim)" % (
+                wt, pt, g["events"], g["rounds"], median(g["speed"]), median(g["weapon"]),
+                max(g["weapon"]) if g["weapon"] else float("nan"), median(g["camera"]),
+                max(g["camera"]) if g["camera"] else float("nan"), len(g["weapon"]), g["events"]))
+    c.check(any("flare" in (wt + pt).lower() for wt, pt in by), "flares reported as WeaponFire")
+    aimed = [min(median(g["weapon"]), median(g["camera"])) for g in by.values() if g["weapon"] or g["camera"]]
+    c.check(bool(aimed), "launch directions compared with the aim for %d templates" % len(aimed))
+
+    # Weapons: changes during the run.
+    log("Weapons events: %d; distinct sets per player: %s" % (len(weapons), {
+        p: sorted({tuple(s for _, s in m["slots"]) for _, m in weapons if m["player"] == p}) for p in
+        {m["player"] for _, m in weapons}}))
+    c.check(any(len({tuple(s for _, s in m["slots"]) for _, m in weapons if m["player"] == p}) > 1
+                for p in {m["player"] for _, m in weapons}), "some player's weapons changed during the run")
+    c.check(link.gaps == 0, "no sequence gaps (%d)" % link.gaps)
+    report_link(link, seconds)
+    return c.summary("viewer")
+
+
 def scenario_extras(lst, args):
     """Kick notice through the console, KillPlayer destroying a seated bot's vehicle, Unsubscribe."""
     c = Checks()
@@ -1348,7 +1521,7 @@ def main():
     ap.add_argument("--print-pin", action="store_true", help="create the certificate if needed, print its pin, exit")
     ap.add_argument("--write-golden", default="", help="write the golden fixtures to this file and exit")
     ap.add_argument("--scenario", default="listen",
-                    choices=["listen", "commands", "resync", "stall", "soak", "wrongkey", "wrongpin", "mapchange", "extras"])
+                    choices=["listen", "commands", "resync", "stall", "soak", "wrongkey", "wrongpin", "mapchange", "extras", "viewer"])
     ap.add_argument("--fuzz", action="store_true")
     ap.add_argument("--fuzz-rounds", type=int, default=24)
     ap.add_argument("--seed", type=int, default=1)
@@ -1356,6 +1529,7 @@ def main():
     ap.add_argument("--accept-timeout", type=float, default=120.0)
     ap.add_argument("--sub", action="append", default=[], help="listen: stream[:rate], e.g. players:30, damage")
     ap.add_argument("--projectile-templates", default="ahe_z10_S8Launcher_Projectile,AHE_AH1Z_HydraLauncher_Projectile,agm114_hellfire_tv")
+    ap.add_argument("--fire-templates", default="", help="comma-separated weapon or projectile templates for --sub fire (none: every launch)")
     ap.add_argument("--spawn-template", default="ahe_ah1z", help="commands: SpawnObject/DeleteObject template")
     ap.add_argument("--map-restart", action="store_true", help="commands: also run Map action 1 (round restart)")
     ap.add_argument("--stall-snapshots", type=int, default=12, help="stall: RequestSnapshot per 10 ms")
@@ -1379,7 +1553,7 @@ def main():
         return {"listen": scenario_listen, "commands": scenario_commands, "resync": scenario_resync,
                 "stall": scenario_stall, "soak": scenario_soak, "wrongkey": scenario_wrongkey,
                 "wrongpin": scenario_wrongpin, "mapchange": scenario_mapchange,
-                "extras": scenario_extras}[args.scenario](lst, args)
+                "extras": scenario_extras, "viewer": scenario_viewer}[args.scenario](lst, args)
     except KeyboardInterrupt:
         return 130
 

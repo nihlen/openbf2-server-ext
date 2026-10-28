@@ -8,7 +8,8 @@ Status: bot channel protocol v3 implemented for Linux x86-64 (`libserverext.so`)
 see [docs/findings/module-v3.md](docs/findings/module-v3.md) (module-v2.md, module-v1.md and module-v0.md for earlier versions). Start with
 the contract in [docs/protocol.md](docs/protocol.md). The admin channel (phase 1 of
 [docs/admin-channel-draft.md](docs/admin-channel-draft.md)) is implemented beside it; its byte layouts, configuration and
-results are in [docs/findings/admin-phase1.md](docs/findings/admin-phase1.md).
+results are in [docs/findings/admin-phase1.md](docs/findings/admin-phase1.md); the viewer additions (view mode, aim, gunfire,
+weapons) in [docs/findings/admin-viewer.md](docs/findings/admin-viewer.md).
 
 ## Layout and build
 

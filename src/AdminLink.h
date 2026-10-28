@@ -25,7 +25,7 @@ class AdminLink
 {
 public:
     static const size_t kMaxCommands = 4096;
-    enum Slot { SlotPlayers = 0, SlotVehicles = 1, SlotProjectiles = 2, SlotGame = 3, SlotCount = 4 };
+    enum Slot { SlotPlayers = 0, SlotVehicles = 1, SlotProjectiles = 2, SlotGame = 3, SlotAim = 4, SlotCount = 5 };
 
     explicit AdminLink(size_t queueBytes);
     ~AdminLink();

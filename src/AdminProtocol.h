@@ -34,12 +34,14 @@ enum Type : uint16_t
     // state
     MsgSnapshot = 0x1101, MsgRequestSnapshot = 0x1102, MsgSubscribe = 0x1103, MsgUnsubscribe = 0x1104,
     MsgPlayerStream = 0x1111, MsgVehicleStream = 0x1112, MsgProjectileStream = 0x1113, MsgGameStream = 0x1114,
+    MsgAimStream = 0x1115,
     // events
     EvGameState = 0x1201, EvRoundStart = 0x1202, EvRoundEnd = 0x1203, EvPlayerConnect = 0x1204,
     EvPlayerDisconnect = 0x1205, EvSpawn = 0x1206, EvDeath = 0x1207, EvRevive = 0x1208, EvTeamChange = 0x1209,
     EvScoreChange = 0x120A, EvKill = 0x120B, EvDamage = 0x120C, EvEnterVehicle = 0x120D, EvExitVehicle = 0x120E,
     EvVehicleDestroyed = 0x120F, EvControlPoint = 0x1210, EvChat = 0x1211, EvProjectileFired = 0x1212,
     EvProjectileHit = 0x1213, EvKick = 0x1214, EvBan = 0x1215, EvBot = 0x1216,
+    EvWeaponFire = 0x1217, EvWeapons = 0x1218,
     // commands
     CmdConsole = 0x1301, CmdSay = 0x1302, CmdTeleport = 0x1303, CmdSetHealth = 0x1304, CmdKillPlayer = 0x1305,
     CmdSetTeam = 0x1306, CmdSetScore = 0x1307, CmdRank = 0x1308, CmdMedal = 0x1309, CmdGameEvent = 0x130A,
@@ -66,8 +68,8 @@ const uint8_t kCapIdentity = 4;
 // Subscribe streams.
 enum Stream : uint8_t
 {
-    StreamPlayers = 1, StreamVehicles = 2, StreamProjectiles = 3, StreamGame = 4,
-    StreamDamageEvents = 16, StreamProjectileEvents = 17
+    StreamPlayers = 1, StreamVehicles = 2, StreamProjectiles = 3, StreamGame = 4, StreamAim = 5,
+    StreamDamageEvents = 16, StreamProjectileEvents = 17, StreamWeaponFireEvents = 18, StreamWeaponEvents = 19
 };
 
 // ObjectRef kinds.
@@ -180,6 +182,26 @@ struct ProjectileState
     ProjectileState();
 };
 
+// AimStream entry flags.
+const uint8_t kAimCamera = 1, kAimWeapon = 2;
+
+struct AimState
+{
+    uint8_t player, flags;
+    float cameraPos[3], cameraRot[3];
+    float weaponPos[3], weaponRot[3];
+    AimState();
+};
+
+// The weapons in a player's active slots (Weapons event).
+const size_t kMaxWeaponSlots = 3;
+struct WeaponSlot
+{
+    uint8_t slot;
+    std::string templateName;
+    WeaponSlot() : slot(0) {}
+};
+
 struct MapEntry
 {
     std::string name, mode;
@@ -271,6 +293,7 @@ void encodePlayerStream(std::vector<uint8_t>& out, uint32_t tick, double time, c
 void encodeVehicleStream(std::vector<uint8_t>& out, uint32_t tick, double time, const std::vector<VehicleState>& v);
 void encodeProjectileStream(std::vector<uint8_t>& out, uint32_t tick, double time, const std::vector<ProjectileState>& p);
 void encodeGameStream(std::vector<uint8_t>& out, uint32_t tick, double time, const GameState& g);
+void encodeAimStream(std::vector<uint8_t>& out, uint32_t tick, double time, const std::vector<AimState>& a);
 
 // ---------------------------------------------------------------- replies
 
@@ -348,6 +371,16 @@ struct ProjectileHitEvent
     ProjectileHitEvent();
 };
 
+struct WeaponFireEvent
+{
+    int16_t shooter;
+    uint32_t rootNetId;
+    std::string weapon, projectile;
+    uint8_t rounds;
+    float origin[3], velocity[3];
+    WeaponFireEvent();
+};
+
 void encodeGameStateEvent(std::vector<uint8_t>& out, uint32_t seq, uint32_t tick, const GameState& g, uint8_t previous);
 void encodeRoundStart(std::vector<uint8_t>& out, uint32_t seq, uint32_t tick, const std::string& map,
                       const std::string& mode, const int32_t tickets[2]);
@@ -378,6 +411,9 @@ void encodeBan(std::vector<uint8_t>& out, uint32_t seq, uint32_t tick, uint8_t p
                uint8_t banType, uint32_t expiry);
 void encodeBot(std::vector<uint8_t>& out, uint32_t seq, uint32_t tick, uint8_t player, uint8_t kind, uint8_t team,
                uint32_t connection);
+void encodeWeaponFire(std::vector<uint8_t>& out, uint32_t seq, uint32_t tick, const WeaponFireEvent& e);
+void encodeWeapons(std::vector<uint8_t>& out, uint32_t seq, uint32_t tick, uint8_t player,
+                   const std::vector<WeaponSlot>& slots);
 
 // ---------------------------------------------------------------- inbound (WebAdmin -> module)
 
