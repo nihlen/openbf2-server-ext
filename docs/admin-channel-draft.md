@@ -12,8 +12,10 @@ with OpenSSL 1.1.1w) and bots. It replaces draft 1, which kept
 `PlayerState`, the aim stream (5), and the `WeaponFire` (18) and `Weapons` (19) event streams. The admin
 protocol version stays 1; module and WebAdmin are deployed together. Implemented and tested on a WSL server
 with a firing bot crew: `docs/findings/admin-viewer.md`.
-**Proposed 2026-10-28, not approved:** the hit/miss replay for the viewer (lag in `PlayerState`, the
-`ProjectileCollision` and `ProjectileTrace` events on stream 20), under the `WeaponFire` definition below. Not part of the contract until the author approves it.
+**Hit/miss replay approved by the author on 2026-10-28** (for the viewer): the lag in `PlayerState`, and the
+`ProjectileCollision` and `ProjectileTrace` events on stream 20 (the section under `WeaponFire` below). Engine getter
+`IServerExtension::getLagCompensation` and the projectile-collision observer (OpenBF2 `serverext/r1` `0a58ec0`,
+`1ca26b8`). Version stays 1. Implemented and tested on a WSL server with scripted bots: `docs/findings/tv-hitbox.md`.
 The author has decided that the BF2WebAdmin C# side may change as much as needed, and that the
 author keeps deployments from running `mm_webadmin.py` and the native channel at the same time.
 Evidence for the engine side: `docs/findings/admin-channel-a1-a4.md`. Inventory of today's
@@ -369,6 +371,7 @@ Pm = HMAC-SHA256(K, T("OBF2-ADMIN-1 server"))
 | `Vec3` | root velocity (its physics node) |
 | `f32` | soldier health 0..1 (its armour), -1 if none |
 | `u8` | camera view mode (`IPlayer::getCamera()->getViewMode()`, `ICameraObject` +0x1C): 1 inside, 2 nose, 3 chase, 4 front chase, 5 fly-by, 6 trace, 7 extern trace, 0 none (the bot channel's values, `docs/protocol.md` v2 `TickState`); 255 when dead or without a camera |
+| `u16` | lag compensation, ms: how far back the server tests this player's projectiles against vehicles and soldiers (`IServerExtension::getLagCompensation`; see "Hit/miss replay" A below) |
 
 The view mode is the server's copy: `ServerGameLogic::checkPlayerTriggers` applies each player's camera keys to
 the server's camera object (`ServerGameLogic.cpp:1550-1579`, called for every player from
@@ -494,10 +497,10 @@ Only projectiles whose template is in a projectile subscription are tracked (`Su
 | Type | Field |
 |---|---|
 | `u32` | request id |
-| `u8` | stream: 1 players, 2 vehicles, 3 projectiles, 4 game, 5 aim; event streams 16 `Damage`, 17 `ProjectileFired`/`ProjectileHit`, 18 `WeaponFire`, 19 `Weapons` |
-| `u8` | rate, Hz, 1..30 (ignored for 16-19) |
+| `u8` | stream: 1 players, 2 vehicles, 3 projectiles, 4 game, 5 aim; event streams 16 `Damage`, 17 `ProjectileFired`/`ProjectileHit`, 18 `WeaponFire`, 19 `Weapons`, 20 `ProjectileCollision`/`ProjectileTrace` |
+| `u8` | rate, Hz, 1..30 (ignored for 16-20) |
 | `u8` | filters F |
-| F × string | template names, compared without case. Streams 3 and 17 need at least one; stream 18 takes any number (none: every launch; else launches whose weapon or projectile template matches one); the others take none |
+| F × string | template names, compared without case. Streams 3, 17 and 20 need at least one; stream 18 takes any number (none: every launch; else launches whose weapon or projectile template matches one); the others take none |
 
 Subscribing to stream 19 reports every player's weapons at once (below).
 
@@ -548,6 +551,8 @@ reads the objects during the callback, before Python's handlers run.
 | `0x1216` | Bot | `u8` player, `u8` kind (1 created, 2 removed, 3 team change), `u8` team, `u32` bot-channel connection | the module's bot channel |
 | `0x1217` | WeaponFire | see below; only while subscribed (stream 18) | the v2 projectile observer |
 | `0x1218` | Weapons | `u8` player, `u8` W, W × `WeaponSlot`: the weapons in the active slots 0-2 of the player's seat (on foot the soldier's), as the bot channel's weapon list; W = 0 when dead | only while subscribed (stream 19): polled per tick, sent when a player's set changes, and for every player on `Subscribe` and after every `Snapshot` |
+| `0x1219` | ProjectileCollision | see "Hit/miss replay" B below; only while subscribed (stream 20) | the projectile-collision observer |
+| `0x121A` | ProjectileTrace | see "Hit/miss replay" C below; only while subscribed (stream 20) | the module's tick hook and the projectile observer |
 
 **`WeaponFire`** (one per shooter and weapon per tick in which it launched; added 2026-10-28):
 
@@ -566,8 +571,7 @@ reads the objects during the callback, before Python's handlers run.
   `GenericProjectile`). Tracer copies are made after it and are not counted (`:1131-1160`).
 - The event's tick is the tick of the launch. The module sends it with its next tick's events.
 
-**Proposed, not approved: the hit/miss replay** (draft 2026-10-28, awaiting the author's approval; nothing
-implements it yet). For the 3D viewer: replay a missile's whole flight with the target drawn where the gunner saw it
+**Hit/miss replay** (approved by the author on 2026-10-28; implemented). For the 3D viewer: replay a missile's whole flight with the target drawn where the gunner saw it
 ("red", its current server pose) and where the server tested it ("blue", rewound by the shooter's lag), and name the
 part a hit touched. Background and measurements: `docs/findings/tv-hitbox.md`. Three additions. Decided by the author
 on 2026-10-28: the lag goes into `PlayerState`, and collisions are capped per tick.
@@ -580,9 +584,9 @@ on 2026-10-28: the lag goes into `PlayerState`, and collisions are capped per ti
 
 - The value is the engine's own, `LatencyCompensation::getLatency(player)`: ping x 0.5 plus the interpolation time
   the player's client reports (`IPlayer::getInterpolationTime`), capped by `phy-latencyComp-max` (0.3 s), or the
-  forced `phy-latencyComp-debug`; bots are local players and get 0. The module cannot reach that static function or
-  the cvars, so this needs one appended engine getter, `IServerExtension::getLagCompensation(int playerId)`
-  (`[CHOSEN, not recovered]`, a few lines on `serverext/r1`).
+  forced `phy-latencyComp-debug`; bots are local players and get 0. The module reads it through the appended
+  engine getter `IServerExtension::getLagCompensation(int playerId)` (OpenBF2 `serverext/r1` `1ca26b8`,
+  `[CHOSEN, not recovered]`), rounded to whole ms.
 - `PlayerState` is in `Snapshot`, `PlayerInfo` and `PlayerStream`, so every consumer can use it.
 
 **B. `0x1219 ProjectileCollision`** (event stream 20). `Subscribe` takes projectile templates as filters, at least
@@ -625,6 +629,8 @@ rest are dropped before they get a sequence number (so no gap) and counted in th
   A miss usually ends in a kind 0 event.
 - `Damage` keeps its meaning: damage is booked to the nearest armour up the parent chain, so a rotor hit is a
   `Damage` to the helicopter. Match the two by tick and projectile template.
+- The tick is numbered as `Damage`'s: the state the colliding tick started from, which is the `ProjectileTrace`
+  sample whose tested poses that tick's sweep used.
 
 **C. `0x121A ProjectileTrace`** (event stream 20, the same subscription). The whole flight of one subscribed
 projectile, sent once when it ends, so the viewer can replay it with red and blue visible at every tick. An event,
@@ -649,12 +655,14 @@ Each sample:
 | `f32` | the shooter's lag compensation this tick, seconds |
 | T × target | `Vec3` position now, `Rot` rotation now, `Vec3` position as tested, `Rot` rotation as tested |
 
-- **Timing.** Sample `k` is taken in the module's tick hook at the start of tick `first + k`, before the simulation:
-  the projectile and the targets are where tick `first + k - 1` left them, and "as tested" is
-  `getLatencyCompensatedTransformation(lag)` of each target's physics node at that moment, which is exactly the pose
-  the projectile's sweep in tick `first + k` is tested against (the history advances only at the end of the tick).
-  So the sweep from sample `k` to sample `k + 1` meets the target at sample `k`'s tested pose. Without a history
-  (or with a lag of 1/30 s or less) the tested pose is the current one.
+- **Timing.** Sample `k` carries the stream tick label `first + k`: the state at the end of that tick, taken in the
+  module's tick hook before the next tick is simulated. "As tested" is `getLatencyCompensatedTransformation(lag)` of
+  each target's physics node at that moment, which is exactly the pose the projectile's sweep in the next tick is
+  tested against (the history advances only at the end of a tick). So the sweep from sample `k` to sample `k + 1`
+  meets the target at sample `k`'s tested pose, and a `ProjectileCollision` in that sweep carries tick `first + k`.
+  Without a history, or with a lag of 1/30 s or less, nothing is rewound and the sweep meets the target where the
+  tick leaves it (targets move before collision): sample `k`'s tested pose is then sample `k + 1`'s current pose
+  (the last sample keeps its own).
 - **Targets.** Every vehicle in the vehicle set except the shooter's own root that comes within 150 m of the
   projectile during the flight, at most 8 (nearest first); a target that leaves the set keeps its last pose.
   Soldiers are not traced: a seated crew member is rewound with its own history but sits where the rewound hull
@@ -662,14 +670,18 @@ Each sample:
 - **Child parts** (rotors, dummy missiles, sensors, gun turrets) are drawn by the viewer at the target's current pose
   from their fixed offsets (the table in `docs/findings/tv-hitbox.md`). The rotor's blade angle is not traced, so the
   viewer draws the rotor as a disc and shows the blade only at a `ProjectileCollision` on it.
+- **Candidates.** Vehicles within 1000 m of the launch are sampled from the first sample on, so a target that
+  comes close late still has its whole flight. At most 64 flights are traced at once; more are counted in the stats
+  line and not traced.
 - **End.** Sampling stops 15 ticks after the projectile's first collision with an object or the terrain (so the
   target can be seen moving on), when it vanishes, or at 300 samples (10 s).
-- **Size.** About 28 + T × 56 bytes per sample: a 3.5 s TV flight with two targets is about 15 KB, sent once.
-- **Cost on the main thread.** One transform read per target per tick while a subscribed projectile flies; nothing
-  otherwise.
+- **Size.** 28 + T × 48 bytes per sample: a 3.5 s TV flight with one target is about 8 KB, sent once.
+- **Cost on the main thread.** One transform read per candidate per tick while a subscribed projectile flies;
+  nothing otherwise.
 
-Golden fixtures for the C++ and C# codecs and `adminclient.py` decoding come with the implementation; the bot channel
-is unchanged. The admin protocol version stays 1 (development-phase rule). Engine changes: the getter in A only.
+Golden frames `ev_projectile_collision`, `ev_projectile_trace` and `cmd_subscribe_replay` in
+`tests/fixtures/admin-v1-golden.txt`; `adminclient.py` decodes both and its `replay` scenario checks them against a
+live server. The bot channel is unchanged. The admin protocol version stays 1 (development-phase rule).
 
 **`Kill`** (for one victim, `Kill` precedes `Death`: the engine raises event 1 before it calls
 `killPlayer`, `GameLogicDamage.cpp:484-507`):

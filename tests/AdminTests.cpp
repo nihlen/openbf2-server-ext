@@ -200,6 +200,7 @@ PlayerState samplePlayerState()
     s.vel[0] = 10.0f; s.vel[1] = 0.5f; s.vel[2] = -1.0f;
     s.health = 0.75f;
     s.viewMode = 3;
+    s.lagMs = 245;
     return s;
 }
 
@@ -210,7 +211,7 @@ bool samePlayerState(const PlayerState& a, const PlayerState& b)
             return false;
     return a.team == b.team && a.squad == b.squad && a.life == b.life && a.flags == b.flags && a.ping == b.ping &&
            a.rootNetId == b.rootNetId && a.rootObjectId == b.rootObjectId && a.seat == b.seat && a.health == b.health &&
-           a.viewMode == b.viewMode;
+           a.viewMode == b.viewMode && a.lagMs == b.lagMs;
 }
 
 PlayerInfo samplePlayerInfo()
@@ -245,7 +246,7 @@ void testStructures()
     Writer w(buf);
     const PlayerState s = samplePlayerState();
     writePlayerState(w, s);
-    CHECK(buf.size() == 1 + 1 + 1 + 1 + 2 + 4 + 4 + 1 + 36 + 4 + 1);
+    CHECK(buf.size() == 1 + 1 + 1 + 1 + 2 + 4 + 4 + 1 + 36 + 4 + 1 + 2);
     {
         Reader r(&buf[0], buf.size());
         PlayerState back;
@@ -438,7 +439,7 @@ void testSnapshotAndStreams()
     out.clear();
     encodePlayerStream(out, 5, 1.0, ids, states);
     f = frames(out);
-    CHECK(f.size() == 1 && f[0].type == MsgPlayerStream && f[0].payload.size() == 4 + 8 + 1 + 1 + 56);
+    CHECK(f.size() == 1 && f[0].type == MsgPlayerStream && f[0].payload.size() == 4 + 8 + 1 + 1 + 58);
     out.clear();
     encodeVehicleStream(out, 5, 1.0, vehicles);
     encodeProjectileStream(out, 5, 1.0, projectiles);
@@ -452,7 +453,7 @@ void testSnapshotAndStreams()
     std::vector<PlayerState> many(64, samplePlayerState());
     out.clear();
     encodePlayerStream(out, 5, 1.0, manyIds, many);
-    CHECK(out.size() == 8 + 13 + 64 * 57);
+    CHECK(out.size() == 8 + 13 + 64 * 59);
 
     // Aim: 50 bytes per living player.
     std::vector<AimState> aims(2);
@@ -527,21 +528,95 @@ void testEvents()
     slots[0].slot = 0; slots[0].templateName = "ahe_z10_30mm";
     slots[1].slot = 1; slots[1].templateName = "ahe_z10_FlareLauncher";
     encodeWeapons(out, 24, 10, 255, slots);
+    ProjectileCollisionEvent col;
+    col.id = 1852; col.templateName = "agm114_hellfire_tv"; col.shooter = 254; col.kind = kCollisionObject;
+    col.flags = kCollisionPartIsSoldier | kCollisionRewound; col.rootNetId = 1799; col.rootObjectId = 29312;
+    col.rootTemplate = "ahe_ah1z"; col.partTemplate = "us_light_soldier"; col.partPlayer = 3; col.material = 7;
+    col.latency = 0.3f;
+    encodeProjectileCollision(out, 25, 10, col);
+    ProjectileTraceEvent tr;
+    tr.id = 1852; tr.templateName = "agm114_hellfire_tv"; tr.shooter = -1; tr.firstTick = 77; tr.flags = kTraceCut;
+    for (int k = 0; k < 9; ++k)   // one more than kMaxTraceTargets: the ninth is not written
+    {
+        TraceTarget t;
+        t.netId = 1800 + k; t.templateName = "v";
+        tr.targets.push_back(t);
+    }
+    tr.samples.resize(kMaxTraceSamples + 5);   // the last 5 are not written
+    tr.poses.resize(tr.samples.size() * tr.targets.size());
+    tr.samples[1].lag = 0.15f;
+    tr.poses[1 * 9 + 7].testedPos[0] = 1.0f; tr.poses[1 * 9 + 7].testedPos[1] = 2.0f;   // sample 1, target 7 (the last written)
+    tr.poses[1 * 9 + 7].testedPos[2] = 3.0f;
+    encodeProjectileTrace(out, 26, 10, tr);
     const std::vector<proto::Frame> f = frames(out);
-    CHECK(f.size() == 24);
+    CHECK(f.size() == 26);
     for (size_t i = 0; i < f.size(); ++i)
     {
         Reader r(&f[i].payload[0], f[i].payload.size());
         CHECK(r.u32() == i + 1 && r.u32() == 10);
-        CHECK(f[i].type >= 0x1201 && f[i].type <= 0x1218);
+        CHECK(f[i].type >= 0x1201 && f[i].type <= 0x121A);
     }
     // Event types in table order.
-    const uint16_t expected[24] = { EvGameState, EvRoundStart, EvRoundEnd, EvPlayerConnect, EvPlayerDisconnect, EvSpawn,
+    const uint16_t expected[26] = { EvGameState, EvRoundStart, EvRoundEnd, EvPlayerConnect, EvPlayerDisconnect, EvSpawn,
                                     EvDeath, EvRevive, EvTeamChange, EvScoreChange, EvKill, EvDamage, EvEnterVehicle,
                                     EvExitVehicle, EvVehicleDestroyed, EvControlPoint, EvChat, EvProjectileFired,
-                                    EvProjectileHit, EvKick, EvBan, EvBot, EvWeaponFire, EvWeapons };
-    for (size_t i = 0; i < f.size() && i < 24; ++i)
+                                    EvProjectileHit, EvKick, EvBan, EvBot, EvWeaponFire, EvWeapons,
+                                    EvProjectileCollision, EvProjectileTrace };
+    for (size_t i = 0; i < f.size() && i < 26; ++i)
         CHECK(f[i].type == expected[i]);
+    {
+        Reader r(&f[24].payload[8], f[24].payload.size() - 8);   // ProjectileCollision
+        std::string sv;
+        CHECK(r.u32() == 1852);
+        r.str(sv);
+        CHECK(sv == "agm114_hellfire_tv" && r.i16() == 254 && r.u8() == kCollisionObject && r.u8() == 6);
+        CHECK(r.u32() == 1799 && r.u32() == 29312);
+        r.str(sv);
+        CHECK(sv == "ahe_ah1z");
+        r.str(sv);
+        CHECK(sv == "us_light_soldier" && r.i16() == 3);
+        float v[3];
+        for (int k = 0; k < 3; ++k)
+            readVec3(r, v);
+        CHECK(r.u16() == 7 && r.f32() == 0.3f);
+        for (int k = 0; k < 4; ++k)
+            readVec3(r, v);
+        CHECK(r.done());
+    }
+    {
+        Reader r(&f[25].payload[8], f[25].payload.size() - 8);   // ProjectileTrace
+        std::string sv;
+        CHECK(r.u32() == 1852);
+        r.str(sv);
+        CHECK(sv == "agm114_hellfire_tv" && r.i16() == -1 && r.u32() == 77 && r.u8() == kTraceCut);
+        CHECK(r.u8() == kMaxTraceTargets);
+        for (size_t k = 0; k < kMaxTraceTargets; ++k)
+        {
+            CHECK(r.u32() == 1800 + k);
+            r.str(sv);
+        }
+        CHECK(r.u16() == kMaxTraceSamples);
+        float v[3];
+        for (size_t i = 0; i < kMaxTraceSamples; ++i)
+        {
+            readVec3(r, v);
+            readVec3(r, v);
+            const float lag = r.f32();
+            if (i == 1)
+                CHECK(lag == 0.15f);
+            for (size_t k = 0; k < kMaxTraceTargets; ++k)
+            {
+                readVec3(r, v);
+                readVec3(r, v);
+                readVec3(r, v);
+                if (i == 1 && k == 7)
+                    CHECK(v[0] == 1.0f && v[1] == 2.0f && v[2] == 3.0f);
+                readVec3(r, v);
+            }
+        }
+        CHECK(r.done());
+        CHECK(f[25].payload.size() < kMaxOutboundPayload);
+    }
     {
         Reader r(&f[22].payload[8], f[22].payload.size() - 8);   // WeaponFire
         std::string sv;
@@ -695,6 +770,7 @@ std::vector<Case> validCommands()
     w.u32(28); w.u8(StreamWeaponFireEvents); w.u8(0); w.u8(0); CASE(MsgSubscribe);
     w.u32(29); w.u8(StreamWeaponFireEvents); w.u8(0); w.u8(1); w.str("ahe_z10_FlareLauncher"); CASE(MsgSubscribe);
     w.u32(30); w.u8(StreamWeaponEvents); w.u8(0); w.u8(0); CASE(MsgSubscribe);
+    w.u32(31); w.u8(StreamProjectileReplay); w.u8(0); w.u8(1); w.str("agm114_hellfire_tv"); CASE(MsgSubscribe);
 #undef CASE
     return cs;
 }
@@ -752,7 +828,8 @@ void testCommandParsing()
     w.u32(1); w.u8(StreamAim); w.u8(0); w.u8(0); BAD(MsgSubscribe);                           // aim rate 0
     w.u32(1); w.u8(StreamAim); w.u8(5); w.u8(1); w.str("x"); BAD(MsgSubscribe);               // aim takes no filter
     w.u32(1); w.u8(StreamWeaponEvents); w.u8(0); w.u8(1); w.str("x"); BAD(MsgSubscribe);      // weapons takes none
-    w.u32(1); w.u8(20); w.u8(0); w.u8(0); BAD(MsgSubscribe);                                  // unknown event stream
+    w.u32(1); w.u8(StreamProjectileReplay); w.u8(0); w.u8(0); BAD(MsgSubscribe);              // replay needs a filter
+    w.u32(1); w.u8(21); w.u8(0); w.u8(0); BAD(MsgSubscribe);                                  // unknown event stream
     w.u32(1); w.str(""); BAD(CmdConsole);
     w.u32(1); w.str("a\nb"); BAD(CmdConsole);
     w.u32(1); w.str(std::string(4097, 'a')); BAD(CmdConsole);
@@ -1532,7 +1609,7 @@ void testGolden()
 {
     const std::string path = std::string(SERVEREXT_FIXTURES) + "/admin-v1-golden.txt";
     std::map<std::string, std::vector<uint8_t> > golden = readGolden(path);
-    CHECK(golden.size() == 64);
+    CHECK(golden.size() == 67);
     if (golden.empty())
     {
         std::printf("  no golden fixtures at %s\n", path.c_str());
@@ -1646,6 +1723,43 @@ void testGolden()
         slots[1].slot = 1; slots[1].templateName = "ahe_z10_FlareLauncher";
         encodeWeapons(mine["ev_weapons"], 24, 10, 255, slots);
     }
+    {
+        ProjectileCollisionEvent e;
+        e.id = 1852; e.templateName = "agm114_hellfire_tv"; e.shooter = 254; e.kind = kCollisionObject;
+        e.flags = kCollisionRewound; e.rootNetId = 1799; e.rootObjectId = 29312; e.rootTemplate = "ahe_ah1z";
+        e.partTemplate = "agm114_hellfiredummy"; e.partPlayer = -1;
+        set3(e.pos, 210.5f, 199.25f, 112.0f);
+        set3(e.normal, 1.0f, 0.0f, 0.0f);
+        set3(e.speed, -30.0f, 2.5f, 120.0f);
+        e.material = 56; e.latency = 0.25f;
+        set3(e.partPos, 211.5f, 199.0f, 112.25f);
+        set3(e.partRot, 180.0f, 2.0f, 25.5f);
+        set3(e.rootPos, 206.0f, 199.5f, 110.0f);
+        set3(e.rootRot, 180.0f, 2.0f, 25.5f);
+        encodeProjectileCollision(mine["ev_projectile_collision"], 25, 10, e);
+    }
+    {
+        ProjectileTraceEvent e;
+        e.id = 1852; e.templateName = "agm114_hellfire_tv"; e.shooter = 254; e.firstTick = 5000; e.flags = kTraceCollided;
+        TraceTarget t;
+        t.netId = 1799; t.templateName = "ahe_ah1z";
+        e.targets.push_back(t);
+        for (int k = 0; k < 2; ++k)
+        {
+            TraceSample smp;
+            set3(smp.pos, 100.0f + k, 200.0f, 50.0f + 4 * k);
+            set3(smp.vel, 0.0f, -1.0f, 125.0f);
+            smp.lag = 0.25f;
+            e.samples.push_back(smp);
+            TracePose q;
+            set3(q.pos, 210.0f - k, 199.0f, 112.0f);
+            set3(q.rot, 180.0f, 2.0f, 25.5f);
+            set3(q.testedPos, 217.5f - k, 199.5f, 111.0f);
+            set3(q.testedRot, 180.0f, 1.5f, 25.0f);
+            e.poses.push_back(q);
+        }
+        encodeProjectileTrace(mine["ev_projectile_trace"], 26, 10, e);
+    }
     encodeOk(mine["ok"], 9);
     {
         std::vector<std::string> lines;
@@ -1691,10 +1805,11 @@ void testGolden()
         CHECK(ok);
         parsed[it->first] = c;
     }
-    CHECK(parsed.size() == 23);
+    CHECK(parsed.size() == 24);
     Command c;
     c = parsed["cmd_request_snapshot"]; CHECK(c.type == MsgRequestSnapshot && c.requestId == 1);
     c = parsed["cmd_subscribe_fire"]; CHECK(c.requestId == 25 && c.target == 18 && c.filters.size() == 1 && c.filters[0] == "ahe_z10_FlareLauncher");
+    c = parsed["cmd_subscribe_replay"]; CHECK(c.requestId == 26 && c.target == StreamProjectileReplay && c.filters.size() == 1 && c.filters[0] == "agm114_hellfire_tv");
     c = parsed["cmd_subscribe"]; CHECK(c.requestId == 3 && c.target == 3 && c.value8 == 5 && c.filters.size() == 1 && c.filters[0] == "agm114_hellfire_tv");
     c = parsed["cmd_unsubscribe"]; CHECK(c.requestId == 5 && c.target == 2);
     c = parsed["cmd_console"]; CHECK(c.requestId == 6 && c.text == "sv.serverName");

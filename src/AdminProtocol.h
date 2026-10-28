@@ -41,7 +41,7 @@ enum Type : uint16_t
     EvScoreChange = 0x120A, EvKill = 0x120B, EvDamage = 0x120C, EvEnterVehicle = 0x120D, EvExitVehicle = 0x120E,
     EvVehicleDestroyed = 0x120F, EvControlPoint = 0x1210, EvChat = 0x1211, EvProjectileFired = 0x1212,
     EvProjectileHit = 0x1213, EvKick = 0x1214, EvBan = 0x1215, EvBot = 0x1216,
-    EvWeaponFire = 0x1217, EvWeapons = 0x1218,
+    EvWeaponFire = 0x1217, EvWeapons = 0x1218, EvProjectileCollision = 0x1219, EvProjectileTrace = 0x121A,
     // commands
     CmdConsole = 0x1301, CmdSay = 0x1302, CmdTeleport = 0x1303, CmdSetHealth = 0x1304, CmdKillPlayer = 0x1305,
     CmdSetTeam = 0x1306, CmdSetScore = 0x1307, CmdRank = 0x1308, CmdMedal = 0x1309, CmdGameEvent = 0x130A,
@@ -69,7 +69,8 @@ const uint8_t kCapIdentity = 4;
 enum Stream : uint8_t
 {
     StreamPlayers = 1, StreamVehicles = 2, StreamProjectiles = 3, StreamGame = 4, StreamAim = 5,
-    StreamDamageEvents = 16, StreamProjectileEvents = 17, StreamWeaponFireEvents = 18, StreamWeaponEvents = 19
+    StreamDamageEvents = 16, StreamProjectileEvents = 17, StreamWeaponFireEvents = 18, StreamWeaponEvents = 19,
+    StreamProjectileReplay = 20
 };
 
 // ObjectRef kinds.
@@ -119,6 +120,7 @@ struct PlayerState
     float pos[3], rot[3], vel[3];
     float health;
     uint8_t viewMode;    // camera view mode, kViewModeNone when dead or without a camera
+    uint16_t lagMs;      // lag compensation for this player's projectiles, ms (IServerExtension::getLagCompensation)
     PlayerState();
 };
 
@@ -414,6 +416,73 @@ void encodeBot(std::vector<uint8_t>& out, uint32_t seq, uint32_t tick, uint8_t p
 void encodeWeaponFire(std::vector<uint8_t>& out, uint32_t seq, uint32_t tick, const WeaponFireEvent& e);
 void encodeWeapons(std::vector<uint8_t>& out, uint32_t seq, uint32_t tick, uint8_t player,
                    const std::vector<WeaponSlot>& slots);
+
+// ---------------------------------------------------------------- hit/miss replay (stream 20)
+
+// ProjectileCollision kinds and flags.
+const uint8_t kCollisionTerrain = 0, kCollisionObject = 1;
+const uint8_t kCollisionPartIsRoot = 1, kCollisionPartIsSoldier = 2, kCollisionRewound = 4;
+const size_t kMaxCollisionsPerTick = 64;
+
+struct ProjectileCollisionEvent
+{
+    uint32_t id;                    // as ProjectileState's
+    std::string templateName;
+    int16_t shooter;
+    uint8_t kind;                   // kCollisionTerrain or kCollisionObject
+    uint8_t flags;                  // kCollision* bits
+    uint32_t rootNetId;             // 0 none
+    uint32_t rootObjectId;          // kNoObjectId none
+    std::string rootTemplate;       // empty for terrain
+    std::string partTemplate;       // the object touched; empty for terrain
+    int16_t partPlayer;             // the soldier's player when kCollisionPartIsSoldier, else -1
+    float pos[3], normal[3], speed[3];
+    uint16_t material;
+    float latency;                  // seconds
+    float partPos[3], partRot[3];   // the part as tested
+    float rootPos[3], rootRot[3];   // the root now
+    ProjectileCollisionEvent();
+};
+
+// ProjectileTrace flags and limits.
+const uint8_t kTraceCut = 1, kTraceCollided = 2;
+const size_t kMaxTraceTargets = 8;
+const size_t kMaxTraceSamples = 300;
+
+struct TraceTarget
+{
+    uint32_t netId;
+    std::string templateName;
+};
+
+struct TraceSample
+{
+    float pos[3], vel[3];   // the projectile
+    float lag;              // the shooter's lag compensation, seconds
+};
+
+struct TracePose
+{
+    float pos[3], rot[3];               // the target now
+    float testedPos[3], testedRot[3];   // the pose the projectile's sweep in this tick is tested against
+};
+
+struct ProjectileTraceEvent
+{
+    uint32_t id;
+    std::string templateName;
+    int16_t shooter;
+    uint32_t firstTick;
+    uint8_t flags;
+    std::vector<TraceTarget> targets;
+    std::vector<TraceSample> samples;
+    std::vector<TracePose> poses;   // samples.size() x targets.size(), sample-major
+    ProjectileTraceEvent();
+};
+
+void encodeProjectileCollision(std::vector<uint8_t>& out, uint32_t seq, uint32_t tick, const ProjectileCollisionEvent& e);
+// Targets beyond kMaxTraceTargets and samples beyond kMaxTraceSamples are not written.
+void encodeProjectileTrace(std::vector<uint8_t>& out, uint32_t seq, uint32_t tick, const ProjectileTraceEvent& e);
 
 // ---------------------------------------------------------------- inbound (WebAdmin -> module)
 

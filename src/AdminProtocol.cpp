@@ -83,7 +83,7 @@ void appendUtf8(std::string& out, uint32_t cp)
 
 PlayerState::PlayerState()
     : team(0), squad(0), life(kLifeDead), flags(0), ping(0), rootNetId(0), rootObjectId(kNoObjectId), seat(kSeatNone),
-      health(-1.0f), viewMode(kViewModeNone)
+      health(-1.0f), viewMode(kViewModeNone), lagMs(0)
 {
     zero3(pos); zero3(rot); zero3(vel);
 }
@@ -115,6 +115,15 @@ WeaponFireEvent::WeaponFireEvent() : shooter(-1), rootNetId(0), rounds(0)
 {
     zero3(origin); zero3(velocity);
 }
+
+ProjectileCollisionEvent::ProjectileCollisionEvent()
+    : id(0), shooter(-1), kind(kCollisionTerrain), flags(0), rootNetId(0), rootObjectId(kNoObjectId), partPlayer(-1),
+      material(0), latency(0.0f)
+{
+    zero3(pos); zero3(normal); zero3(speed); zero3(partPos); zero3(partRot); zero3(rootPos); zero3(rootRot);
+}
+
+ProjectileTraceEvent::ProjectileTraceEvent() : id(0), shooter(-1), firstTick(0), flags(0) {}
 
 ObjectInfo::ObjectInfo() : objectId(kNoObjectId), netId(0), health(-1.0f), flags(0)
 {
@@ -202,6 +211,7 @@ void writePlayerState(Writer& w, const PlayerState& s)
     writeVec3(w, s.vel);
     w.f32(s.health);
     w.u8(s.viewMode);
+    w.u16(s.lagMs);
 }
 
 void readPlayerState(Reader& r, PlayerState& s)
@@ -219,6 +229,7 @@ void readPlayerState(Reader& r, PlayerState& s)
     readVec3(r, s.vel);
     s.health = r.f32();
     s.viewMode = r.u8();
+    s.lagMs = r.u16();
 }
 
 void writePlayerScore(Writer& w, const PlayerScore& s)
@@ -900,6 +911,70 @@ void encodeWeapons(std::vector<uint8_t>& out, uint32_t seq, uint32_t tick, uint8
     w.finish();
 }
 
+void encodeProjectileCollision(std::vector<uint8_t>& out, uint32_t seq, uint32_t tick, const ProjectileCollisionEvent& e)
+{
+    Writer w(out);
+    beginEvent(w, EvProjectileCollision, seq, tick);
+    w.u32(e.id);
+    w.str(e.templateName);
+    w.i16(e.shooter);
+    w.u8(e.kind);
+    w.u8(e.flags);
+    w.u32(e.rootNetId);
+    w.u32(e.rootObjectId);
+    w.str(e.rootTemplate);
+    w.str(e.partTemplate);
+    w.i16(e.partPlayer);
+    writeVec3(w, e.pos);
+    writeVec3(w, e.normal);
+    writeVec3(w, e.speed);
+    w.u16(e.material);
+    w.f32(e.latency);
+    writeVec3(w, e.partPos);
+    writeVec3(w, e.partRot);
+    writeVec3(w, e.rootPos);
+    writeVec3(w, e.rootRot);
+    w.finish();
+}
+
+void encodeProjectileTrace(std::vector<uint8_t>& out, uint32_t seq, uint32_t tick, const ProjectileTraceEvent& e)
+{
+    Writer w(out);
+    beginEvent(w, EvProjectileTrace, seq, tick);
+    w.u32(e.id);
+    w.str(e.templateName);
+    w.i16(e.shooter);
+    w.u32(e.firstTick);
+    w.u8(e.flags);
+    const size_t t = e.targets.size() > kMaxTraceTargets ? kMaxTraceTargets : e.targets.size();
+    w.u8(static_cast<uint8_t>(t));
+    for (size_t k = 0; k < t; ++k)
+    {
+        w.u32(e.targets[k].netId);
+        w.str(e.targets[k].templateName);
+    }
+    size_t n = e.samples.size() > kMaxTraceSamples ? kMaxTraceSamples : e.samples.size();
+    if (e.targets.size() && e.poses.size() / e.targets.size() < n)
+        n = e.poses.size() / e.targets.size();
+    w.u16(static_cast<uint16_t>(n));
+    for (size_t i = 0; i < n; ++i)
+    {
+        const TraceSample& s = e.samples[i];
+        writeVec3(w, s.pos);
+        writeVec3(w, s.vel);
+        w.f32(s.lag);
+        for (size_t k = 0; k < t; ++k)
+        {
+            const TracePose& q = e.poses[i * e.targets.size() + k];
+            writeVec3(w, q.pos);
+            writeVec3(w, q.rot);
+            writeVec3(w, q.testedPos);
+            writeVec3(w, q.testedRot);
+        }
+    }
+    w.finish();
+}
+
 // ---------------------------------------------------------------- inbound
 
 bool isWebAdminMessage(uint16_t type)
@@ -961,13 +1036,13 @@ bool parseCommand(uint16_t type, const uint8_t* p, size_t n, Command& out, std::
             return false;
         const uint8_t s = out.target;
         const bool eventStream = s == StreamDamageEvents || s == StreamProjectileEvents ||
-                                 s == StreamWeaponFireEvents || s == StreamWeaponEvents;
+                                 s == StreamWeaponFireEvents || s == StreamWeaponEvents || s == StreamProjectileReplay;
         if (s != StreamPlayers && s != StreamVehicles && s != StreamProjectiles && s != StreamGame && s != StreamAim &&
             !eventStream)
             return bad(badValue, "unknown stream");
         if (!eventStream && (out.value8 < 1 || out.value8 > 30))
             return bad(badValue, "rate must be 1..30 Hz");
-        const bool needsFilters = s == StreamProjectiles || s == StreamProjectileEvents;
+        const bool needsFilters = s == StreamProjectiles || s == StreamProjectileEvents || s == StreamProjectileReplay;
         const bool anyFilters = s == StreamWeaponFireEvents;
         if (!anyFilters && (needsFilters ? out.filters.empty() : !out.filters.empty()))
             return bad(badValue, needsFilters ? "this stream needs at least one template filter"

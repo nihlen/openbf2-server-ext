@@ -57,6 +57,11 @@ const int kStatusPlaying = 1, kStatusEndGame = 2, kStatusPaused = 4;
 const size_t kMaxCommandsPerTick = 64;
 const size_t kMaxTrackedProjectiles = 256;
 const size_t kMaxPendingFires = 512;      // WeaponFire aggregates per tick; more are dropped and counted
+const size_t kMaxTraces = 64;             // ProjectileTrace flights recorded at once; more are not traced
+const float kTraceCandidateRange = 1000.0f;   // vehicles this close at launch are sampled
+const float kTraceTargetRange = 150.0f;       // and kept as targets when they come this close
+const size_t kTraceTailSamples = 15;          // samples kept after the first collision
+const float kTickSeconds = 1.0f / 30.0f;
 const unsigned int kCachedObjectFlag = 0x20;
 const uint32_t kNoNetIdBase = 0x10000;
 const unsigned long kStatsPeriodTicks = 1800;
@@ -170,14 +175,16 @@ class Admin : public AdminChannel,
               public IEventListener,
               public IServerExtension::IScriptEventListener,
               public IServerExtension::IDamageObserver,
-              public IServerExtension::IProjectileObserver
+              public IServerExtension::IProjectileObserver,
+              public IServerExtension::IProjectileCollisionObserver
 {
 public:
     Admin(const Config& config, AdminHost* host, AdminLogFn log)
         : m_config(config), m_host(host), m_logFn(log), m_em(0), m_ext(0), m_players(0), m_objects(0), m_game(0),
           m_server(0), m_system(0), m_console(0), m_templates(0), m_link(0), m_io(0), m_session(0), m_seq(0),
           m_tick(0), m_lastStatus(-2), m_lastBeginRound(-2), m_cpsScanned(false), m_lastCpScan(0), m_damageEvents(false),
-          m_projectileEvents(false), m_fireEvents(false), m_weaponEvents(false), m_firesDropped(0), m_r4(false),
+          m_projectileEvents(false), m_fireEvents(false), m_weaponEvents(false), m_firesDropped(0), m_replay(false),
+          m_collisionsThisTick(0), m_collisionsDropped(0), m_tracesSent(0), m_tracesSkipped(0), m_r4(false),
           m_eventsSent(0), m_eventsDropped(0), m_commands(0)
     {
         for (int i = 0; i < kCategories; ++i)
@@ -230,15 +237,16 @@ public:
         const bool hudOk = m_em->registerEventHandler(ECHud, this, 0);
         const bool damageOk = m_ext->addDamageObserver(this);
         const bool projectileOk = m_ext->addProjectileObserver(this);
+        const bool collisionOk = m_ext->addProjectileCollisionObserver(this);
         char buf[512];
         std::snprintf(buf, sizeof(buf),
                       "admin channel: protocol v%u, dial %s:%d, server id '%s', TLS %s, identity %d, console %d, objects %d, "
-                      "queue %d bytes; R4 1, status hook %d, unload hook %d, damage %d, projectile %d",
+                      "queue %d bytes; R4 1, status hook %d, unload hook %d, damage %d, projectile %d, collision %d",
                       static_cast<unsigned>(kVersion), m_config.adminHost.c_str(), m_config.adminPort,
                       m_config.adminServerId.c_str(), m_config.adminTls ? "1.3 (pinned)" : "off (loopback test)",
                       m_config.adminIdentity() ? 1 : 0, m_config.adminAllowConsole ? 1 : 0,
                       m_config.adminAllowObjects ? 1 : 0, m_config.adminQueueBytes, statusOk ? 1 : 0, hudOk ? 1 : 0,
-                      damageOk ? 1 : 0, projectileOk ? 1 : 0);
+                      damageOk ? 1 : 0, projectileOk ? 1 : 0, collisionOk ? 1 : 0);
         m_describe = buf;
         return true;
     }
@@ -251,9 +259,11 @@ public:
     {
         const std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
         m_tick = tick;
+        m_collisionsThisTick = 0;
         processCommands();
         if (m_session)
         {
+            sampleTraces();
             pollGameState();
             if (!m_cpsScanned || (m_cps.empty() && m_tick - m_lastCpScan >= kCpRescanTicks))
                 scanControlPoints();
@@ -293,6 +303,7 @@ public:
             m_cpsScanned = false;
             m_projectiles.clear();
             m_fires.clear();
+            m_traces.clear();
             logf("tick %lu: admin: level unload; control points and projectiles forgotten", m_tick);
             return;
         }
@@ -382,6 +393,8 @@ public:
         const std::string name = templateName(projectile);
         if (m_fireEvents)
             addFire(projectile, shooter, name);
+        if (m_replay && contains(m_replayFilters, name))
+            startTrace(projectile, shooter, name);
         if (m_projectiles.size() >= kMaxTrackedProjectiles)
             return;
         const bool streamed = m_streams[StreamProjectiles].on && contains(m_streams[StreamProjectiles].filters, name);
@@ -412,6 +425,64 @@ public:
         }
     }
 
+    // Projectile-collision observer (OpenBF2 serverext/r1 0a58ec0): ProjectileCollision on stream 20, and the
+    // end of a trace. Runs inside the collision response; reads transforms and queues, nothing else. The tick
+    // is numbered as Damage numbers it: the state the colliding tick started from, which is also the trace
+    // sample whose tested poses the sweep used.
+    virtual void onProjectileCollision(const IServerExtension::ProjectileCollisionInfo& c)
+    {
+        if (!m_session || !m_replay || !c.projectile)
+            return;
+        Trace* trace = findTrace(c.projectile);
+        const std::string name = trace ? trace->templateName : templateName(c.projectile);
+        if (!trace && !contains(m_replayFilters, name))
+            return;
+        if (trace && trace->collidedAt < 0)
+            trace->collidedAt = static_cast<int>(trace->samples.size()) - 1;
+        if (m_collisionsThisTick >= kMaxCollisionsPerTick)
+        {
+            ++m_collisionsDropped;
+            return;
+        }
+        ++m_collisionsThisTick;
+
+        ProjectileCollisionEvent e;
+        e.id = trace ? trace->wireId : wireIdOf(c.projectile);
+        e.templateName = cp1252ToUtf8(name);
+        e.shooter = c.shooter && c.shooter->getId() >= 0 && c.shooter->getId() <= 255
+                        ? static_cast<int16_t>(c.shooter->getId()) : -1;
+        for (int k = 0; k < 3; ++k)
+        {
+            e.pos[k] = c.position[k];
+            e.normal[k] = c.normal[k];
+            e.speed[k] = c.speed[k];
+        }
+        e.material = static_cast<uint16_t>(c.material < 0 ? 0 : c.material > 0xFFFF ? 0xFFFF : c.material);
+        e.latency = c.latency;
+        if (c.other)
+        {
+            IObject* root = rootOf(c.other);
+            const bool soldier = c.other->queryInterface(IID_ISoldier) != 0;
+            e.kind = kCollisionObject;
+            e.flags = static_cast<uint8_t>((root == c.other ? kCollisionPartIsRoot : 0) |
+                                           (soldier ? kCollisionPartIsSoldier : 0) |
+                                           (c.otherRewound ? kCollisionRewound : 0));
+            e.rootNetId = netIdOf(root);
+            e.rootObjectId = objectIdOf(root);
+            e.rootTemplate = cp1252ToUtf8(templateName(root));
+            e.partTemplate = cp1252ToUtf8(templateName(c.other));
+            if (soldier)
+                if (world::IPlayer* p = playerOfSoldier(c.other))
+                    e.partPlayer = static_cast<int16_t>(p->getId());
+            testedPose(c.other, c.otherRewound ? c.latency : 0.0f, e.partPos, e.partRot);
+            if (root)
+                placeOf(root, e.rootPos, e.rootRot);
+        }
+        std::vector<uint8_t> f;
+        encodeProjectileCollision(f, ++m_seq, tickNumber(), e);
+        event(f);
+    }
+
 private:
     struct Track
     {
@@ -439,6 +510,32 @@ private:
         float timeToLive;
         float lastPos[3];
         int16_t owner;
+    };
+
+    // A vehicle sampled for a trace: every root within kTraceCandidateRange of the launch.
+    struct TraceCandidate
+    {
+        IObject* object;            // borrowed; used only after getRegisteredObject(objectId) returns it
+        unsigned int objectId;
+        uint32_t netId;
+        std::string templateName;   // UTF-8
+        float minDistance;          // closest approach to the projectile so far
+        bool lastNotRewound;        // the last pose is tested unrewound: its tested pose is the next sample's
+        std::vector<TracePose> poses;   // one per sample
+    };
+
+    // One subscribed projectile's flight being recorded for ProjectileTrace.
+    struct Trace
+    {
+        IObject* object;            // borrowed; used only after getRegisteredObject(objectId) returns it
+        unsigned int objectId;
+        uint32_t wireId;
+        std::string templateName;   // engine bytes
+        int shooterId;              // -1 none
+        uint32_t firstTick;
+        int collidedAt;             // the sample whose sweep collided first, -1 none yet
+        std::vector<TraceSample> samples;
+        std::vector<TraceCandidate> candidates;
     };
 
     // One WeaponFire event being gathered: a shooter's launches from one weapon in one tick.
@@ -528,13 +625,16 @@ private:
     void reportStats()
     {
         const double seconds = kStatsPeriodTicks / 30.0;
-        logf("tick %lu: admin: session %u, events %llu sent %llu dropped, commands %llu; B/s events %.0f (fire %.0f) replies %.0f players %.0f vehicles %.0f projectiles %.0f game %.0f aim %.0f; fires dropped %llu; admin cost (us) p50 %.0f p99 %.0f max %.0f",
+        logf("tick %lu: admin: session %u, events %llu sent %llu dropped, commands %llu; B/s events %.0f (fire %.0f) replies %.0f players %.0f vehicles %.0f projectiles %.0f game %.0f aim %.0f; fires dropped %llu; collisions dropped %llu, traces %llu sent %llu not traced; admin cost (us) p50 %.0f p99 %.0f max %.0f",
              m_tick, m_session, static_cast<unsigned long long>(m_eventsSent), static_cast<unsigned long long>(m_eventsDropped),
              static_cast<unsigned long long>(m_commands), m_bytes[CatEvents] / seconds, m_bytes[CatFire] / seconds,
              m_bytes[CatReplies] / seconds, m_bytes[CatPlayers] / seconds, m_bytes[CatVehicles] / seconds,
              m_bytes[CatProjectiles] / seconds, m_bytes[CatGame] / seconds, m_bytes[CatAim] / seconds,
-             static_cast<unsigned long long>(m_firesDropped), m_cost.pct(0.5), m_cost.pct(0.99), m_cost.max());
+             static_cast<unsigned long long>(m_firesDropped), static_cast<unsigned long long>(m_collisionsDropped),
+             static_cast<unsigned long long>(m_tracesSent), static_cast<unsigned long long>(m_tracesSkipped),
+             m_cost.pct(0.5), m_cost.pct(0.99), m_cost.max());
         m_firesDropped = 0;
+        m_collisionsDropped = m_tracesSent = m_tracesSkipped = 0;
         for (int i = 0; i < kCategories; ++i)
             m_bytes[i] = 0;
         m_cost.reset();
@@ -647,6 +747,40 @@ private:
         attitudeFromMatrix(m.m, rot);
     }
 
+    // The pose a projectile sweep is tested against: the object's lag-compensated transform when it keeps a
+    // latency history and lag is above one tick (PointResponsePhysics::checkObjectVsObject), else its current
+    // one. The engine returns a function-static matrix, so it is copied at once.
+    // @return True when the pose is the rewound one.
+    static bool testedPose(IObject* o, float lag, float pos[3], float rot[3])
+    {
+        IPhysicsNode* node = static_cast<IPhysicsNode*>(o->queryComponent(IID_IPhysicsNode, IID_IPhysicsNode));
+        if (!node || !(lag > kTickSeconds) || !node->hasLatencyCompensation())
+        {
+            placeOf(o, pos, rot);
+            return false;
+        }
+        const Mat4 m = node->getLatencyCompensatedTransformation(lag, 0);
+        pos[0] = m.m[12]; pos[1] = m.m[13]; pos[2] = m.m[14];
+        attitudeFromMatrix(m.m, rot);
+        return true;
+    }
+
+    static uint32_t wireIdOf(IObject* o)
+    {
+        const uint32_t net = netIdOf(o);
+        return net ? net : kNoNetIdBase + o->getObjectId();
+    }
+
+    // The player whose soldier o is (alive or seated), or null.
+    world::IPlayer* playerOfSoldier(IObject* o)
+    {
+        const std::list<world::IPlayer*>& players = m_players->getPlayers();
+        for (std::list<world::IPlayer*>::const_iterator it = players.begin(); it != players.end(); ++it)
+            if (*it && (*it)->getDefaultVehicle() == o)
+                return *it;
+        return 0;
+    }
+
     void fillScore(world::IPlayer* p, PlayerScore& s)
     {
         PlayerScoreData* d = p->getScoreData();
@@ -675,6 +809,8 @@ private:
         s.ping = static_cast<uint16_t>(ping > 0xFFFF ? 0xFFFF : ping);
         if (seat)
             s.seat = clampU8(seat->getPcoId());
+        const float lag = m_ext->getLagCompensation(p->getId());
+        s.lagMs = static_cast<uint16_t>(lag > 0.0f ? (lag * 1000.0f > 65535.0f ? 65535.0f : lag * 1000.0f + 0.5f) : 0.0f);
         root = rootOfPlayer(p);
         if (!root)
             return;
@@ -916,6 +1052,7 @@ private:
         m_pending.clear();
         m_projectiles.clear();
         m_fires.clear();
+        m_traces.clear();
     }
 
     void baseline(world::IPlayer* p, Track& t)
@@ -1161,6 +1298,162 @@ private:
             }
             m_projectiles.erase(m_projectiles.begin() + i);
         }
+    }
+
+    // ---------------------------------------------------------------- traces (stream 20)
+
+    Trace* findTrace(IObject* projectile)
+    {
+        for (size_t i = 0; i < m_traces.size(); ++i)
+            if (m_traces[i].object == projectile)
+                return &m_traces[i];
+        return 0;
+    }
+
+    // Called from the projectile observer, inside the fire path: picks the candidates, takes no sample yet.
+    void startTrace(IObject* projectile, world::IPlayer* shooter, const std::string& name)
+    {
+        if (m_traces.size() >= kMaxTraces)
+        {
+            ++m_tracesSkipped;
+            return;
+        }
+        Trace t;
+        t.object = projectile;
+        t.objectId = projectile->getObjectId();
+        t.wireId = wireIdOf(projectile);
+        t.templateName = name;
+        t.shooterId = shooter ? shooter->getId() : -1;
+        t.firstTick = 0;
+        t.collidedAt = -1;
+        IObject* own = shooter ? rootOfPlayer(shooter) : 0;
+        const Vec3& at = projectile->getAbsolutePosition();
+        m_vehicleRoots.clear();
+        m_host->vehicleRoots(m_vehicleRoots);
+        for (size_t i = 0; i < m_vehicleRoots.size(); ++i)
+        {
+            IObject* v = m_vehicleRoots[i];
+            if (!v || v == own || healthOf(v, 0) < 0.0f)   // pooled entries have no armour
+                continue;
+            const Vec3& p = v->getAbsolutePosition();
+            const float dx = p.x - at.x, dy = p.y - at.y, dz = p.z - at.z;
+            if (dx * dx + dy * dy + dz * dz > kTraceCandidateRange * kTraceCandidateRange)
+                continue;
+            TraceCandidate c;
+            c.object = v;
+            c.objectId = v->getObjectId();
+            c.netId = netIdOf(v);
+            c.templateName = cp1252ToUtf8(templateName(v));
+            c.minDistance = 1e9f;
+            c.lastNotRewound = false;
+            t.candidates.push_back(c);
+        }
+        m_traces.push_back(t);
+    }
+
+    // In the tick hook, before the simulation: one sample per trace (the state the coming tick starts from,
+    // and the poses its sweeps will be tested against); finished traces are sent.
+    void sampleTraces()
+    {
+        for (size_t i = 0; i < m_traces.size();)
+        {
+            Trace& t = m_traces[i];
+            IObject* o = m_objects->getRegisteredObject(static_cast<int>(t.objectId));
+            const bool live = o && o == t.object && !(o->getFlags() & kCachedObjectFlag);
+            bool done = !live;
+            if (live)
+            {
+                if (t.samples.empty())
+                    t.firstTick = tickNumber();
+                TraceSample s;
+                const Vec3& at = o->getAbsolutePosition();
+                s.pos[0] = at.x; s.pos[1] = at.y; s.pos[2] = at.z;
+                velocityOf(o, s.vel);
+                const float lag = t.shooterId >= 0 ? m_ext->getLagCompensation(t.shooterId) : 0.0f;
+                s.lag = lag > 0.0f ? lag : 0.0f;
+                t.samples.push_back(s);
+                for (size_t k = 0; k < t.candidates.size(); ++k)
+                {
+                    TraceCandidate& c = t.candidates[k];
+                    IObject* v = m_objects->getRegisteredObject(static_cast<int>(c.objectId));
+                    TracePose q;
+                    std::memset(&q, 0, sizeof(q));
+                    bool notRewound = false;
+                    if (v && v == c.object)
+                    {
+                        placeOf(v, q.pos, q.rot);
+                        notRewound = !testedPose(v, s.lag, q.testedPos, q.testedRot);
+                        const float dx = q.pos[0] - s.pos[0], dy = q.pos[1] - s.pos[1], dz = q.pos[2] - s.pos[2];
+                        const float d = std::sqrt(dx * dx + dy * dy + dz * dz);
+                        if (d < c.minDistance)
+                            c.minDistance = d;
+                        // Unrewound, the coming tick's sweep meets the target where that tick leaves it (targets
+                        // integrate before collision): the previous sample's tested pose is this current one.
+                        if (c.lastNotRewound && !c.poses.empty())
+                        {
+                            TracePose& prev = c.poses.back();
+                            for (int j = 0; j < 3; ++j)
+                            {
+                                prev.testedPos[j] = q.pos[j];
+                                prev.testedRot[j] = q.rot[j];
+                            }
+                        }
+                    }
+                    else if (!c.poses.empty())
+                        q = c.poses.back();   // left the world: keeps its last pose
+                    c.lastNotRewound = notRewound;
+                    c.poses.push_back(q);
+                }
+                if (t.collidedAt >= 0 && t.samples.size() >= static_cast<size_t>(t.collidedAt) + 1 + kTraceTailSamples)
+                    done = true;
+                if (t.samples.size() >= kMaxTraceSamples)
+                    done = true;
+            }
+            if (done)
+            {
+                sendTrace(t);
+                m_traces.erase(m_traces.begin() + i);
+            }
+            else
+                ++i;
+        }
+    }
+
+    void sendTrace(const Trace& t)
+    {
+        if (t.samples.empty())
+            return;
+        std::vector<const TraceCandidate*> near;
+        for (size_t k = 0; k < t.candidates.size(); ++k)
+            if (t.candidates[k].minDistance <= kTraceTargetRange)
+                near.push_back(&t.candidates[k]);
+        std::sort(near.begin(), near.end(),
+                  [](const TraceCandidate* a, const TraceCandidate* b) { return a->minDistance < b->minDistance; });
+        if (near.size() > kMaxTraceTargets)
+            near.resize(kMaxTraceTargets);
+        ProjectileTraceEvent e;
+        e.id = t.wireId;
+        e.templateName = cp1252ToUtf8(t.templateName);
+        e.shooter = t.shooterId >= 0 && t.shooterId <= 255 ? static_cast<int16_t>(t.shooterId) : -1;
+        e.firstTick = t.firstTick;
+        e.flags = static_cast<uint8_t>((t.samples.size() >= kMaxTraceSamples ? kTraceCut : 0) |
+                                       (t.collidedAt >= 0 ? kTraceCollided : 0));
+        e.samples = t.samples;
+        for (size_t k = 0; k < near.size(); ++k)
+        {
+            TraceTarget target;
+            target.netId = near[k]->netId;
+            target.templateName = near[k]->templateName;
+            e.targets.push_back(target);
+        }
+        e.poses.reserve(t.samples.size() * near.size());
+        for (size_t i = 0; i < t.samples.size(); ++i)
+            for (size_t k = 0; k < near.size(); ++k)
+                e.poses.push_back(near[k]->poses[i]);
+        std::vector<uint8_t> f;
+        encodeProjectileTrace(f, ++m_seq, tickNumber(), e);
+        event(f);
+        ++m_tracesSent;
     }
 
     // ---------------------------------------------------------------- streams
@@ -1753,6 +2046,11 @@ private:
             m_weaponEvents = true;
             forgetWeapons();   // this tick's pollWeapons, after the Ok, reports every player
         }
+        else if (c.target == StreamProjectileReplay)
+        {
+            m_replay = true;
+            m_replayFilters = filters;
+        }
         else
         {
             StreamSub& s = m_streams[c.target];
@@ -1785,6 +2083,12 @@ private:
         }
         else if (c.target == StreamWeaponEvents)
             m_weaponEvents = false;
+        else if (c.target == StreamProjectileReplay)
+        {
+            m_replay = false;
+            m_replayFilters.clear();
+            m_traces.clear();
+        }
         else if (c.target >= StreamPlayers && c.target <= StreamAim)
             m_streams[c.target] = StreamSub();
         else
@@ -2289,6 +2593,11 @@ private:
     uint64_t m_firesDropped;
     WeaponTrack m_weaponTracks[256];
     std::vector<AimState> m_aims;
+    bool m_replay;                              // stream 20
+    std::vector<std::string> m_replayFilters;   // lowered
+    std::vector<Trace> m_traces;
+    size_t m_collisionsThisTick;
+    uint64_t m_collisionsDropped, m_tracesSent, m_tracesSkipped;
     bool m_r4;
 
     std::vector<IObject*> m_vehicleRoots;

@@ -45,7 +45,7 @@ EV_PLAYER_DISCONNECT, EV_SPAWN, EV_DEATH, EV_REVIVE, EV_TEAM_CHANGE = 0x1205, 0x
 EV_SCORE_CHANGE, EV_KILL, EV_DAMAGE, EV_ENTER_VEHICLE, EV_EXIT_VEHICLE = 0x120A, 0x120B, 0x120C, 0x120D, 0x120E
 EV_VEHICLE_DESTROYED, EV_CONTROL_POINT, EV_CHAT, EV_PROJECTILE_FIRED = 0x120F, 0x1210, 0x1211, 0x1212
 EV_PROJECTILE_HIT, EV_KICK, EV_BAN, EV_BOT = 0x1213, 0x1214, 0x1215, 0x1216
-EV_WEAPON_FIRE, EV_WEAPONS = 0x1217, 0x1218
+EV_WEAPON_FIRE, EV_WEAPONS, EV_PROJECTILE_COLLISION, EV_PROJECTILE_TRACE = 0x1217, 0x1218, 0x1219, 0x121A
 CMD_CONSOLE, CMD_SAY, CMD_TELEPORT, CMD_SET_HEALTH, CMD_KILL_PLAYER = 0x1301, 0x1302, 0x1303, 0x1304, 0x1305
 CMD_SET_TEAM, CMD_SET_SCORE, CMD_RANK, CMD_MEDAL, CMD_GAME_EVENT = 0x1306, 0x1307, 0x1308, 0x1309, 0x130A
 CMD_HUD_EVENT, CMD_KICK, CMD_BAN, CMD_MAP, CMD_LIST_OBJECTS = 0x130B, 0x130C, 0x130D, 0x130E, 0x130F
@@ -55,10 +55,13 @@ PING, PONG, ERROR = 0x1501, 0x1502, 0xFFFF
 
 NAMES = {v: k for k, v in list(globals().items()) if isinstance(v, int) and k.isupper() and 0x1000 <= v <= 0xFFFF
          and k not in ("VERSION",)}
-EVENT_TYPES = range(0x1201, 0x1219)
+EVENT_TYPES = range(0x1201, 0x121B)
 
 STREAMS = {"players": 1, "vehicles": 2, "projectiles": 3, "game": 4, "aim": 5, "damage": 16, "projectile-events": 17,
-           "fire": 18, "weapons": 19}
+           "fire": 18, "weapons": 19, "replay": 20}
+COLLISION_TERRAIN, COLLISION_OBJECT = 0, 1
+COLLISION_ROOT, COLLISION_SOLDIER, COLLISION_REWOUND = 1, 2, 4
+TRACE_CUT, TRACE_COLLIDED = 1, 2
 AIM_CAMERA, AIM_WEAPON = 1, 2
 REF_PLAYER, REF_NET, REF_CONSOLE = 1, 2, 3
 ERR_VERSION, ERR_MALFORMED, ERR_UNKNOWN_TYPE, ERR_UNKNOWN_PLAYER = 1, 2, 3, 4
@@ -147,13 +150,13 @@ def r_game(r):
 
 def w_pstate(w, s):
     w.u8(s["team"]).u8(s["squad"]).u8(s["life"]).u8(s["flags"]).u16(s["ping"]).u32(s["root_net"]).u32(s["root_obj"])
-    w.u8(s["seat"]).vec3(s["pos"]).vec3(s["rot"]).vec3(s["vel"]).f32(s["health"]).u8(s["view_mode"])
+    w.u8(s["seat"]).vec3(s["pos"]).vec3(s["rot"]).vec3(s["vel"]).f32(s["health"]).u8(s["view_mode"]).u16(s["lag_ms"])
 
 
 def r_pstate(r):
     return {"team": r.u8(), "squad": r.u8(), "life": r.u8(), "flags": r.u8(), "ping": r.u16(), "root_net": r.u32(),
             "root_obj": r.u32(), "seat": r.u8(), "pos": r.vec3(), "rot": r.vec3(), "vel": r.vec3(), "health": r.f32(),
-            "view_mode": r.u8()}
+            "view_mode": r.u8(), "lag_ms": r.u16()}
 
 
 def w_score(w, s):
@@ -310,6 +313,21 @@ def decode(t, payload):
         elif t == EV_WEAPONS:
             m.update(player=r.u8())
             m["slots"] = [(r.u8(), r.s()) for _ in range(r.u8())]
+        elif t == EV_PROJECTILE_COLLISION:
+            m.update(id=r.u32(), template=r.s(), shooter=r.i16(), kind=r.u8(), flags=r.u8(), root_net=r.u32(),
+                     root_obj=r.u32(), root_template=r.s(), part_template=r.s(), part_player=r.i16(), pos=r.vec3(),
+                     normal=r.vec3(), speed=r.vec3(), material=r.u16(), latency=r.f32(), part_pos=r.vec3(),
+                     part_rot=r.vec3(), root_pos=r.vec3(), root_rot=r.vec3())
+        elif t == EV_PROJECTILE_TRACE:
+            m.update(id=r.u32(), template=r.s(), shooter=r.i16(), first_tick=r.u32(), flags=r.u8())
+            m["targets"] = [(r.u32(), r.s()) for _ in range(r.u8())]
+            samples = []
+            for _ in range(r.u16()):
+                smp = {"pos": r.vec3(), "vel": r.vec3(), "lag": r.f32()}
+                smp["targets"] = [{"pos": r.vec3(), "rot": r.vec3(), "tested_pos": r.vec3(), "tested_rot": r.vec3()}
+                                  for _ in m["targets"]]
+                samples.append(smp)
+            m["samples"] = samples
     elif t == OK:
         m.update(request=r.u32())
     elif t == CONSOLE_RESULT:
@@ -404,7 +422,7 @@ def golden_samples():
     s = {}
     pstate = {"team": 2, "squad": 3, "life": 2, "flags": 5, "ping": 48, "root_net": 1819, "root_obj": 29328,
               "seat": 1, "pos": (1.5, 100.25, -3.0), "rot": (90.0, -5.0, 2.5), "vel": (10.0, 0.5, -1.0),
-              "health": 0.75, "view_mode": 3}
+              "health": 0.75, "view_mode": 3, "lag_ms": 245}
     score = {"score": 12, "team_score": 4, "kills": 5, "deaths": 2, "team_kills": 1, "rank": 7}
     pinfo = {"id": 3, "name": "§netsky", "flags": INFO_CONNECTED | INFO_IDENTITY, "profile": 43001234,
              "ip": "10.0.0.7", "hash": "0123456789abcdef0123456789abcdef", "score": score, "state": pstate}
@@ -499,6 +517,18 @@ def golden_samples():
     s["ev_weapon_fire"] = (EV_WEAPON_FIRE, ev(23).i16(255).u32(1819).s("ahe_z10_30mm").s("ahe_z10_30mm_projectile")
                            .u8(3).vec3((1.0, 2.0, 3.0)).vec3((400.0, -5.0, 10.0)).b)
     s["ev_weapons"] = (EV_WEAPONS, ev(24).u8(255).u8(2).u8(0).s("ahe_z10_30mm").u8(1).s("ahe_z10_FlareLauncher").b)
+    s["ev_projectile_collision"] = (
+        EV_PROJECTILE_COLLISION,
+        ev(25).u32(1852).s("agm114_hellfire_tv").i16(254).u8(COLLISION_OBJECT).u8(COLLISION_REWOUND).u32(1799)
+        .u32(29312).s("ahe_ah1z").s("agm114_hellfiredummy").i16(-1).vec3((210.5, 199.25, 112.0))
+        .vec3((1.0, 0.0, 0.0)).vec3((-30.0, 2.5, 120.0)).u16(56).f32(0.25).vec3((211.5, 199.0, 112.25))
+        .vec3((180.0, 2.0, 25.5)).vec3((206.0, 199.5, 110.0)).vec3((180.0, 2.0, 25.5)).b)
+    w = ev(26).u32(1852).s("agm114_hellfire_tv").i16(254).u32(5000).u8(TRACE_COLLIDED).u8(1).u32(1799).s("ahe_ah1z")
+    w.u16(2)
+    for k in range(2):
+        w.vec3((100.0 + k, 200.0, 50.0 + 4 * k)).vec3((0.0, -1.0, 125.0)).f32(0.25)
+        w.vec3((210.0 - k, 199.0, 112.0)).vec3((180.0, 2.0, 25.5)).vec3((217.5 - k, 199.5, 111.0)).vec3((180.0, 1.5, 25.0))
+    s["ev_projectile_trace"] = (EV_PROJECTILE_TRACE, w.b)
 
     s["ok"] = (OK, W().u32(9).b)
     s["console_result"] = (CONSOLE_RESULT, W().u32(10).u8(1).u16(3).s("a").s("").s("§").b)
@@ -533,6 +563,7 @@ def golden_samples():
     s["cmd_delete_object"] = (CMD_DELETE_OBJECT, p_object_ref(23, REF_NET, 5))
     s["cmd_ping"] = (PING, p_ping(24, 99))
     s["cmd_subscribe_fire"] = (SUBSCRIBE, p_subscribe(25, 18, 0, ["ahe_z10_FlareLauncher"]))
+    s["cmd_subscribe_replay"] = (SUBSCRIBE, p_subscribe(26, 20, 0, ["agm114_hellfire_tv"]))
     return s
 
 
@@ -645,7 +676,7 @@ class Link:
                 return m
             self.check_seq(m)
             self.events.append(m)
-            if self.args.verbose or m["type"] not in (EV_SCORE_CHANGE, EV_DAMAGE):
+            if self.args.verbose or m["type"] not in (EV_SCORE_CHANGE, EV_DAMAGE, EV_PROJECTILE_COLLISION, EV_PROJECTILE_TRACE):
                 log("  event", describe(m))
         elif t == SNAPSHOT:
             self.snapshot = m
@@ -874,7 +905,7 @@ def subscribe_all(link, args):
         name, _, rate = spec.partition(":")
         stream = STREAMS[name]
         filters = []
-        if stream in (3, 17):
+        if stream in (3, 17, 20):
             filters = args.projectile_templates.split(",")
         elif stream == 18 and args.fire_templates:
             filters = args.fire_templates.split(",")
@@ -1406,6 +1437,145 @@ def scenario_viewer(lst, args):
     return c.summary("viewer")
 
 
+def scenario_replay(lst, args):
+    """The hit/miss replay (stream 20 and the lag in PlayerState) against tools/testclient/tvscan.py: a scripted
+    gunner shooting TV missiles at a target's passes. Forces the server's lag compensation with
+    phy-latencyComp-debug (--lags, in blocks), then checks every ProjectileTrace against itself (each sample's
+    tested pose is the engine's rewind of the trace's own current poses) and every ProjectileCollision against its
+    trace (a rewound hull's tested pose is the trace's for that tick). --console-setup runs console lines first
+    (test servers only: the scan uses ObjectTemplate.damage 1 so the target survives)."""
+    c = Checks()
+    link = lst.accept(args.accept_timeout)
+    rq = link.next_request
+    templates = args.projectile_templates.split(",")
+    lag_ms = {}      # forced lag (s) -> [PlayerState lag_ms of every player]
+    blocks = []      # (tick from which the lag holds, lag)
+    current = [None]
+
+    def on_frame(m):
+        if m["type"] == PLAYER_STREAM and current[0] is not None and blocks and m["tick"] > blocks[-1][0] + 30:
+            lag_ms.setdefault(current[0], []).extend(s["lag_ms"] for _, s in m["players"])
+    link.on_frame = on_frame
+
+    r = link.request(SUBSCRIBE, p_subscribe(rq(), 20, 0))
+    c.check(r["name"] == "ERROR" and r["code"] == ERR_INVALID, "Subscribe replay without a filter -> Error 7 (%s)" %
+            r.get("message"))
+    r = link.request(SUBSCRIBE, p_subscribe(rq(), 20, 0, templates))
+    c.check(r["name"] == "OK", "Subscribe replay %s -> %s" % (templates, r["name"]))
+    r = link.request(SUBSCRIBE, p_subscribe(rq(), STREAMS["players"], 5))
+    c.check(r["name"] == "OK", "Subscribe players:5 -> %s" % r["name"])
+    for line in filter(None, (x.strip() for x in args.console_setup.split("|"))):
+        r = link.request(CMD_CONSOLE, p_console(rq(), line))
+        log("  console %r -> %s" % (line, r["name"]))
+
+    lags = [float(x) for x in args.lags.split(",")]
+    t0 = time.time()
+    for lag in lags:
+        r = link.request(CMD_CONSOLE, p_console(rq(), "vars.set phy-latencyComp-debug %s" % (lag if lag > 0 else -1)))
+        tick = link.last_player_stream["tick"] if link.last_player_stream else 0
+        blocks.append((tick, lag))
+        current[0] = lag
+        log("  forced lag %.3f s from about tick %d" % (lag, tick))
+        link.pump(args.seconds / len(lags))
+    link.request(CMD_CONSOLE, p_console(rq(), "vars.set phy-latencyComp-debug -1"))
+    link.pump(2.0)
+    seconds = time.time() - t0
+    link.on_frame = None
+
+    # PlayerState lag.
+    for lag, values in sorted(lag_ms.items()):
+        want = int(lag * 1000 + 0.5) if lag > 0 else 0
+        c.check(values and all(v == want for v in values), "PlayerState lag_ms with the lag forced to %.3f s: %s (want %d)"
+                % (lag, sorted(set(values))[:8], want))
+
+    traces = [m for m in link.events if m["type"] == EV_PROJECTILE_TRACE]
+    cols = [m for m in link.events if m["type"] == EV_PROJECTILE_COLLISION]
+    c.check(len(traces) > 10, "ProjectileTrace events: %d; ProjectileCollision events: %d" % (len(traces), len(cols)))
+
+    def lag_at(tick):
+        lag = None
+        for t, l in blocks:
+            if t <= tick:
+                lag = l
+        return lag
+
+    # Each trace: lag per sample, and the tested pose against the trace's own current poses.
+    worst, compared, lag_bad, targets = 0.0, 0, 0, 0
+    for tr in traces:
+        n = len(tr["samples"])
+        first, last = tr["first_tick"], tr["first_tick"] + n - 1
+        want = lag_at(first)
+        if want is None or lag_at(last) != want or first < blocks[0][0] + 60:
+            continue   # spans a switch, or the forced value may not have reached the server yet
+        for smp in tr["samples"]:
+            if abs(smp["lag"] - (want if want > 0 else 0.0)) > 1e-6:
+                lag_bad += 1
+        for ti in range(len(tr["targets"])):
+            targets += 1
+            for k, smp in enumerate(tr["samples"]):
+                lag = smp["lag"]
+                if lag <= 1.0 / 30.0:
+                    if k + 1 >= n:
+                        continue
+                    expect = tr["samples"][k + 1]["targets"][ti]["pos"]   # where the coming tick leaves it
+                else:
+                    x = k + 1 - lag * 30.0           # the engine's rewind, in samples
+                    i = int(math.floor(x))
+                    if i < 0 or i + 1 >= n:
+                        continue
+                    f = x - i
+                    a, b = tr["samples"][i]["targets"][ti]["pos"], tr["samples"][i + 1]["targets"][ti]["pos"]
+                    expect = tuple(a[j] + (b[j] - a[j]) * f for j in range(3))
+                got = smp["targets"][ti]["tested_pos"]
+                worst = max(worst, math.sqrt(sum((got[j] - expect[j]) ** 2 for j in range(3))))
+                compared += 1
+    c.check(lag_bad == 0, "every trace sample carries the forced lag (%d wrong)" % lag_bad)
+    c.check(compared > 100 and worst < 0.01,
+            "tested pose = the engine's rewind of the trace's own poses: %d samples of %d targets, worst %.4f m" % (
+                compared, targets, worst))
+
+    # Collisions against their traces.
+    by_id = {}
+    for tr in traces:
+        by_id.setdefault(tr["id"], []).append(tr)
+    matched, hull_worst, parts, worst_by = 0, 0.0, {}, {}
+    for col in cols:
+        parts[col["part_template"] or "(terrain)"] = parts.get(col["part_template"] or "(terrain)", 0) + 1
+        tr = next((t for t in by_id.get(col["id"], [])
+                   if t["first_tick"] <= col["tick"] < t["first_tick"] + len(t["samples"])), None)
+        if not tr or not (col["flags"] & COLLISION_ROOT) or col["kind"] != COLLISION_OBJECT:
+            continue
+        ti = next((i for i, (net, _) in enumerate(tr["targets"]) if net == col["root_net"]), None)
+        if ti is None:
+            continue
+        smp = tr["samples"][col["tick"] - tr["first_tick"]]
+        got, want = col["part_pos"], smp["targets"][ti]["tested_pos"]
+        d = math.sqrt(sum((got[j] - want[j]) ** 2 for j in range(3)))
+        hull_worst = max(hull_worst, d)
+        key = "rewound" if col["flags"] & COLLISION_REWOUND else "not rewound"
+        worst_by[key] = max(worst_by.get(key, 0.0), d)
+        matched += 1
+    log("parts touched: %s" % sorted(parts.items(), key=lambda x: -x[1]))
+    log("hull collision vs trace, worst by kind: %s" % {k: round(v, 4) for k, v in worst_by.items()})
+    c.check(matched > 0 and hull_worst < 0.01,
+            "hull collisions match their trace's tested pose for that tick: %d, worst %.4f m" % (matched, hull_worst))
+    rewound = [col for col in cols if col["flags"] & COLLISION_ROOT and col["kind"] == COLLISION_OBJECT]
+    want_flag = [((col["flags"] & COLLISION_REWOUND) != 0) == ((lag_at(col["tick"]) or 0) > 1.0 / 30.0)
+                 for col in rewound if lag_at(col["tick"]) is not None]
+    c.check(want_flag and all(want_flag), "hull hits flagged rewound exactly when the lag is over one tick (%d of %d)" % (
+        sum(want_flag), len(want_flag)))
+    children = [col for col in cols if col["kind"] == COLLISION_OBJECT and not col["flags"] & (COLLISION_ROOT | COLLISION_SOLDIER)]
+    c.check(all(not col["flags"] & COLLISION_REWOUND for col in children),
+            "child parts are never flagged rewound (%d child hits)" % len(children))
+    collided = [tr for tr in traces if tr["flags"] & TRACE_COLLIDED]
+    c.check(all(any(col["id"] == tr["id"] and tr["first_tick"] <= col["tick"] < tr["first_tick"] + len(tr["samples"])
+                    for col in cols) for tr in collided),
+            "every trace that ended at a collision has its ProjectileCollision (%d)" % len(collided))
+    c.check(link.gaps == 0, "no sequence gaps (%d)" % link.gaps)
+    report_link(link, seconds)
+    return c.summary("replay")
+
+
 def scenario_extras(lst, args):
     """Kick notice through the console, KillPlayer destroying a seated bot's vehicle, Unsubscribe."""
     c = Checks()
@@ -1521,7 +1691,8 @@ def main():
     ap.add_argument("--print-pin", action="store_true", help="create the certificate if needed, print its pin, exit")
     ap.add_argument("--write-golden", default="", help="write the golden fixtures to this file and exit")
     ap.add_argument("--scenario", default="listen",
-                    choices=["listen", "commands", "resync", "stall", "soak", "wrongkey", "wrongpin", "mapchange", "extras", "viewer"])
+                    choices=["listen", "commands", "resync", "stall", "soak", "wrongkey", "wrongpin", "mapchange", "extras",
+                             "viewer", "replay"])
     ap.add_argument("--fuzz", action="store_true")
     ap.add_argument("--fuzz-rounds", type=int, default=24)
     ap.add_argument("--seed", type=int, default=1)
@@ -1536,6 +1707,8 @@ def main():
     ap.add_argument("--stall-says", type=int, default=2, help="stall: Say per 10 ms")
     ap.add_argument("--stall-seconds", type=float, default=15.0)
     ap.add_argument("--rcvbuf", type=int, default=0, help="SO_RCVBUF for accepted links (stall tests)")
+    ap.add_argument("--lags", default="0.25,0.15,0", help="replay: forced lag blocks, seconds (0 = off)")
+    ap.add_argument("--console-setup", default="", help="replay: console lines run first, separated by |")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
     if args.write_golden:
@@ -1553,7 +1726,7 @@ def main():
         return {"listen": scenario_listen, "commands": scenario_commands, "resync": scenario_resync,
                 "stall": scenario_stall, "soak": scenario_soak, "wrongkey": scenario_wrongkey,
                 "wrongpin": scenario_wrongpin, "mapchange": scenario_mapchange,
-                "extras": scenario_extras, "viewer": scenario_viewer}[args.scenario](lst, args)
+                "extras": scenario_extras, "viewer": scenario_viewer, "replay": scenario_replay}[args.scenario](lst, args)
     except KeyboardInterrupt:
         return 130
 

@@ -125,26 +125,51 @@ client (the client's drawn pose stays a model), retail (the code is the recovere
 see its `docs/server-extension.md`) reports every collision the server hands to a projectile, from
 `GenericProjectile::handleCollision`, server only: the projectile, its shooter, the object part touched (`null` for
 terrain), the impact point, normal, relative speed, material, the shooter's current latency and whether the part
-was tested rewound. Validated by an MSVC syntax check and the Linux build; it has not run, because nothing in the
-module uses it yet (the same call site was exercised by the temporary log above); reporting it on the admin channel is a contract change still
-to be designed and approved.
+was tested rewound. The module reports it on the admin channel as `ProjectileCollision` (next section).
+
+## The hit/miss replay on the admin channel (implemented 2026-10-28)
+
+Approved by the author on 2026-10-28; contract in `docs/admin-channel-draft.md` ("Hit/miss replay"). Engine:
+OpenBF2 `serverext/r1` `0a58ec0` (the observer) and `1ca26b8` (`IServerExtension::getLagCompensation`). Module:
+the lag in `PlayerState` (`u16` ms), `0x1219 ProjectileCollision` (at most 64 per tick) and `0x121A ProjectileTrace`
+(a whole flight, per tick the projectile and the current and as-tested poses of up to 8 targets) on stream 20.
+
+Live test (WSL server as above with the new engine and module, `tools/testclient/tvscan.py` against
+`tools/adminclient/adminclient.py --scenario replay --lags 0.25,0.15,0`, 1031 passes): **14/14 checks**.
+
+| Check | Result |
+|---|---|
+| `PlayerState` lag | 250, 150 and 0 ms in the three blocks, every player and frame |
+| Traces | 1029 `ProjectileTrace`, 455 `ProjectileCollision`, no sequence gaps |
+| Tested pose = the engine's rewind of the trace's own current poses | 97 741 samples, worst 0.0000 m |
+| Hull collisions against their trace's tested pose for the same tick | 423, worst 0.0000 m (rewound and not) |
+| Rewound flag | set on every hull hit with a lag over one tick, never on a child part (25 child hits) |
+| Parts touched | `ahe_ah1z` 423, `ahe_ah1z_mainrotor` 12, `agm114_hellfiredummy` 11, `us_light_soldier` 7, `AHE_AH1Z_Sensors1`/`2` 1 each |
+
+The first run found one timing fault, fixed before the second: without a rewind the sweep meets a target where the
+tick leaves it, not where it started, so a sample's tested pose is then the next sample's current pose. Admin
+cost during the scan: p99 20 µs per tick, max 103 µs. `adminclient.py --fuzz`: pass. Not exercised: the per-tick
+collision cap (never reached), a human client, BF2WebAdmin (its C# codec does not know the new fields yet; the
+`PlayerState` field changes every frame that carries it, so WebAdmin must be updated before it runs against this
+module).
 
 ## For the viewer
 
 - The server ("blue") hitbox is the hull and crew placed where the target was `L` ago, plus the child parts above
-  at the target's current pose. `L` needs the shooter's ping and reported interpolation time
-  (`IPlayer::getInterpolationTime`), which the admin channel does not carry yet.
+  at the target's current pose. `ProjectileTrace` carries the exact blue pose per tick and `PlayerState` the lag.
 - The client's drawn pose ("red"): both the missile and the target are ghosts the gunner's client draws with the same
   interpolation delay (both `BasicInfo`, `PMLinear`), so relative to the missile the target appears at its current
   server pose. A model, not measured with a human client.
 - Which part a missile hit: exact from the observer; from data alone, the contact point (the stopped missile's
   position) classified against the parts above, ambiguous when `L` is under about 0.1 s.
 
-## Tools (scratch, not in the repo)
+## Tools
 
-- WSL `~/serverext-tvhitbox/tools/`: `tvrecord.py` (admin-channel recorder: heli and TV streams at 30 Hz,
-  `--sparse`, forced-lag blocks, `--setup` console lines), `tvscan.py` (the scripted scan, a stepping protocol v4 client
-  on `serverext_client.py`); recordings in `~/serverext-tvhitbox/logs/`.
+- In the repo: `tools/testclient/tvscan.py` (the scripted scan: a stepping protocol v4 client on
+  `serverext_client.py`; the server needs `stepMode 1` and `allowTeleport 1`) and `tools/adminclient/adminclient.py
+  --scenario replay` (the replay checks; `--lags`, `--console-setup`).
+- Scratch, WSL `~/serverext-tvhitbox/tools/`: `tvrecord.py` (admin-channel recorder: heli and TV streams at 30 Hz,
+  `--sparse`, forced-lag blocks, `--setup` console lines); recordings in `~/serverext-tvhitbox/logs/`.
 - `C:\Data\Projects\DotNet\BF2WebAdmin-localtest\scratch\tvhitbox\`: `tvanalyze.py` (lag fit), `tvscananalyze.py`
   (hit bands, hit rate by aim lag), `tvcontact.py`, `tvtimeline.py`, `tvparts.py` (the full part model),
   `tvsoldier.py`, `tvsoldier2.py` (crew hits); collision meshes from bf2-bots `data-pipeline` and `meshes\`.
