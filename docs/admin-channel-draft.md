@@ -12,6 +12,8 @@ with OpenSSL 1.1.1w) and bots. It replaces draft 1, which kept
 `PlayerState`, the aim stream (5), and the `WeaponFire` (18) and `Weapons` (19) event streams. The admin
 protocol version stays 1; module and WebAdmin are deployed together. Implemented and tested on a WSL server
 with a firing bot crew: `docs/findings/admin-viewer.md`.
+**Proposed 2026-10-28, not approved:** a `ProjectileCollision` event (stream 20) for the viewer's hit/miss replay,
+under the `WeaponFire` definition below. Not part of the contract until the author approves it.
 The author has decided that the BF2WebAdmin C# side may change as much as needed, and that the
 author keeps deployments from running `mm_webadmin.py` and the native channel at the same time.
 Evidence for the engine side: `docs/findings/admin-channel-a1-a4.md`. Inventory of today's
@@ -563,6 +565,63 @@ reads the objects during the callback, before Python's handlers run.
   the server launches, bullets and flares included (the 2v2 helis' `*_FlareLauncher` are `GenericFireArm`s with a
   `GenericProjectile`). Tracer copies are made after it and are not counted (`:1131-1160`).
 - The event's tick is the tick of the launch. The module sends it with its next tick's events.
+
+**Proposed, not approved: `0x1219 ProjectileCollision`** (draft 2026-10-28, awaiting the author's approval; nothing
+implements it yet). Which object part a projectile touched and the pose the server tested it at, for the 3D
+viewer's hit/miss replay (`docs/findings/tv-hitbox.md`). Event stream 20; `Subscribe` takes projectile templates as
+filters, at least one, as stream 17 does (bullets would flood the link). One event per collision the server hands to
+a subscribed projectile:
+
+| Type | Field |
+|---|---|
+| `u32` | projectile id, as `ProjectileState`'s |
+| string | projectile template |
+| `i16` | shooter player, -1 if none |
+| `u8` | kind: 0 terrain or water, 1 an object |
+| `u8` | flags: bit 0 the part is the root (a vehicle's hull), bit 1 the part is a soldier, bit 2 the part was tested at its rewound pose |
+| `u32` | root networkable id, 0 if none |
+| `u32` | root console id, `0xFFFFFFFF` if none |
+| string | root template, empty for kind 0 |
+| string | part template: the object touched (the root's own for a hull hit; for example `agm114_hellfiredummy`, `ahe_ah1z_mainrotor`, `us_light_soldier`), empty for kind 0 |
+| `i16` | part player: the soldier's player id when bit 1, else -1 |
+| `Vec3` | impact point |
+| `Vec3` | contact normal |
+| `Vec3` | relative speed |
+| `u16` | collision material index |
+| `f32` | latency, seconds: the lag compensation the engine uses for this shooter now (1/30 s or less rewinds nothing) |
+| `Vec3` | part position as tested: rewound when bit 2, else where it is now |
+| `Rot` | part rotation as tested |
+| `Vec3` | root position now (0/0/0 for kind 0) |
+| `Rot` | root rotation now |
+
+- Source: the projectile-collision observer, OpenBF2 `serverext/r1` `0a58ec0`
+  (`IServerExtension::addProjectileCollisionObserver`), called from `GenericProjectile::handleCollision` on the main
+  thread inside the collision response. The module encodes and queues; no I/O, as for every event.
+- The tested pose with bit 2 is `IPhysicsNode::getLatencyCompensatedTransformation(latency)` of the part, read in the
+  callback (the module reaches the node with `queryComponent(IID_IPhysicsNode)`, as for velocities). The latency
+  history only advances at the end of the tick, so this is the transform the collision used. Without bit 2 it is the
+  part's absolute transform.
+- Only parentless objects (vehicle hulls) and soldiers are rewound; child parts (rotors, dummy missiles, sensors,
+  gun turrets) are tested where they are now. The parts of the 2v2 helicopters are listed in
+  `docs/findings/tv-hitbox.md`.
+- A projectile can collide more than once (ricochet, penetration). A TV missile's direct hit is its first kind 1
+  event; the missile then stays at the impact point until its time to live runs out, and `ProjectileHit` follows.
+  A miss usually ends in a kind 0 event, which still carries the latency.
+- `Damage` keeps its meaning: damage is booked to the nearest armour up the parent chain, so a rotor hit is a
+  `Damage` to the helicopter. Match the two by tick and projectile template.
+- Golden fixtures for the C++ and C# codecs, `adminclient.py` decoding, and the bot-channel side unchanged.
+
+Open points for the approval:
+
+1. **The lag before a hit.** The event gives `L` only at a collision. A projectile that expires without touching
+   anything gives none, and the viewer cannot draw the rewound hitbox during a flight before its end. Options: add
+   the shooter's latency to `ProjectileFired`, or a per-player `u16` latency in ms to `PlayerState` (ping x 0.5 plus
+   the interpolation time the client reports, `IPlayer::getInterpolationTime`, capped at 0.3 s as the engine does).
+2. **Rotor blade angle.** The part pose of a rotor hit is its current transform, blade angle included, so the viewer
+   can draw the blade that was hit. Near misses through the rotor disc are not reported (no collision), so the viewer
+   cannot show how close a blade came.
+3. **Rate.** Collisions are few for subscribed missile templates. Should the module also cap them per tick (for
+   example 64, the rest dropped and counted in the stats line) in case a bullet template is subscribed?
 
 **`Kill`** (for one victim, `Kill` precedes `Death`: the engine raises event 1 before it calls
 `killPlayer`, `GameLogicDamage.cpp:484-507`):
