@@ -164,6 +164,27 @@ Nothing in WebAdmin subscribes to stream 20 yet.
 - Which part a missile hit: exact from the observer; from data alone, the contact point (the stopped missile's
   position) classified against the parts above, ambiguous when `L` is under about 0.1 s.
 
+## The viewer in BF2WebAdmin (2026-10-28)
+
+BF2WebAdmin `admin-channel` `a59d392` has the 3D viewer (`/server/<id>/viewer`; its docs/admin-channel.md "3D viewer").
+Tested on a localtest test instance (`test-instance.ps1 -Name viewer`, image `bf2wa-localtest-openbf2:viewer` from
+OpenBF2 `1ca26b8` and module `7a817e0`) with two all-bot crews and `phy-latencyComp-debug 0.15`:
+
+- With a viewer open, players, vehicles, projectiles and aim arrive at 30 Hz with consecutive ticks (5395 of 5396 tick
+  steps 1 in 180 s); closing it drops the streams back to 4 Hz and 1 Hz.
+- 17 TV missiles in 3 minutes, all kept with their outcome: rewound hull hits with the crew named, child-part hits
+  (`ahe_ah1z_mainrotor`, `AHE_Z10_GunBarrels_Base`, tested at the red pose), terrain and map objects
+  (`coolingtower_01`). At 150 ms the blue hull trailed the red heli by 1.3-3.2 m.
+- Trace samples and stream frames share tick labels (both `tickNumber()` at the start of the tick hook).
+- Bot gunners stay in the TV launcher camera (CameraId 11) during their missile's flight: the server's camera object
+  never became the missile's camera, although `GenericProjectile::postInit` switches the gunner's active camera
+  (`GenericProjectile.cpp`, `enableProjectileCamera`). Unexplained; untested with a human gunner. The viewer's missile
+  TV camera works from the trace either way.
+- The chase formula the viewer uses is `Camera::getTransformationCVMChase` (`Camera.cpp:744-857`): eye
+  `chaseDistance` (AH-1Z 23, Z-10 28) from the point `chaseOffset` 0/2.5/6, along the back axis plus 0.25 x up,
+  smoothed with `followStiffness` 2, looking at that point with world up. BF2v2's fitted spring arm looks 6 degrees
+  down; this one about 14. Not compared with the game client.
+
 ## Tools
 
 - In the repo: `tools/testclient/tvscan.py` (the scripted scan: a stepping protocol v4 client on
