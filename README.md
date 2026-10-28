@@ -9,7 +9,8 @@ see [docs/findings/module-v3.md](docs/findings/module-v3.md) (module-v2.md, modu
 the contract in [docs/protocol.md](docs/protocol.md). The admin channel (phase 1 of
 [docs/admin-channel-draft.md](docs/admin-channel-draft.md)) is implemented beside it; its byte layouts, configuration and
 results are in [docs/findings/admin-phase1.md](docs/findings/admin-phase1.md); the viewer additions (view mode, aim, gunfire,
-weapons) in [docs/findings/admin-viewer.md](docs/findings/admin-viewer.md).
+weapons) in [docs/findings/admin-viewer.md](docs/findings/admin-viewer.md). What a TV missile can hit on a helicopter, and
+which parts the server tests at a lag-compensated (rewound) pose: [docs/findings/tv-hitbox.md](docs/findings/tv-hitbox.md).
 
 ## Layout and build
 
