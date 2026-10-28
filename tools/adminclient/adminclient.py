@@ -142,12 +142,13 @@ def r_game(r):
 
 def w_pstate(w, s):
     w.u8(s["team"]).u8(s["squad"]).u8(s["life"]).u8(s["flags"]).u16(s["ping"]).u32(s["root_net"]).u32(s["root_obj"])
-    w.u8(s["seat"]).vec3(s["pos"]).vec3(s["rot"]).vec3(s["vel"]).f32(s["health"])
+    w.u8(s["seat"]).vec3(s["pos"]).vec3(s["rot"]).vec3(s["vel"]).f32(s["health"]).u8(s["view_mode"])
 
 
 def r_pstate(r):
     return {"team": r.u8(), "squad": r.u8(), "life": r.u8(), "flags": r.u8(), "ping": r.u16(), "root_net": r.u32(),
-            "root_obj": r.u32(), "seat": r.u8(), "pos": r.vec3(), "rot": r.vec3(), "vel": r.vec3(), "health": r.f32()}
+            "root_obj": r.u32(), "seat": r.u8(), "pos": r.vec3(), "rot": r.vec3(), "vel": r.vec3(), "health": r.f32(),
+            "view_mode": r.u8()}
 
 
 def w_score(w, s):
@@ -379,7 +380,7 @@ def golden_samples():
     s = {}
     pstate = {"team": 2, "squad": 3, "life": 2, "flags": 5, "ping": 48, "root_net": 1819, "root_obj": 29328,
               "seat": 1, "pos": (1.5, 100.25, -3.0), "rot": (90.0, -5.0, 2.5), "vel": (10.0, 0.5, -1.0),
-              "health": 0.75}
+              "health": 0.75, "view_mode": 3}
     score = {"score": 12, "team_score": 4, "kills": 5, "deaths": 2, "team_kills": 1, "rank": 7}
     pinfo = {"id": 3, "name": "§netsky", "flags": INFO_CONNECTED | INFO_IDENTITY, "profile": 43001234,
              "ip": "10.0.0.7", "hash": "0123456789abcdef0123456789abcdef", "score": score, "state": pstate}

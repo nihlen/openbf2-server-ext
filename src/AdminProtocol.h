@@ -79,6 +79,7 @@ const uint8_t kPlayerInVehicle = 1, kPlayerCommander = 2, kPlayerSquadLeader = 4
 // PlayerInfo flags.
 const uint8_t kInfoAi = 1, kInfoBotChannel = 2, kInfoConnected = 4, kInfoIdentity = 8;
 const uint8_t kSeatNone = 255;
+const uint8_t kViewModeNone = 255;   // PlayerState view mode: dead or no camera
 
 // Kill kinds.
 enum KillKind : uint8_t { KillNormal = 1, KillTeam = 2, KillSuicide = 3, KillRoad = 4, KillNoAttacker = 5 };
@@ -115,6 +116,7 @@ struct PlayerState
     uint8_t seat;
     float pos[3], rot[3], vel[3];
     float health;
+    uint8_t viewMode;    // camera view mode, kViewModeNone when dead or without a camera
     PlayerState();
 };
 

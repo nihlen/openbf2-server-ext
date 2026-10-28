@@ -83,7 +83,7 @@ void appendUtf8(std::string& out, uint32_t cp)
 
 PlayerState::PlayerState()
     : team(0), squad(0), life(kLifeDead), flags(0), ping(0), rootNetId(0), rootObjectId(kNoObjectId), seat(kSeatNone),
-      health(-1.0f)
+      health(-1.0f), viewMode(kViewModeNone)
 {
     zero3(pos); zero3(rot); zero3(vel);
 }
@@ -191,6 +191,7 @@ void writePlayerState(Writer& w, const PlayerState& s)
     writeVec3(w, s.rot);
     writeVec3(w, s.vel);
     w.f32(s.health);
+    w.u8(s.viewMode);
 }
 
 void readPlayerState(Reader& r, PlayerState& s)
@@ -207,6 +208,7 @@ void readPlayerState(Reader& r, PlayerState& s)
     readVec3(r, s.rot);
     readVec3(r, s.vel);
     s.health = r.f32();
+    s.viewMode = r.u8();
 }
 
 void writePlayerScore(Writer& w, const PlayerScore& s)

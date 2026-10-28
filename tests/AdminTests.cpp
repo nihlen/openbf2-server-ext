@@ -199,6 +199,7 @@ PlayerState samplePlayerState()
     s.rot[0] = 90.0f; s.rot[1] = -5.0f; s.rot[2] = 2.5f;
     s.vel[0] = 10.0f; s.vel[1] = 0.5f; s.vel[2] = -1.0f;
     s.health = 0.75f;
+    s.viewMode = 3;
     return s;
 }
 
@@ -208,7 +209,8 @@ bool samePlayerState(const PlayerState& a, const PlayerState& b)
         if (a.pos[k] != b.pos[k] || a.rot[k] != b.rot[k] || a.vel[k] != b.vel[k])
             return false;
     return a.team == b.team && a.squad == b.squad && a.life == b.life && a.flags == b.flags && a.ping == b.ping &&
-           a.rootNetId == b.rootNetId && a.rootObjectId == b.rootObjectId && a.seat == b.seat && a.health == b.health;
+           a.rootNetId == b.rootNetId && a.rootObjectId == b.rootObjectId && a.seat == b.seat && a.health == b.health &&
+           a.viewMode == b.viewMode;
 }
 
 PlayerInfo samplePlayerInfo()
@@ -243,7 +245,7 @@ void testStructures()
     Writer w(buf);
     const PlayerState s = samplePlayerState();
     writePlayerState(w, s);
-    CHECK(buf.size() == 1 + 1 + 1 + 1 + 2 + 4 + 4 + 1 + 36 + 4);
+    CHECK(buf.size() == 1 + 1 + 1 + 1 + 2 + 4 + 4 + 1 + 36 + 4 + 1);
     {
         Reader r(&buf[0], buf.size());
         PlayerState back;
@@ -436,7 +438,7 @@ void testSnapshotAndStreams()
     out.clear();
     encodePlayerStream(out, 5, 1.0, ids, states);
     f = frames(out);
-    CHECK(f.size() == 1 && f[0].type == MsgPlayerStream && f[0].payload.size() == 4 + 8 + 1 + 1 + 55);
+    CHECK(f.size() == 1 && f[0].type == MsgPlayerStream && f[0].payload.size() == 4 + 8 + 1 + 1 + 56);
     out.clear();
     encodeVehicleStream(out, 5, 1.0, vehicles);
     encodeProjectileStream(out, 5, 1.0, projectiles);
@@ -450,7 +452,7 @@ void testSnapshotAndStreams()
     std::vector<PlayerState> many(64, samplePlayerState());
     out.clear();
     encodePlayerStream(out, 5, 1.0, manyIds, many);
-    CHECK(out.size() == 8 + 13 + 64 * 56);
+    CHECK(out.size() == 8 + 13 + 64 * 57);
 }
 
 void testEvents()

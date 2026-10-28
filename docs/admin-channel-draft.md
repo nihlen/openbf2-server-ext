@@ -362,6 +362,12 @@ Pm = HMAC-SHA256(K, T("OBF2-ADMIN-1 server"))
 | `Rot` | root rotation |
 | `Vec3` | root velocity (its physics node) |
 | `f32` | soldier health 0..1 (its armour), -1 if none |
+| `u8` | camera view mode (`IPlayer::getCamera()->getViewMode()`, `ICameraObject` +0x1C): 1 inside, 2 nose, 3 chase, 4 front chase, 5 fly-by, 6 trace, 7 extern trace, 0 none (the bot channel's values, `docs/protocol.md` v2 `TickState`); 255 when dead or without a camera |
+
+The view mode is the server's copy: `ServerGameLogic::checkPlayerTriggers` applies each player's camera keys to
+the server's camera object (`ServerGameLogic.cpp:1550-1579`, called for every player from
+`GameServer.cpp:3788`), and projectile cameras set it too (`ToggleCameraComp.cpp:116-160`). A camera key press
+the server never received is not reflected. Added 2026-10-28 with the author's approval; the version stays 1.
 
 **`PlayerScore`** (in `PlayerInfo` and `ScoreChange`)
 

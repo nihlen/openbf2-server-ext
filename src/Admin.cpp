@@ -648,6 +648,12 @@ private:
         placeOf(root, s.pos, s.rot);
         velocityOf(root, s.vel);
         s.health = alive ? healthFraction(p->getDefaultVehicle()) : -1.0f;
+        world::ICameraObject* cam = alive ? p->getCamera() : 0;
+        if (cam)
+        {
+            const int vm = static_cast<int>(cam->getViewMode());
+            s.viewMode = vm >= 0 && vm < kViewModeNone ? static_cast<uint8_t>(vm) : 0;
+        }
     }
 
     void fillPlayerInfo(world::IPlayer* p, PlayerInfo& info)
