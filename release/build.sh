@@ -8,7 +8,8 @@
 #   release/out/openbf2-serverext-<...>-debug.tar.gz                    (the same binaries with debug info, for gdb)
 #
 # The zip holds a source.txt with the three commits, the builder, and per binary its sha256, newest GLIBC_/GLIBCXX_
-# symbol version and NEEDED libraries.
+# symbol version and NEEDED libraries. It holds nothing about the machine or how the script was called, so the same
+# commits give the same zip (checked: a clean and an incremental build gave identical binaries).
 #
 # Usage (Git Bash on Windows with Docker Desktop, or Linux with Docker):
 #   release/build.sh
@@ -55,9 +56,8 @@ fi
 
 # 1. The commits: resolved once, printed and recorded in source.txt.
 sha() { git -C "$1" rev-parse --verify "$2^{commit}"; }
-describe() { # repo rev -> "<origin url or path> rev <rev>, <subject>"
-    local url; url=$(git -C "$1" remote get-url origin 2>/dev/null || abspath "$1")
-    echo "$url rev $2: $(git -C "$1" log -1 --format=%s "$(sha "$1" "$2")" | cut -c1-100)"
+describe() { # repo rev -> the commit's subject (only what the commit determines, so the zip is reproducible)
+    git -C "$1" log -1 --format=%s "$(sha "$1" "$2")" | cut -c1-100
 }
 OPENBF2_SHA=$(sha "$OPENBF2_REPO" "$OPENBF2_REV")
 MODULE_SHA=$(sha "$MODULE_REPO" "$MODULE_REV")
@@ -69,9 +69,9 @@ BF2HUB_SOURCE=$(describe "$BF2HUB_REPO" "$BF2HUB_REV")
 NAME="openbf2-serverext-${OPENBF2_SHA:0:7}-${MODULE_SHA:0:7}-${BF2HUB_SHA:0:7}"
 SOURCE_DATE_EPOCH=$(for r in "$OPENBF2_REPO:$OPENBF2_SHA" "$MODULE_REPO:$MODULE_SHA" "$BF2HUB_REPO:$BF2HUB_SHA"; do
     git -C "${r%:*}" log -1 --format=%ct "${r##*:}"; done | sort -n | tail -1)
-echo "OpenBF2: $OPENBF2_SHA $OPENBF2_SOURCE"
-echo "module:  $MODULE_SHA $MODULE_SOURCE"
-echo "bf2hub:  $BF2HUB_SHA $BF2HUB_SOURCE"
+echo "OpenBF2: $OPENBF2_SHA ($OPENBF2_REPO $OPENBF2_REV) $OPENBF2_SOURCE"
+echo "module:  $MODULE_SHA ($MODULE_REPO $MODULE_REV) $MODULE_SOURCE"
+echo "bf2hub:  $BF2HUB_SHA ($BF2HUB_REPO $BF2HUB_REV) $BF2HUB_SOURCE"
 echo "zip:     $NAME.zip"
 for r in "$OPENBF2_REPO" "$MODULE_REPO" "$BF2HUB_REPO"; do
     if [ -n "$(git -C "$r" status --porcelain --untracked-files=no)" ]; then
@@ -81,7 +81,7 @@ done
 
 # 2. The builder image.
 docker build -q -t "$BUILDER" "$HERE" >/dev/null
-BUILDER_IMAGE="$BUILDER $(docker image inspect "$BUILDER" --format '{{.Id}}' | cut -c1-19) from $(sed -n 's/^FROM //p' "$HERE/Dockerfile")"
+BUILDER_IMAGE="release/Dockerfile from $(sed -n 's/^FROM //p' "$HERE/Dockerfile")"
 
 # 3. Sources -> volume, synced by content.
 docker volume create "$VOLUME" >/dev/null
