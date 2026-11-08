@@ -35,6 +35,27 @@ That configures the `linux-x64` preset, builds `libserverext.so` and runs the un
 channel needs OpenSSL 1.1.1 or 3.x (`libssl-dev` to build; `libssl3` or `libssl1.1` at run time, linked
 dynamically). A Windows build (`serverext.dll`) is not implemented yet.
 
+## Release build
+
+`release/build.sh` builds the zip the production game-server images unpack into `bin/amd-64` (bf2-docker
+`images/netsky-openbf2-*`): `openbf2-serverext-<openbf2>-<module>-<bf2hub>.zip` with `bf2` and `libdice_py.so`
+(OpenBF2 with the `IServerExtension` commits), `libserverext.so` (this repo), `libbf2hub.so`
+([OpenBF2-BF2Hub](https://github.com/B2BF/OpenBF2-BF2Hub)) and a `source.txt` with the three commits, the builder and
+per binary its sha256, newest `GLIBC_` version and `NEEDED` libraries. It runs in Git Bash with Docker Desktop or on
+Linux, takes the sources as `git archive` of commits, builds in the docker volume `serverext-release-build`
+(incremental) with the image from `release/Dockerfile`, and runs the module's unit tests:
+
+```
+release/build.sh                                         # HEAD of ../OpenBF2, this repo and ../_ext/OpenBF2-BF2Hub
+OPENBF2_REV=824d4dc MODULE_REV=c14b561 BF2HUB_REV=7e37854 CLEAN=1 release/build.sh
+```
+
+Output in `release/out/`: the zip, its `.sha512` (the line for bf2-docker's `assets.sha512`), a `-debug.tar.gz` with
+the unstripped binaries, and the build log. The builder is Ubuntu 22.04, the target of OpenBF2's own Linux CI (GCC 11,
+static libstdc++), with glibc 2.35 (Debian trixie has 2.41) and OpenSSL 3.0.2 (the module links `libssl.so.3`).
+`.github/workflows/release.yml` runs the same script on GitHub Actions; it needs this repo and the OpenBF2 fork's
+branch on GitHub.
+
 ## Related repos
 
 How they fit together, and how to build, deploy and test across them: [docs/system.md](docs/system.md)

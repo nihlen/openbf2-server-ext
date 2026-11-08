@@ -1,0 +1,87 @@
+name: Release zip
+
+# Builds the zip the production game-server images unpack into bin/amd-64 (bf2-docker images/netsky-openbf2-*):
+#   openbf2-serverext-<openbf2>-<module>-<bf2hub>.zip  bf2, libdice_py.so (OpenBF2), libserverext.so (this repo),
+#                                                      libbf2hub.so (OpenBF2-BF2Hub), source.txt
+# with release/build.sh, the same script and builder image (release/Dockerfile, Ubuntu 22.04) as a local build, from a
+# clean build directory. The module's unit tests run inside the build.
+#
+# Draft: it needs this repo on GitHub and the OpenBF2 fork's branch with the IServerExtension commits pushed (see
+# release/build.sh and README.md "Release build"). The zip is uploaded as a workflow artifact only; publishing it on
+# static.nihlen.net and updating bf2-docker's assets.txt/assets.sha512 stay manual.
+
+on:
+  workflow_dispatch:
+    inputs:
+      openbf2_ref:
+        description: Branch, tag or commit of github.com/nihlen/OpenBF2 (the IServerExtension commits on upstream)
+        default: serverext/r1
+      bf2hub_ref:
+        description: Branch, tag or commit of github.com/B2BF/OpenBF2-BF2Hub
+        default: 7e378545fe5b0235041d6a70a4035f69c814c30a
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  zip:
+    name: Build the release zip
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - name: Check out the module
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: module
+          persist-credentials: false
+
+      - name: Check out OpenBF2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: nihlen/OpenBF2
+          ref: ${{ inputs.openbf2_ref }}
+          path: openbf2
+          persist-credentials: false
+
+      - name: Check out OpenBF2-BF2Hub
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: B2BF/OpenBF2-BF2Hub
+          ref: ${{ inputs.bf2hub_ref }}
+          path: bf2hub
+          persist-credentials: false
+
+      - name: Build, test and package
+        env:
+          OPENBF2_REPO: ${{ github.workspace }}/openbf2
+          MODULE_REPO: ${{ github.workspace }}/module
+          BF2HUB_REPO: ${{ github.workspace }}/bf2hub
+          OUT: ${{ github.workspace }}/out
+          CLEAN: '1'
+          JOBS: '2'
+        run: |
+          module/release/build.sh
+          {
+            echo '### Release zip'
+            echo '```'
+            cat out/*.zip.sha512
+            unzip -p out/*[0-9a-f].zip source.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the zip
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: openbf2-serverext
+          path: |
+            out/*.zip
+            out/*.zip.sha512
+            out/*-debug.tar.gz
+            out/*.build.log
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
