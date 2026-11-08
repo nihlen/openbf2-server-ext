@@ -1,7 +1,7 @@
 name: Release zip
 
 # Builds the zip the production game-server images unpack into bin/amd-64 (bf2-docker images/netsky-openbf2-*):
-#   openbf2-serverext-<openbf2>-<module>-<bf2hub>.zip  bf2, libdice_py.so (OpenBF2), libserverext.so (this repo),
+#   openbf2-serverext-<openbf2>-<module>-<bf2hub>-<backend>.zip  bf2, libdice_py.so (OpenBF2), libserverext.so (this repo),
 #                                                      libbf2hub.so (OpenBF2-BF2Hub), source.txt
 # with release/build.sh, the same script and builder image (release/Dockerfile, Ubuntu 22.04) as a local build, from a
 # clean build directory. The module's unit tests run inside the build.
@@ -69,7 +69,8 @@ jobs:
             echo '### Release zip'
             echo '```'
             cat out/*.zip.sha512
-            unzip -p out/*[0-9a-f].zip source.txt
+            # The zip's name ends with the GameSpy backend (e.g. -bf2hub.zip); out/ holds exactly one zip
+            for zip in out/*.zip; do unzip -p "$zip" source.txt; done
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
