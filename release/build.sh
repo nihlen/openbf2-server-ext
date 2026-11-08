@@ -3,7 +3,8 @@
 # (bf2, libdice_py.so) with the IServerExtension commits, this module (libserverext.so) and OpenBF2-BF2Hub
 # (libbf2hub.so), all in one zip that is unpacked into the server's bin/amd-64:
 #
-#   release/out/openbf2-serverext-<openbf2>-<module>-<bf2hub>.zip      (7-character commits)
+#   release/out/openbf2-serverext-<openbf2>-<module>-<bf2hub>-<backend>.zip   (7-character commits; backend: the
+#                                                                         first label of GAMESPY_DOMAIN, e.g. bf2hub)
 #   release/out/openbf2-serverext-<...>.zip.sha512                      (the line for bf2-docker's assets.sha512)
 #   release/out/openbf2-serverext-<...>-debug.tar.gz                    (the same binaries with debug info, for gdb)
 #
@@ -22,6 +23,8 @@
 #   JOBS                        parallel jobs (nproc)
 #   CLEAN=1                     delete the build directories first (a full build, as in CI)
 #   STRIP=0                     keep debug info in the zipped binaries
+#   GAMESPY_DOMAIN              the GameSpy backend for the master list, CD-key checks and stats: bf2hub.p.bf2.org
+#                               (BF2Hub, the default) or openspy.net (OpenBF2's source default: not in BF2Hub's list)
 #
 # Sources are commits, taken with `git archive` (uncommitted changes are reported and left out) and synced into the
 # docker volume serverext-release-build by content (rsync -c), so an unchanged file keeps its timestamp and the
@@ -45,6 +48,7 @@ OUT=${OUT:-$HERE/out}
 JOBS=${JOBS:-$(nproc)}
 CLEAN=${CLEAN:-0}
 STRIP=${STRIP:-1}
+GAMESPY_DOMAIN=${GAMESPY_DOMAIN:-bf2hub.p.bf2.org}
 BUILDER=serverext-release-builder:jammy
 VOLUME=serverext-release-build
 CONTAINER=serverext-release-build
@@ -66,7 +70,7 @@ export OPENBF2_SOURCE MODULE_SOURCE BF2HUB_SOURCE
 OPENBF2_SOURCE=$(describe "$OPENBF2_REPO" "$OPENBF2_REV")
 MODULE_SOURCE=$(describe "$MODULE_REPO" "$MODULE_REV")
 BF2HUB_SOURCE=$(describe "$BF2HUB_REPO" "$BF2HUB_REV")
-NAME="openbf2-serverext-${OPENBF2_SHA:0:7}-${MODULE_SHA:0:7}-${BF2HUB_SHA:0:7}"
+NAME="openbf2-serverext-${OPENBF2_SHA:0:7}-${MODULE_SHA:0:7}-${BF2HUB_SHA:0:7}-${GAMESPY_DOMAIN%%.*}"
 SOURCE_DATE_EPOCH=$(for r in "$OPENBF2_REPO:$OPENBF2_SHA" "$MODULE_REPO:$MODULE_SHA" "$BF2HUB_REPO:$BF2HUB_SHA"; do
     git -C "${r%:*}" log -1 --format=%ct "${r##*:}"; done | sort -n | tail -1)
 echo "OpenBF2: $OPENBF2_SHA ($OPENBF2_REPO $OPENBF2_REV) $OPENBF2_SOURCE"
@@ -108,7 +112,7 @@ mkdir -p "$OUT"
 docker run --rm --name "$CONTAINER" -v "$VOLUME:/w" \
     -e NAME="$NAME" -e OPENBF2_SHA="$OPENBF2_SHA" -e MODULE_SHA="$MODULE_SHA" -e BF2HUB_SHA="$BF2HUB_SHA" \
     -e OPENBF2_SOURCE -e MODULE_SOURCE -e BF2HUB_SOURCE -e SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
-    -e BUILDER_IMAGE="$BUILDER_IMAGE" -e JOBS="$JOBS" -e STRIP="$STRIP" \
+    -e BUILDER_IMAGE="$BUILDER_IMAGE" -e JOBS="$JOBS" -e STRIP="$STRIP" -e GAMESPY_DOMAIN="$GAMESPY_DOMAIN" \
     "$BUILDER" build-in-builder.sh 2>&1 | tee "$OUT/$NAME.build.log"
 
 # 5. Outputs -> OUT
