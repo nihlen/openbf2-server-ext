@@ -295,7 +295,8 @@ Collected from the findings and per-repo docs on 2026-10-26; the source of each 
 - **A changed admin key takes up to 60 s** (the module's reconnect backoff). admin-channel.md item 3.
 - **Teleport rotation is not held** by a hovering bot's heading hold. admin-channel.md item 4.
 - **The bot channel has no authentication:** keep it on loopback. findings/docker-v1.md.
-- **Production deployment** (planned 2026-11): the release zip (`release/`, Ubuntu 22.04, OpenSSL 3) and the bf2-docker
+- **Production deployment** (done 2026-11-08: the four live servers run `bf2-netsky:openbf2-*` with this module,
+  WebAdmin 0.1.0; earlier notes: the release zip (`release/`, Ubuntu 22.04, OpenSSL 3) and the bf2-docker
   images `netsky-openbf2-*` (branch `combined`, trixie) are built and tested locally; bf2hub and serverext load
   together. Still open: the engine and module commits are unpushed, the BF2Hub listing and CD-key login on the internet
   (a canary on de2 first), no PunkBuster on OpenBF2 (accepted), shutdown is SIGKILL (as before). The runbook is
