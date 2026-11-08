@@ -63,7 +63,7 @@ How they fit together, and how to build, deploy and test across them: [docs/syst
 
 | Repo | Local path | Relationship |
 |---|---|---|
-| OpenBF2 | `C:\Data\Projects\OpenBF2` | The server this module loads into. Local commits on `main` carry the engine changes the module needs (`docs/server-extension.md` there). |
+| OpenBF2 | `C:\Data\Projects\OpenBF2` | The server this module loads into. Local commits on branch `serverext/r1` carry the engine changes the module needs (`docs/server-extension.md` there). |
 | bf2-bots | `C:\Data\Projects\bf2-bots` | The bot sidecar, a client of the bot channel. |
 | BF2WebAdmin | `C:\Data\Projects\DotNet\BF2WebAdmin` | The admin channel's client: branch `admin-channel` (not merged into `master`) replaces `mm_webadmin.py` with it. |
 | BF2WebAdmin-localtest | `C:\Data\Projects\DotNet\BF2WebAdmin-localtest` | The local test environment. Its OpenBF2 variant runs this module on `dalian_2_v_2` with WebAdmin and the bots attached. |

@@ -5,7 +5,7 @@ local test environment (the "localtest") is assembled from them, and how to rebu
 in any one of them. It links to the per-repo documents for the details. If something here disagrees with the code or
 the scripts, the code wins; fix this file.
 
-State as of 2026-10-26.
+State as of 2026-10-26; the release build, the production images and the human-client note updated 2026-11-08.
 
 ## Repos and checkouts
 
@@ -15,7 +15,7 @@ Findings files still name them as the record of where a result was made; do not 
 
 | Repo | Path | Branch to work on | What it holds | Instructions |
 |---|---|---|---|---|
-| OpenBF2 | `C:\Data\Projects\OpenBF2` | `serverext/r1` (checked out; local only, never pushed, **not merged into `main`**, which stays equal to `origin/main`): the 4 commits below and the docs commit `2a2c77e` on top of `ccf3099` | The engine (BF2 1.50 reconstruction). The server-extension additions `IServerExtension`, its observer hooks and the R1b guards are `[CHOSEN, not recovered]` local commits `9e1cda6`, `540fa88`, `74e18d9`, `873d1b1` | `AGENTS.md` (governs everything there); `C:\Data\Projects\OpenBF2\docs\server-extension.md` |
+| OpenBF2 | `C:\Data\Projects\OpenBF2` | `serverext/r1` (checked out; local only, never pushed, **not merged into `main`**, which stays equal to `origin/main`): 12 local commits on top of `ccf3099` (`824d4dc` on 2026-11-08: the extension, its observers, stepped time, the lag-compensation getter, the projectile-collision observer, the two TV settings `tv-aim-from-missile` and `tv-turn-behind`, and docs). For the release it is to be pushed to its own branch of the fork `github.com/nihlen/OpenBF2`, never to upstream | The engine (BF2 1.50 reconstruction). The server-extension additions `IServerExtension`, its observer hooks and the R1b guards are `[CHOSEN, not recovered]` local commits `9e1cda6`, `540fa88`, `74e18d9`, `873d1b1` | `AGENTS.md` (governs everything there); `C:\Data\Projects\OpenBF2\docs\server-extension.md` |
 | openbf2-server-ext | `C:\Data\Projects\openbf2-server-ext` | `master` (no remote) | The native module `libserverext.so`: bot channel and admin channel; the contracts; test clients; findings | `CLAUDE.md`, [README.md](../README.md), [protocol.md](protocol.md) |
 | bf2-bots | `C:\Data\Projects\bf2-bots` | `main` | The bot sidecar (`bf2bots serverext`), plus the older memory-reader/vJoy agent | `CLAUDE.md`; `C:\Data\Projects\bf2-bots\docs\serverext-backend.md`, `C:\Data\Projects\bf2-bots\docs\serverext-missions.md` |
 | BF2WebAdmin | `C:\Data\Projects\DotNet\BF2WebAdmin` | `admin-channel` (checked out; **not merged into `master`**, stays separate for now) | The web admin. On `admin-channel` its game-server backend is the module's admin channel instead of `mm_webadmin.py`. `master` is still the `mm_webadmin` version | `CLAUDE.md`; `C:\Data\Projects\DotNet\BF2WebAdmin\docs\admin-channel.md` |
@@ -218,7 +218,7 @@ protocol.md "Testing". Their run dirs are agent-owned (`~/serverext-<task>/srv`)
 | Stepped time (protocol v4: `serverext.cfg stepMode 1`, sidecar `--step`) | bot tests faster than real time in lockstep; the game-bf2 test queue (bf2-bots docs/serverext-test.md) runs them | anything with a human client: a stepped server runs only as fast as its sidecar |
 | A play session (`play-2v2.ps1`) | the author plays | for the author only; agents check Status and leave it alone |
 
-Nothing has been tested with a human client on an OpenBF2 server with the module yet (see "Open issues").
+One human client has played on the localtest's OpenBF2 server with the module (LAN, `sv.internet 0`, the author's play sessions 2026-10-24 to 10-29: chat, `rdy`/`go`, `.pad`/`.tp`/`.heal`, pilot and gunner). More than one human, an internet server and the items under "Open issues" are untested.
 
 ## Logs
 
@@ -284,8 +284,9 @@ Collected from the findings and per-repo docs on 2026-10-26; the source of each 
 - **Heli2v2 and bot respawns:** a bot respawned with RemoveBot/CreateBot is a new player to Heli2v2; a pending round
   can then hold 5 players and Heli2v2 (exactly 4) would not start it. Not seen yet. bf2-bots serverext-missions.md
   "Round flow".
-- **No human client has joined** an OpenBF2 server with the module: human chat channels, revive, a real kick/ban and
-  its disconnect reason, in-game `.o`, the client ControlMap stage (Q4) are unexercised. findings/admin-phase1.md "What
+- **Only one human client, on a LAN,** has played on an OpenBF2 server with the module (the localtest play sessions):
+  more than one human, revive, a real kick/ban and its disconnect reason, in-game `.o`, the client ControlMap stage
+  (Q4) and an internet server are unexercised. findings/admin-phase1.md "What
   is left"; admin-channel.md "Not exercised".
 - **CD-key hashes** exist only on an internet server; on a LAN or test server WebAdmin keys players `name:<name>`
   (decision B6). findings/admin-phase1.md "CD-key hash".
@@ -294,8 +295,11 @@ Collected from the findings and per-repo docs on 2026-10-26; the source of each 
 - **A changed admin key takes up to 60 s** (the module's reconnect backoff). admin-channel.md item 3.
 - **Teleport rotation is not held** by a hovering bot's heading hold. admin-channel.md item 4.
 - **The bot channel has no authentication:** keep it on loopback. findings/docker-v1.md.
-- **Production deployment is blocked:** the engine changes are local, unpushed commits; bf2hub and PunkBuster with
-  OpenBF2 are untested; shutdown is SIGKILL. findings/docker-v1.md "What blocks deploying".
+- **Production deployment** (planned 2026-11): the release zip (`release/`, Ubuntu 22.04, OpenSSL 3) and the bf2-docker
+  images `netsky-openbf2-*` (branch `combined`, trixie) are built and tested locally; bf2hub and serverext load
+  together. Still open: the engine and module commits are unpushed, the BF2Hub listing and CD-key login on the internet
+  (a canary on de2 first), no PunkBuster on OpenBF2 (accepted), shutdown is SIGKILL (as before). The runbook is
+  BF2WebAdmin `deploy/openbf2-migration/README.md`.
 - **Linux only:** no Windows `serverext.dll` yet; the OpenBF2 `msvc-x64` strict link fails on VoIP symbols (not caused
   by this work). README; findings/r1-smoke.md.
 - **Q8** (does unrecovered retail code use EventManager category 7) needs IDA/Ghidra; the three R1b guards, the
