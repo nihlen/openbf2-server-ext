@@ -39,9 +39,9 @@ The author may have uncommitted work in any of them (BF2WebAdmin has some now: `
                ▼
            BF2WebAdmin (admin-channel branch) AdminListener on 4310 (Windows host) ── SQL Server (bf2 database)
            web UI http://localhost:5050 ── tools\hubclient uses the same SignalR hub
- ModManager rcon (mm_rcon, container 4711, published 127.0.0.1:4721) is still in the localtest image, for
- tools\rcon.py only: WebAdmin uses no rcon since 2026-11-09 (kick, ban and its "!" console go over the admin
- channel), and the production images (bf2-docker netsky-openbf2-*) have no ModManager.
+ No rcon anywhere: WebAdmin uses none since 2026-11-09 (kick, ban and its "!" console go over the admin channel), and
+ neither the production images (bf2-docker netsky-openbf2-*) nor the localtest image built on them has ModManager.
+ Console lines in the localtest: tools\console.ps1 (WebAdmin's API).
 ```
 
 - The module runs inside the server process. Its socket I/O runs on its own threads; engine work happens once per
@@ -61,9 +61,9 @@ All builds use agent-owned output directories. Nothing builds on a Windows bind 
 
 | Piece | Where | Command | Output | Notes |
 |---|---|---|---|---|
-| Module (dev loop) | WSL Ubuntu | `cd /mnt/c/Data/Projects/openbf2-server-ext && ./build-module.sh [openbf2-checkout] [build-dir]` | `<build-dir>/libserverext.so`, ctest run (`serverext_tests`, `serverext_admin_tests`) | Default OpenBF2 `/mnt/c/Data/Projects/OpenBF2`, build dir `~/serverext-build/linux-x64`; use your own build dir, e.g. `~/serverext-build/<task>`. Needs `testenv/tools-linux.sh` once. Builds the working tree. Output needs glibc 2.35: runs in WSL, **not** in the localtest container |
+| Module (dev loop) | WSL Ubuntu | `cd /mnt/c/Data/Projects/openbf2-server-ext && ./build-module.sh [openbf2-checkout] [build-dir]` | `<build-dir>/libserverext.so`, ctest run (`serverext_tests`, `serverext_admin_tests`) | Default OpenBF2 `/mnt/c/Data/Projects/OpenBF2`, build dir `~/serverext-build/linux-x64`; use your own build dir, e.g. `~/serverext-build/<task>`. Needs `testenv/tools-linux.sh` once. Builds the working tree. Output needs glibc 2.35 and OpenSSL 3: runs in WSL (the localtest image builds its own) |
 | Engine (dev loop) | WSL Ubuntu | `testenv/build-linux.sh /mnt/c/Data/Projects/OpenBF2 ~/bf2-linux-<task>` | `bf2`, `libdice_py.so` | For a WSL test server (`testenv/`). OpenBF2's own gates (MSVC syntax checks etc.) are in its `AGENTS.md` "Validation" |
-| Engine + module for the localtest | Git Bash on Windows, Docker Desktop | `bash C:/Data/Projects/DotNet/BF2WebAdmin-localtest/openbf2/build.sh` | image `bf2wa-localtest-openbf2:latest` | Builds both in `debian:bullseye` (glibc 2.31, OpenSSL 1.1.1) from **commits**, `git archive` of `HEAD` of both default checkouts. Uncommitted changes are left out (it says so): commit first. `OPENBF2_REV=`/`MODULE_REV=` pin other commits, `IMAGE=` another tag. Prints the commits and records them (below). OpenBF2 builds incrementally in the docker volume `bf2wa-openbf2-build`; first build takes long |
+| Engine + module for the localtest | Git Bash on Windows, Docker Desktop | `bash C:/Data/Projects/DotNet/BF2WebAdmin-localtest/openbf2/build.sh` | image `bf2wa-localtest-openbf2:latest` | Builds both in the release build's builder (Ubuntu 22.04, glibc 2.35, OpenSSL 3; since 2026-11-09) from **commits**, `git archive` of `HEAD` of both default checkouts. Uncommitted changes are left out (it says so): commit first. `OPENBF2_REV=`/`MODULE_REV=` pin other commits, `IMAGE=` another tag. Prints the commits and records them (below). OpenBF2 builds incrementally in the docker volume `bf2wa-openbf2-build-jammy` (`bf2wa-openbf2-build` is the old Debian 11 one, unused); first build takes long |
 | Release zip for the production images | Git Bash on Windows, Docker Desktop (or Linux; `.github/workflows/release.yml`) | `release/build.sh` (`OPENBF2_REV=`, `MODULE_REV=`, `BF2HUB_REV=`, `CLEAN=1`; README "Release build") | `release/out/openbf2-serverext-<openbf2>-<module>-<bf2hub>.zip` (bf2, libdice_py.so, libserverext.so, libbf2hub.so, source.txt) | Ubuntu 22.04 builder (glibc 2.35, OpenSSL 3), from commits; its own volume and container `serverext-release-build`. Used by bf2-docker `images/netsky-openbf2-*` (Debian trixie), which render `serverext.cfg` from `ENV_ADMIN_*` on every start |
 | Sidecar | Windows | `cd C:\Data\Projects\bf2-bots; dotnet build Bf2Bots.sln` (dev); for the localtest `publish-sidecar.ps1` (below) | `src\Bf2Bots.Cli\bin\...\bf2bots.exe` | .NET 10 SDK (`global.json`), warnings are errors |
 | WebAdmin | Windows | `cd C:\Data\Projects\DotNet\BF2WebAdmin; dotnet build src\BF2WebAdmin.Server\BF2WebAdmin.Server.csproj`; for the localtest `setup.ps1` publishes it | `app\` in the localtest | .NET 9 projects. Build projects, not `BF2WebAdmin.sln`: the author's uncommitted sln lists the untracked AppHost |
@@ -90,7 +90,7 @@ Which source is running:
 
 | Part | Made from | By | Runs as |
 |---|---|---|---|
-| BF2 server | netsky content image `cr.nihlen.net/library/bf2-netsky:2v2-nocheck` with its `bf2`/`libdice_py.so` replaced by OpenBF2's, plus `libserverext.so`, `openbf2.con`, `serverext.cfg` (`botListen 0.0.0.0:16705`, `watchdogTicks 6`) | `openbf2\build.sh` + `openbf2\Dockerfile` | container `bf2wa-localtest-openbf2` (compose `docker-compose.openbf2.yml`, profile `openbf2`); admin keys appended to `serverext.cfg` at the container's first start from `SERVEREXT_CFG_EXTRA` (`.env`'s `ADMIN_KEY`, `ADMIN_CERT_SHA256`) |
+| BF2 server | the production image `cr.nihlen.net/library/bf2-netsky:openbf2-2v2-nocheck` (bf2-docker: no ModManager, no rcon, `admin/netsky.py`) with its `bf2`, `libdice_py.so` and `libserverext.so` replaced by local builds; `ENV_INTERNET 0`, bot channel `0.0.0.0:16705` | `openbf2\build.sh` + `openbf2\Dockerfile` (since 2026-11-09; before, the retail `bf2-netsky:2v2-nocheck` with ModManager) | container `bf2wa-localtest-openbf2` (compose `docker-compose.openbf2.yml`, profile `openbf2`); the base's `run.sh` renders `serverext.cfg` on every start from `ENV_ADMIN_*` (`.env`'s `ADMIN_KEY`, `ADMIN_CERT_SHA256`) and appends `SERVEREXT_CFG_EXTRA` (`allowTeleport 1;allowRoundRestart 1`) |
 | SQL Server | `mcr.microsoft.com/mssql/server:2022-latest`, database `bf2` from `init-db.sql` | `setup.ps1` | container `bf2wa-localtest-mssql` |
 | WebAdmin | `..\BF2WebAdmin` **working tree** (branch `admin-channel`) | `setup.ps1 -OpenBF2` (publishes into `app\`, writes `app\Configuration\appsecrets.json`, recreates the BF2 container with the current pin) | `app\BF2WebAdmin.Server.exe` on the host, started by `play-2v2.ps1` (background, pid in `logs\play\webadmin.pid`) or `start-webadmin.ps1` (foreground) |
 | Bots | bf2-bots commit (default `HEAD` of `main`) | `publish-sidecar.ps1` (into `sidecar\`, or staged in `sidecar.next\` while bots run) | `sidecar\bf2bots.exe`, started by `play-2v2.ps1` |
@@ -122,7 +122,7 @@ Notes:
 - `play-2v2.ps1` Start without `-NoRoundRestart` restarts the round; Pilot/Gunner always replace the bots.
 - A staged `sidecar.next\` (none at the moment) is installed by the next `play-2v2.ps1` Start or Stop; the previous
   sidecar goes to `sidecar.old\`.
-- `openbf2/build.sh` uses shared state whatever `IMAGE` is: `openbf2\out\`, the docker volume `bf2wa-openbf2-build`
+- `openbf2/build.sh` uses shared state whatever `IMAGE` is: `openbf2\out\`, the docker volume `bf2wa-openbf2-build-jammy`
   and a builder container of that name. Run one build at a time: `docker ps --filter name=bf2wa-openbf2-build` must be
   empty first. Remove your own tag when done (`docker image rm bf2wa-localtest-openbf2:<task>`).
 - `build-module.sh` builds the working tree, `openbf2/build.sh` only commits: after the WSL tests pass, commit (only
@@ -143,7 +143,7 @@ powershell -ExecutionPolicy Bypass -File .\test-instance.ps1 -Mode Stop -Name <t
 ```
 
 - Without `-Name` the name is `test`. Container `bf2wa-localtest-openbf2-<task>` (recreated on every Start), game `127.0.0.1:16571/udp`, GameSpy 29903,
-  rcon `127.0.0.1:4723`, bot channel `127.0.0.1:16706`, admin channel dialled to `host.docker.internal:4312`.
+  bot channel `127.0.0.1:16706`, admin channel dialled to `host.docker.internal:4312`; no rcon.
 - WebAdmin from `scratch\test-<task>\app` (copied once from `app\` when missing, so it can be older than `app\`: delete
   it to copy again; or publish your build there, or pass `-App`), web UI http://localhost:5052,
   database `bf2test` (created from `init-db.sql` with server row `127.0.0.1:16571`, the localtest group's
@@ -154,13 +154,13 @@ powershell -ExecutionPolicy Bypass -File .\test-instance.ps1 -Mode Stop -Name <t
 - Use `-Name <task>` (with Start, Status and Stop) so your instance gets its own container and `scratch\test-<task>\`
   directory and does not overwrite an earlier instance's app and logs. Two instances at once also need other ports
   (the port parameters); ports must not be 16567 or the play server's. Do not run it together with a WSL test server on
-  its default ports (both use 16571/29903/4723).
+  its default ports (both use 16571/29903).
 - Start prints the `ServerModule` rows it copied into the database; `Heli2v2Module` must be among them for Heli2v2
   tests. If it is missing, `bf2` has no such row either: enable it there (WebAdmin UI) or insert it into the test
   database.
 - Bots: run your own copy, `publish-sidecar.ps1 -Out scratch\sidecar-<task>`, not the play session's `sidecar\`: a
   process running from `sidecar\` would block a staged `sidecar.next\` from being installed.
-- Clients: `$env:RCON_PORT=4723; python -I tools\rcon.py "<cmd>"`;
+- Clients: `tools\console.ps1 -Url http://localhost:5052 -ServerId 127.0.0.1:16571 "<console line>"`;
   `$env:BF2WA_URL='http://localhost:5052'; $env:BF2WA_SERVER_ID='127.0.0.1:16571'; dotnet run --project tools\hubclient -- --watch 30`;
   the sidecar with `--endpoint 127.0.0.1:16706`; `serverext_client.py --port 16706`.
 - A sidecar run like the play session's (two all-bot crews; add `--human-seat 0|1 --test-stand-in <s>` for a mixed
@@ -192,13 +192,13 @@ protocol.md "Testing". Their run dirs are agent-owned (`~/serverext-<task>/srv`)
 | 16567 (and 29900, 4711 on the host) | **Reserved for the author's own sessions** | Never use, never stop what holds it |
 | 16569/udp (all interfaces) | play server game port | LAN players join here |
 | 29901/udp | play server GameSpy query | |
-| 127.0.0.1:4721 | play server rcon (container 4711) | `tools\rcon.py` |
+| 127.0.0.1:4721 | the retail variant's rcon (container 4711) | `tools\rcon.py`; the OpenBF2 variant has no rcon |
 | 127.0.0.1:16705 | play server bot channel (container 16705) | sidecar, test client |
 | 4310 (0.0.0.0) | play WebAdmin admin-channel listener (TLS) | the module dials `host.docker.internal:4310` |
 | 5050 | play WebAdmin web UI | user `admin`, password `WEBADMIN_ADMIN_PASSWORD` in `.env` |
 | 127.0.0.1:14333 | SQL Server (shared) | databases `bf2` (play), `bf2test` (test instance) |
 | 4300 | `mm_webadmin` text socket | only the retail variant (`setup.ps1` without `-OpenBF2`) and BF2WebAdmin `master` |
-| 16571/udp, 29903/udp, 127.0.0.1:4723, 127.0.0.1:16706, 4312, 5052 | test instance defaults | `test-instance.ps1` |
+| 16571/udp, 29903/udp, 127.0.0.1:16706, 4312, 5052 | test instance defaults | `test-instance.ps1` |
 | 16571, 29903, 4723, bot 16701 (WSL) / 16702 (Docker) | `testenv/` servers | 16700 is held by a stale `wslrelay`: leave it |
 | 16703, 16710, 16573, 29905, 4725 | used by the admin-channel phase-1 WSL runs | |
 | 55124, 55126/udp | VoIP inside each server | two WSL servers at once collide; containers do not |
@@ -225,7 +225,7 @@ One human client has played on the localtest's OpenBF2 server with the module (L
 
 | What | Where |
 |---|---|
-| Module (`[serverext]` lines), play server | `docker logs bf2wa-localtest-openbf2`; inside the container `/volume/bf2.log` (status screen only), `/volume/modmanager.log` |
+| Module (`[serverext]` lines), play server | `docker logs bf2wa-localtest-openbf2`; inside the container `/volume/bf2.log` (status screen and the admin script's `netsky:` lines) |
 | Module, test instance | `docker logs bf2wa-localtest-openbf2-<name>` |
 | WebAdmin, play session | `logs\play\webadmin.log`, `webadmin.err.log` (started by play-2v2.ps1); `start-webadmin.ps1` logs to its console |
 | WebAdmin, test instance | `scratch\test-<name>\webadmin.log` |
