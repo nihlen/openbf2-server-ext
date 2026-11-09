@@ -873,8 +873,8 @@ authenticates. A bad value refuses the module's load, as for the bot channel's k
 - Map mods, noclip, freeze, gravity and the TV settings still use console lines, because a typed
   `SpawnObject` gives most templates no networkable, so clients never see them. They need
   `adminAllowConsole 1`.
-- Kick and ban from the web UI and Discord still go through ModManager's `iga` over classic rcon; the
-  typed `Kick`/`Ban` are used by the `.kick`/`.ban` chat commands only.
+- Kick and ban from the web UI and Discord went through ModManager's `iga` over classic rcon until
+  2026-11-09; since then WebAdmin uses the typed `Kick`/`Ban` everywhere and the console for the ban list.
 - A changed `AdminKey` takes effect at the module's next retry (up to 60 s).
 - BF2WebAdmin's `ServerId` column is `nvarchar(20)`, one character short of the longest `ip:port`, and
   it is now the module's server id.

@@ -39,8 +39,9 @@ The author may have uncommitted work in any of them (BF2WebAdmin has some now: `
                ▼
            BF2WebAdmin (admin-channel branch) AdminListener on 4310 (Windows host) ── SQL Server (bf2 database)
            web UI http://localhost:5050 ── tools\hubclient uses the same SignalR hub
- ModManager rcon (mm_rcon, container 4711, published 127.0.0.1:4721) is still there: tools\rcon.py, WebAdmin's
- web rcon box, kick/ban through iga.
+ ModManager rcon (mm_rcon, container 4711, published 127.0.0.1:4721) is still in the localtest image, for
+ tools\rcon.py only: WebAdmin uses no rcon since 2026-11-09 (kick, ban and its "!" console go over the admin
+ channel), and the production images (bf2-docker netsky-openbf2-*) have no ModManager.
 ```
 
 - The module runs inside the server process. Its socket I/O runs on its own threads; engine work happens once per
@@ -279,8 +280,8 @@ Collected from the findings and per-repo docs on 2026-10-26; the source of each 
   BF2WebAdmin admin-channel.md item 5.
 - **The admin key is visible in WebAdmin's server edit form** to Administrator-role users (HMAC needs the raw key).
   admin-channel.md item 6.
-- **Kick and ban still go through rcon** (ModManager `iga`) from the web UI and Discord; the typed commands are only
-  behind the `.kick`/`.ban` chat commands. admin-channel.md item 7.
+- **Kick and ban** use the typed commands everywhere since 2026-11-09 (WebAdmin `Services/ServerAdmin.cs`); the bans
+  are the engine's own list (`settings/banlist.con`). admin-channel.md item 7.
 - **Heli2v2 and bot respawns:** a bot respawned with RemoveBot/CreateBot is a new player to Heli2v2; a pending round
   can then hold 5 players and Heli2v2 (exactly 4) would not start it. Not seen yet. bf2-bots serverext-missions.md
   "Round flow".
