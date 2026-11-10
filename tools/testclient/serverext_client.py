@@ -2906,6 +2906,63 @@ def run_q12(args):
     return cl.finish()
 
 
+def run_tvswitch(args):
+    """The TV reload stall (the tv-bugs investigation, OpenBF2 AmmoComp): a crew on its pad; the gunner fires a TV
+    missile into the deck ahead (a short flight), switches to the gun --switch-ticks after the press, waits
+    --switch-hold seconds on the gun and switches back. A launcher whose reload started before the switch comes back
+    loaded; one put away between the reload's two start steps comes back empty and only then reloads. Each offset
+    runs --switch-repeats times; the server's [TVT] trace shows the state at each disable."""
+    cl = Client(args, "serverext testclient tvswitch")
+    crew = board_crew(cl, args.team, args.name)
+    if not crew:
+        return cl.finish()
+    pilot, gunner, heli = crew
+    cl.pulses[gunner] = BTN_ALT_FIRE
+    cl.run_for(1.5)
+    if not cl.check(f"gunner on the TV launcher: {slot0_name(cl, gunner)}", has_tv(cl, gunner)):
+        return cl.finish()
+    offsets = [int(x) for x in args.switch_ticks.split(",") if x.strip()]
+    rows = []
+    for n in offsets:
+        for rep in range(args.switch_repeats):
+            label = f"switch at +{n} ticks (#{rep + 1})"
+            if not cl.run_for(30.0, lambda: has_tv(cl, gunner) and slot0(cl, gunner)["ammo"] > 0 and
+                              not slot0(cl, gunner)["reloading"] and not own_tv_missiles(cl, gunner)):
+                log(f"{label}: launcher not ready: {slot0(cl, gunner)}")
+                rows.append((n, rep, "not ready", None, None))
+                continue
+            e = cl.states[gunner]
+            pos = e["pos"]
+            aim_end = ahead(pos, e["ypr"][0], 45.0, pos[1] - 6.0)
+            cl.steers[gunner] = (eye(cl, gunner), aim_end)
+            wait_ticks(cl, 6)
+            cl.pulses[gunner] = BTN_FIRE
+            press = cl.tick
+            cl.run_for(5.0, lambda: cl.tick >= press + n)
+            cl.pulses[gunner] = BTN_ALT_FIRE
+            switched = cl.tick
+            cl.run_for(1.0)
+            on_gun = not has_tv(cl, gunner)
+            cl.steers.pop(gunner, None)
+            cl.run_for(args.switch_hold)
+            cl.pulses[gunner] = BTN_ALT_FIRE
+            back = cl.tick
+            cl.run_for(1.0, lambda: has_tv(cl, gunner))
+            w = slot0(cl, gunner)
+            at_back = (w["ammo"], w["reloading"]) if w else None
+            loaded = cl.run_for(12.0, lambda: has_tv(cl, gunner) and slot0(cl, gunner)["ammo"] > 0)
+            wait_s = (cl.tick - back) / 30.0 if loaded else None
+            verdict = "STALLED" if wait_s is not None and wait_s > 2.0 else ("ok" if loaded else "never loaded")
+            log(f"{label}: fire pressed after tick {press}, alt fire after tick {switched} (on the gun: {on_gun}), back after tick "
+                f"{back}: ammo/reloading at return {at_back}, loaded {wait_s if wait_s is None else round(wait_s, 2)} s after "
+                f"the return -> {verdict}")
+            rows.append((n, rep, verdict, on_gun, wait_s))
+    print("tvswitch summary (offset ticks, repeat, verdict, switched to the gun, seconds to loaded after the return):", flush=True)
+    for r in rows:
+        print("  " + ", ".join(str(x) for x in r), flush=True)
+    return cl.finish()
+
+
 def run_viewer(args):
     """Drives the admin channel's viewer additions (adminclient.py --scenario viewer reads them): a pilot
     and a gunner share a heli over the sea. The pilot cycles its camera views, fires rockets and flares;
@@ -2977,7 +3034,8 @@ def run_viewer(args):
     return cl.finish()
 
 
-SCENARIOS_V3 = {"burst": run_burst, "tv": run_tv, "soak3": run_soak3, "q12": run_q12, "viewer": run_viewer}
+SCENARIOS_V3 = {"burst": run_burst, "tv": run_tv, "soak3": run_soak3, "q12": run_q12, "viewer": run_viewer,
+                "tvswitch": run_tvswitch}
 
 
 # ------------------------------------------------------------------------------------- fuzz
@@ -3250,7 +3308,7 @@ def main():
     ap.add_argument("--vehicle-log-every", type=float, default=60.0, help="seconds between VehicleList summaries")
     ap.add_argument("--scenario", choices=["hover", "walk", "buttons", "blockpad", "allblocked", "wreck", "q9", "q5", "teamswitch",
                                            "view", "weapons", "damage", "spot", "round", "teleport", "multiconn", "soak2",
-                                           "burst", "tv", "soak3", "q12", "viewer"],
+                                           "burst", "tv", "soak3", "q12", "viewer", "tvswitch"],
                     default="hover")
     ap.add_argument("--rcon-port", type=int, default=4723, help="q9: ModManager RCON port")
     ap.add_argument("--rcon-password", default="", help="q9: ModManager RCON password")
@@ -3292,6 +3350,10 @@ def main():
     ap.add_argument("--tv-every", type=float, default=75.0,
                     help="soak3: seconds between guided TV shots (the AH-1Z carries 8 and does not rearm in a hover)")
     ap.add_argument("--trace-csv", default="", help="tv: write every TV missile's track to this CSV")
+    ap.add_argument("--switch-ticks", default="20,26,28,29,30,31,32,33,34,36,40",
+                    help="tvswitch: ticks after the fire press at which the gunner switches to the gun")
+    ap.add_argument("--switch-repeats", type=int, default=2, help="tvswitch: runs per offset")
+    ap.add_argument("--switch-hold", type=float, default=12.0, help="tvswitch: seconds on the gun")
     args = ap.parse_args()
     try:
         if args.fuzz:
