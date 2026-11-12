@@ -771,6 +771,8 @@ std::vector<Case> validCommands()
     w.u32(29); w.u8(StreamWeaponFireEvents); w.u8(0); w.u8(1); w.str("ahe_z10_FlareLauncher"); CASE(MsgSubscribe);
     w.u32(30); w.u8(StreamWeaponEvents); w.u8(0); w.u8(0); CASE(MsgSubscribe);
     w.u32(31); w.u8(StreamProjectileReplay); w.u8(0); w.u8(1); w.str("agm114_hellfire_tv"); CASE(MsgSubscribe);
+    w.u32(32); w.str("Enable mod X?"); w.u16(30); w.u8(0); w.u8(50); w.u8(1); CASE(CmdStartVote);
+    w.u32(33); CASE(CmdCancelVote);
 #undef CASE
     return cs;
 }
@@ -861,6 +863,15 @@ void testCommandParsing()
     w.u32(1); w.u8(RefPlayer); w.u32(3); BAD(CmdDeleteObject);
     w.u32(1); w.str("x"); w.f32(0); w.f32(20000); w.f32(0); for (int i = 0; i < 3; ++i) w.f32(0); w.u8(0); BAD(CmdSpawnObject);
     w.u32(1); w.str(""); for (int i = 0; i < 6; ++i) w.f32(0); w.u8(0); BAD(CmdSpawnObject);
+    w.u32(1); w.str("q"); w.u16(4); w.u8(0); w.u8(50); w.u8(1); BAD(CmdStartVote);              // 4 s
+    w.u32(1); w.str("q"); w.u16(601); w.u8(0); w.u8(50); w.u8(1); BAD(CmdStartVote);            // 601 s
+    w.u32(1); w.str("q"); w.u16(30); w.u8(3); w.u8(50); w.u8(1); BAD(CmdStartVote);             // team 3
+    w.u32(1); w.str("q"); w.u16(30); w.u8(0); w.u8(0); w.u8(1); BAD(CmdStartVote);              // 0 %
+    w.u32(1); w.str("q"); w.u16(30); w.u8(0); w.u8(101); w.u8(1); BAD(CmdStartVote);            // 101 %
+    w.u32(1); w.str("q"); w.u16(30); w.u8(0); w.u8(50); w.u8(65); BAD(CmdStartVote);            // 65 ballots
+    w.u32(1); w.str(""); w.u16(30); w.u8(0); w.u8(50); w.u8(1); BAD(CmdStartVote);              // no question
+    w.u32(1); w.str(std::string(97, 'q')); w.u16(30); w.u8(0); w.u8(50); w.u8(1); BAD(CmdStartVote);
+    w.u32(1); w.str("a\x01"); w.u16(30); w.u8(0); w.u8(50); w.u8(1); BAD(CmdStartVote);         // control byte
 #undef BAD
     for (size_t i = 0; i < bads.size(); ++i)
     {
@@ -1609,7 +1620,7 @@ void testGolden()
 {
     const std::string path = std::string(SERVEREXT_FIXTURES) + "/admin-v1-golden.txt";
     std::map<std::string, std::vector<uint8_t> > golden = readGolden(path);
-    CHECK(golden.size() == 67);
+    CHECK(golden.size() == 70);
     if (golden.empty())
     {
         std::printf("  no golden fixtures at %s\n", path.c_str());
@@ -1780,6 +1791,7 @@ void testGolden()
     encodePing(mine["ping"], MsgPing, 13, 0x0102030405060708ull);
     encodePing(mine["pong"], MsgPong, 13, 0x0102030405060708ull);
     encodeError(mine["error"], 14, ErrDisabled, "off");
+    encodeVoteResult(mine["ev_vote_result"], 27, 10, 27, "Enable mod \xC2\xA7X?", 1, 3, 1, 5);
 
     for (std::map<std::string, std::vector<uint8_t> >::iterator it = mine.begin(); it != mine.end(); ++it)
     {
@@ -1805,8 +1817,10 @@ void testGolden()
         CHECK(ok);
         parsed[it->first] = c;
     }
-    CHECK(parsed.size() == 24);
+    CHECK(parsed.size() == 26);
     Command c;
+    c = parsed["cmd_start_vote"]; CHECK(c.type == CmdStartVote && c.requestId == 27 && c.text == "Enable mod X?" && c.seconds == 30 && c.target == 2 && c.value8 == 60 && c.flags == 3);
+    c = parsed["cmd_cancel_vote"]; CHECK(c.type == CmdCancelVote && c.requestId == 28);
     c = parsed["cmd_request_snapshot"]; CHECK(c.type == MsgRequestSnapshot && c.requestId == 1);
     c = parsed["cmd_subscribe_fire"]; CHECK(c.requestId == 25 && c.target == 18 && c.filters.size() == 1 && c.filters[0] == "ahe_z10_FlareLauncher");
     c = parsed["cmd_subscribe_replay"]; CHECK(c.requestId == 26 && c.target == StreamProjectileReplay && c.filters.size() == 1 && c.filters[0] == "agm114_hellfire_tv");

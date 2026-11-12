@@ -46,16 +46,19 @@ EV_SCORE_CHANGE, EV_KILL, EV_DAMAGE, EV_ENTER_VEHICLE, EV_EXIT_VEHICLE = 0x120A,
 EV_VEHICLE_DESTROYED, EV_CONTROL_POINT, EV_CHAT, EV_PROJECTILE_FIRED = 0x120F, 0x1210, 0x1211, 0x1212
 EV_PROJECTILE_HIT, EV_KICK, EV_BAN, EV_BOT = 0x1213, 0x1214, 0x1215, 0x1216
 EV_WEAPON_FIRE, EV_WEAPONS, EV_PROJECTILE_COLLISION, EV_PROJECTILE_TRACE = 0x1217, 0x1218, 0x1219, 0x121A
+EV_VOTE_RESULT = 0x121B
 CMD_CONSOLE, CMD_SAY, CMD_TELEPORT, CMD_SET_HEALTH, CMD_KILL_PLAYER = 0x1301, 0x1302, 0x1303, 0x1304, 0x1305
 CMD_SET_TEAM, CMD_SET_SCORE, CMD_RANK, CMD_MEDAL, CMD_GAME_EVENT = 0x1306, 0x1307, 0x1308, 0x1309, 0x130A
 CMD_HUD_EVENT, CMD_KICK, CMD_BAN, CMD_MAP, CMD_LIST_OBJECTS = 0x130B, 0x130C, 0x130D, 0x130E, 0x130F
 CMD_SET_OBJECT_ACTIVE, CMD_SPAWN_OBJECT, CMD_DELETE_OBJECT = 0x1310, 0x1311, 0x1312
+CMD_START_VOTE, CMD_CANCEL_VOTE = 0x1313, 0x1314
 OK, CONSOLE_RESULT, OBJECT_LIST, OBJECT_SPAWNED = 0x1401, 0x1402, 0x1403, 0x1404
 PING, PONG, ERROR = 0x1501, 0x1502, 0xFFFF
 
 NAMES = {v: k for k, v in list(globals().items()) if isinstance(v, int) and k.isupper() and 0x1000 <= v <= 0xFFFF
          and k not in ("VERSION",)}
-EVENT_TYPES = range(0x1201, 0x121B)
+EVENT_TYPES = range(0x1201, 0x121C)
+VOTE_OUTCOMES = {1: "passed", 2: "failed", 3: "cancelled", 4: "level unload"}
 
 STREAMS = {"players": 1, "vehicles": 2, "projectiles": 3, "game": 4, "aim": 5, "damage": 16, "projectile-events": 17,
            "fire": 18, "weapons": 19, "replay": 20}
@@ -328,6 +331,8 @@ def decode(t, payload):
                                   for _ in m["targets"]]
                 samples.append(smp)
             m["samples"] = samples
+        elif t == EV_VOTE_RESULT:
+            m.update(request=r.u32(), text=r.s(), outcome=r.u8(), yes=r.u16(), no=r.u16(), eligible=r.u16())
     elif t == OK:
         m.update(request=r.u32())
     elif t == CONSOLE_RESULT:
@@ -403,6 +408,10 @@ def p_object_ref(req, kind, ident):
 
 
 def p_spawn(req, template, pos, rot, team=0): return W().u32(req).s(template).vec3(pos).vec3(rot).u8(team).b
+
+
+def p_start_vote(req, text, seconds=30, team=0, percent=50, min_votes=1):
+    return W().u32(req).s(text).u16(seconds).u8(team).u8(percent).u8(min_votes).b
 
 
 def p_subscribe(req, stream, rate=1, filters=()):
@@ -564,6 +573,9 @@ def golden_samples():
     s["cmd_ping"] = (PING, p_ping(24, 99))
     s["cmd_subscribe_fire"] = (SUBSCRIBE, p_subscribe(25, 18, 0, ["ahe_z10_FlareLauncher"]))
     s["cmd_subscribe_replay"] = (SUBSCRIBE, p_subscribe(26, 20, 0, ["agm114_hellfire_tv"]))
+    s["cmd_start_vote"] = (CMD_START_VOTE, p_start_vote(27, "Enable mod X?", 30, 2, 60, 3))
+    s["cmd_cancel_vote"] = (CMD_CANCEL_VOTE, W().u32(28).b)
+    s["ev_vote_result"] = (EV_VOTE_RESULT, ev(27).u32(27).s("Enable mod §X?").u8(1).u16(3).u16(1).u16(5).b)
     return s
 
 
@@ -932,6 +944,59 @@ def scenario_listen(lst, args):
     except Closed as e:
         log("link closed:", e)
     report_link(link, time.time() - t0)
+    return 0
+
+
+def scenario_vote(lst, args):
+    """Starts a server vote (--vote-text, --vote-seconds, --vote-team, --vote-percent, --vote-min) and prints what
+    the players are sent: the module's chat lines (vote lines, confirmations, the result), the kills that push rows,
+    and VoteResult. Ballots need retail clients pressing PgUp/PgDn. With no human player the module refuses the vote
+    (Error 6); the scenario then checks that CancelVote is refused too and stops."""
+    link = lst.accept(args.accept_timeout)
+    rq = link.next_request
+    if args.vote_delay > 0:
+        link.pump(args.vote_delay)
+    r = link.request(CMD_START_VOTE, p_start_vote(rq(), args.vote_text, args.vote_seconds, args.vote_team,
+                                                 args.vote_percent, args.vote_min))
+    if r["name"] != "OK":
+        log("StartVote -> %s %s %s" % (r["name"], r.get("code"), r.get("message")))
+        r2 = link.request(CMD_CANCEL_VOTE, W().u32(rq()).b)
+        log("CancelVote with no vote running -> %s %s %s" % (r2["name"], r2.get("code"), r2.get("message")))
+        ok = r["name"] == "ERROR" and r["code"] == ERR_REFUSED and r2["name"] == "ERROR" and r2["code"] == ERR_REFUSED
+        return 0 if ok else 1
+    r2 = link.request(CMD_START_VOTE, p_start_vote(rq(), "second", 10))
+    log("a second StartVote -> %s %s %s" % (r2["name"], r2.get("code"), r2.get("message")))
+    t0 = time.time()
+    seen = len(link.events)
+    result = None
+    lines = 0
+    rows_sent = 0
+    try:
+        while result is None and time.time() < t0 + args.vote_seconds + 15:
+            # --vote-rows: server messages from 3 s on, one per 0.5 s, each a row in every box.
+            if rows_sent < args.vote_rows and time.time() >= t0 + 3.0 + 0.5 * rows_sent:
+                rows_sent += 1
+                link.request(CMD_SAY, p_say(rq(), 0, 0, "row %d" % rows_sent))
+            link.pump(0.25)
+            for m in link.events[seen:]:
+                if m["type"] == EV_CHAT and m["sender"] == -1:
+                    lines += 1
+                    to = ("player %d" % m["engine_flags"]) if m["channel"] == 14 else m["channel_name"]
+                    log("%6.1f s  -> %-16s %s" % (time.time() - t0, to, m["text"]))
+                elif m["type"] == EV_KILL:
+                    log("%6.1f s  kill (a row in every box): %d -> %d" % (time.time() - t0, m["attacker"], m["victim"]))
+                elif m["type"] == EV_VOTE_RESULT:
+                    result = m
+            seen = len(link.events)
+    except Closed as e:
+        log("link closed:", e)
+        return 1
+    if result is None:
+        log("no VoteResult")
+        return 1
+    log("VoteResult: %s, yes %d, no %d, voters %d (%d server lines seen): %s" % (
+        VOTE_OUTCOMES.get(result["outcome"], result["outcome"]), result["yes"], result["no"], result["eligible"], lines,
+        result["text"]))
     return 0
 
 
@@ -1692,7 +1757,7 @@ def main():
     ap.add_argument("--write-golden", default="", help="write the golden fixtures to this file and exit")
     ap.add_argument("--scenario", default="listen",
                     choices=["listen", "commands", "resync", "stall", "soak", "wrongkey", "wrongpin", "mapchange", "extras",
-                             "viewer", "replay"])
+                             "viewer", "replay", "vote"])
     ap.add_argument("--fuzz", action="store_true")
     ap.add_argument("--fuzz-rounds", type=int, default=24)
     ap.add_argument("--seed", type=int, default=1)
@@ -1709,6 +1774,13 @@ def main():
     ap.add_argument("--rcvbuf", type=int, default=0, help="SO_RCVBUF for accepted links (stall tests)")
     ap.add_argument("--lags", default="0.25,0.15,0", help="replay: forced lag blocks, seconds (0 = off)")
     ap.add_argument("--console-setup", default="", help="replay: console lines run first, separated by |")
+    ap.add_argument("--vote-text", default="Enable mod X?", help="vote: the question")
+    ap.add_argument("--vote-seconds", type=int, default=30, help="vote: 5..600")
+    ap.add_argument("--vote-team", type=int, default=0, help="vote: 0 everyone, 1 or 2")
+    ap.add_argument("--vote-percent", type=int, default=50, help="vote: yes share of the ballots needed to pass")
+    ap.add_argument("--vote-min", type=int, default=1, help="vote: ballots needed to pass")
+    ap.add_argument("--vote-rows", type=int, default=0, help="vote: server messages to send from 3 s on (rows)")
+    ap.add_argument("--vote-delay", type=float, default=0.0, help="vote: seconds to wait after the link before StartVote")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
     if args.write_golden:
@@ -1726,7 +1798,8 @@ def main():
         return {"listen": scenario_listen, "commands": scenario_commands, "resync": scenario_resync,
                 "stall": scenario_stall, "soak": scenario_soak, "wrongkey": scenario_wrongkey,
                 "wrongpin": scenario_wrongpin, "mapchange": scenario_mapchange,
-                "extras": scenario_extras, "viewer": scenario_viewer, "replay": scenario_replay}[args.scenario](lst, args)
+                "extras": scenario_extras, "viewer": scenario_viewer, "replay": scenario_replay,
+                "vote": scenario_vote}[args.scenario](lst, args)
     except KeyboardInterrupt:
         return 130
 

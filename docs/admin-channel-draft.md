@@ -169,6 +169,7 @@ designed and approved on its own.
 | R5 | Damage observer | Read-only, at the point where damage is applied. **The bot channel's approved v2 damage event needs the same hook**, so it is built once for both |
 | — | Appended `IServerExtension` methods | CD-key hash, team names, tickets, round time, game and HUD events, medal, rank, player message, and object spawn and delete if no typed path exists |
 | R6 | Veto hooks | Phase 3 only |
+| R7 | Client presentation hooks | Approved 2026-11-12, not implemented. Three appended `IServerExtension` methods; see "R7: client presentation hooks" below |
 
 ## The C# side
 
@@ -553,6 +554,7 @@ reads the objects during the callback, before Python's handlers run.
 | `0x1218` | Weapons | `u8` player, `u8` W, W × `WeaponSlot`: the weapons in the active slots 0-2 of the player's seat (on foot the soldier's), as the bot channel's weapon list; W = 0 when dead | only while subscribed (stream 19): polled per tick, sent when a player's set changes, and for every player on `Subscribe` and after every `Snapshot` |
 | `0x1219` | ProjectileCollision | see "Hit/miss replay" B below; only while subscribed (stream 20) | the projectile-collision observer |
 | `0x121A` | ProjectileTrace | see "Hit/miss replay" C below; only while subscribed (stream 20) | the module's tick hook and the projectile observer |
+| `0x121B` | VoteResult | `u32` request id of the `StartVote`, string question, `u8` outcome (1 passed, 2 failed, 3 cancelled by `CancelVote`, 4 cancelled by a level unload), `u16` yes, `u16` no, `u16` voters | the module's server vote ("Server votes" below) |
 
 **`WeaponFire`** (one per shooter and weapon per tick in which it launched; added 2026-10-28):
 
@@ -745,6 +747,8 @@ request id) unless a typed result is listed. Failure is `Error` with the request
 | `0x1310` | SetObjectActive | `ObjectRef` (kind 2 or 3) | `Ok` |
 | `0x1311` | SpawnObject | string template name, `Vec3` position, `Rot` rotation, `u8` team | `ObjectSpawned`; `Error` 9 with `adminAllowObjects 0` |
 | `0x1312` | DeleteObject | `ObjectRef` (kind 2 or 3) | `Ok`; `Error` 9 with `adminAllowObjects 0` |
+| `0x1313` | StartVote | string question (1-96 bytes), `u16` seconds (5-600), `u8` team (0 everyone, 1 or 2), `u8` percent (1-100), `u8` minimum ballots (0-64) | `Ok`; `Error` 6 when a vote is running or no human player can vote ("Server votes" below) |
+| `0x1314` | CancelVote | nothing after the request id | `Ok`; `Error` 6 when no vote is running |
 
 **`0x1402 ConsoleResult`**: `u32` request id, `u8` flags (bit 0 output truncated at 256 KiB), `u16`
 line count L, L × string. The output of `Console::executeLine` split at `\n`, without the final
@@ -902,3 +906,108 @@ moving player's position and rotation changes every frame. A full 64-player fram
 30 Hz is about 80 KB/s, and a 2v2 server with 4 players is about 6 KB/s. If that becomes a problem,
 the cheap step is to skip entities unchanged since the last frame, with a full frame every second; it
 is a new stream encoding, not a protocol redesign.
+
+## R7: client presentation hooks (approved 2026-11-12, not implemented)
+
+Lets the module drive HUD features the retail client already has, with no client mod: map markers, notices, a round
+clock and squad orders. Python's `sendHudEvent` carries only a 4-byte payload, and nothing sends the other two events on
+demand. Every part is `[CHOSEN, not recovered]` and lives only in the extension files: three methods appended to
+`IServerExtension.h`, with bodies in `GameServer::ServerExtension` (`GameServer.cpp`). No other engine file changes. All
+three run on the main thread. The client behaviour below is read from the reconstructed client code; each part is
+tested on a retail client before it is relied on.
+
+**R7a `bool sendHudEventRaw(int playerId, int eventId, const void* payload, int size)`.** Sends
+`PostRemoteEvent(ECHud, eventId, payload, size)` to one player, or to every playing client for -1. Refuses an id outside
+the whitelist and a size above 52 (shorter payloads are zero-padded). The whitelist holds ids whose client handlers read
+the payload as plain data; an id joins it only after a retail-client test (42 may touch commander-only state; 64/65 do
+nothing unless both teams can capture the point):
+
+| Id | Effect | Payload |
+|---|---|---|
+| 43 | Spotted marker at x/z, one team | `u16` spotter, `u16` target, `u8` team at +4, `f32` x at +8, `f32` z at +12, `i32` vehicle type at +16 |
+| 42 | Artillery circle and heads-up | `Vec3`, `u8` active at +12 |
+| 40 / 41 | UAV marker / satellite sweep | position, as `CommanderToolsManager.cpp` sends it |
+| 74 / 83 | Vehicle-drop / supply-drop marker and "incoming" VO | position, as `CommanderToolsManager.cpp` / `SupplyDropManager.cpp` send it |
+| 64 / 65 | Control point captured / lost | `i32` cp id, `i32` player id |
+| 44 | Missile-lock warning | 16 bytes, as `GameServer.cpp` sends it |
+| 51 | The client sends this radio message itself | 32-byte name, channel at +0x20 |
+| 66, 70, 71 | Help hint, ticket VO | `i32` |
+
+Never allowed: 7, 12, 17, 38 and 73, whose handlers treat the payload as a pointer (73 frees it).
+
+**R7b `bool sendRoundClock(int playerId, float secondsFromNow)`.** Sends
+`BeginRoundEvent(getBeginRoundState(), nowTick + seconds × tick rate, false, false)` to one player or to all (-1). The
+state is always the server's current one, so only the client's clock and banner move. The server's own
+`BeginRoundEvent` at the next phase change overwrites it. To test: that the in-round HUD clock follows
+`nextStateChangeAtTick`, and that state 1 has no side effect beyond HUD mode 0.
+
+**R7c `bool issueSquadOrder(int team, int squad, int orderId, unsigned short targetNetId, const float points[9], bool commander)`.**
+Calls the retail `SquadManager::issueSquadOrder` or the commander-order equivalent with a filled `SquadOrder`, so server
+squad state stays consistent and members get the retail HUD notices (and AI members the order). Order ids: 0 artillery,
+1 UAV, 2 vehicle drop, 3 supply, 5 attack, 6 defend, 7 repair, 8 destroy, 9 mines, 10 attack control point, anything
+else move. Refuses squad 0 and teams other than 1 and 2.
+
+**Module side.** Admin-channel commands `HudEvent` (player, id, bytes; the module checks the same whitelist), `RoundClock`
+(player, seconds) and `SquadOrder` (team, squad, order, target, points, commander), ids assigned when the byte layouts
+are written. Bot-channel equivalents can follow. The engine surface changes, so the admin protocol version bumps.
+
+**Out of scope.** Raw `ECGameLogic` events (unknown subtypes abort the client), `KilledByEvent`, commander drops,
+control-point `takeOverCounter` (later R7 items), and veto hooks (other engine files).
+
+## Server votes (approved and implemented 2026-11-12, module only)
+
+A yes/no vote on any question, with no engine change. Players answer with PgUp/PgDn: with no HUD question pending, the
+retail client turns them into the team radio messages `roger_that` and `negative` (`HudQuestionManager.cpp`
+`replyWithoutQuestion`), which reach the module on `ECNetwork` as `RadioMessageReceivedEvent` (id 13). The module
+cannot call the engine's name lookup, so the ids are constants (`src/Vote.h`): 112 and 113, the two messages' order in
+the bf2 content's `Common/Sound/VoiceMessages*.con` (`addMessage` numbers messages in load order,
+`Game/GameLogic/VoiceMessages.cpp:102`). Content with another message list needs other ids.
+
+- **Commands** `0x1313 StartVote` and `0x1314 CancelVote`, **event** `0x121B VoteResult` (layouts in the wire format
+  tables above). One vote at a time.
+- **Voters.** Every human player (not AI-flagged, so never a bot) on a voting team (1 or 2; a team vote: that team),
+  re-checked every tick. A voter who leaves, or leaves the team of a team vote, loses the ballot; a voter who joins
+  mid-vote gets the vote line at once.
+- **Ballots.** A player's latest `roger_that`/`negative` while the vote runs counts; changing it is allowed.
+- **Result.** The vote ends when its time is up or every voter has voted. It passes when at least `minimum ballots`
+  (at least 1) were cast and yes ≥ `percent` % of them. The result line goes to everyone (`sayAll`), or to the team of a
+  team vote (`sayTeam`): `VOTE PASSED: <text> (yes Y, no N)`, `VOTE FAILED: …` or `VOTE CANCELLED: <text>`. A level
+  unload cancels the vote without a line.
+- **Lines.** `VOTE: <text> (PgUp yes / PgDn no, <s> s left)`; a voter's own line `<text> - you voted YES` (or `NO`),
+  sent on the tick after the ballot.
+- **Display** (the author's choice, option 1): the question goes to the game-message rows, the box the kill feed and
+  server messages share (chat types 0/1 → `addTeamChat` → `HudChat::addGameMessage`, row group 1), which player chat
+  cannot push out. Each voter gets a private `<text> - you voted YES/NO` there too (`IGameServer::say`, channel 14
+  `TCPlayer`, type 1). The result goes to everyone at the end.
+- **Known costs.** Each answer is also relayed as team radio ("Roger that" / "Negative"). A pending squad invite, order
+  or team-kill question takes the key press first. A player who just spammed radio may have the press dropped by the
+  client's radio throttle (`sv.radioSpamInterval` can be relaxed during the vote). "PgUp/PgDn" is literal text.
+
+**Re-posting (approved 2026-11-12).** The client's group-1 rows are fixed in `BF2HudManager` init: 5 rows, 20 s
+(`Menu/BF2HudManagerInit.cpp:123,132`). Every new line resets the group's timer; when 20 s pass with no new line, the
+whole group clears within a few frames (`HudChat::advanceTimers`). A sixth row pushes the oldest out (`nextRow`). So the
+module keeps, per voter, the number of group-1 rows added since its vote line and the time of the last one, and
+re-posts the line (with the current time left) when the count reaches 5, or when 20.5 s plus the voter's ping have
+passed since the last row. Rows it counts:
+
+- every chat line of type 0 or 1 (`ECNetwork` `StringReceivedEvent`, which every `GameServer::say` posts, so server
+  messages from Python, ModManager, the console and WebAdmin all count): channel 14 for the player in its flags, 13 for
+  the team in its flags, the rest for everyone. Its own vote lines are recognised while it posts them and not counted;
+  its "you voted" lines are;
+- the server's own game-info radio lines (`RadioMessageReceivedEvent` type 0 from connection 255): team channels for
+  their team, the rest for everyone;
+- a kill-feed line for everyone on each kill with a killer (script event 1; a suicide counts), "player disconnected"
+  (15) and a control point captured or lost (25).
+
+Not counted: a few client-local lines (squad invites and requests, "Autoaccept disabled"), a new squad leader and a
+team-kill kick or ban notice. Those can push the vote out early; it returns at the next counted push-out or quiet
+clear. A kill with no killer counts as no row, though the client prints one for the two "no killer" artillery codes
+(`BF2HudManagerGameLogicEvents.cpp`, 0xFD/0xFE). Long lines wrap into extra rows at a
+width the server does not know, so the question is limited to 96 bytes and every line counts as one row.
+
+**Tested (2026-11-12)** on a WSL server (dalian_2_v_2, ports 16583/16733/16734) with `adminclient.py --scenario vote`
+and a throwaway build that let a bot vote (bots never vote in the real module): the line is posted at the start,
+re-posted at exactly the fifth row (its own line is not counted), re-posted 20.3 s after the last row of a quiet box
+and not within the following 19 s, and the vote ends at its time with the result line and `VoteResult`. With no human
+player, `StartVote` and `CancelVote` are refused (`Error` 6). Not tested: ballots, which need a retail client pressing
+PgUp/PgDn, and how the lines look on a retail client.

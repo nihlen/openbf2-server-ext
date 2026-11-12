@@ -42,11 +42,13 @@ enum Type : uint16_t
     EvVehicleDestroyed = 0x120F, EvControlPoint = 0x1210, EvChat = 0x1211, EvProjectileFired = 0x1212,
     EvProjectileHit = 0x1213, EvKick = 0x1214, EvBan = 0x1215, EvBot = 0x1216,
     EvWeaponFire = 0x1217, EvWeapons = 0x1218, EvProjectileCollision = 0x1219, EvProjectileTrace = 0x121A,
+    EvVoteResult = 0x121B,
     // commands
     CmdConsole = 0x1301, CmdSay = 0x1302, CmdTeleport = 0x1303, CmdSetHealth = 0x1304, CmdKillPlayer = 0x1305,
     CmdSetTeam = 0x1306, CmdSetScore = 0x1307, CmdRank = 0x1308, CmdMedal = 0x1309, CmdGameEvent = 0x130A,
     CmdHudEvent = 0x130B, CmdKick = 0x130C, CmdBan = 0x130D, CmdMap = 0x130E, CmdListObjects = 0x130F,
-    CmdSetObjectActive = 0x1310, CmdSpawnObject = 0x1311, CmdDeleteObject = 0x1312,
+    CmdSetObjectActive = 0x1310, CmdSpawnObject = 0x1311, CmdDeleteObject = 0x1312, CmdStartVote = 0x1313,
+    CmdCancelVote = 0x1314,
     // replies
     MsgOk = 0x1401, MsgConsoleResult = 0x1402, MsgObjectList = 0x1403, MsgObjectSpawned = 0x1404,
     // keepalive, either direction
@@ -416,6 +418,9 @@ void encodeBot(std::vector<uint8_t>& out, uint32_t seq, uint32_t tick, uint8_t p
 void encodeWeaponFire(std::vector<uint8_t>& out, uint32_t seq, uint32_t tick, const WeaponFireEvent& e);
 void encodeWeapons(std::vector<uint8_t>& out, uint32_t seq, uint32_t tick, uint8_t player,
                    const std::vector<WeaponSlot>& slots);
+// VoteResult. outcome: 1 passed, 2 failed, 3 cancelled by CancelVote, 4 cancelled by a level unload.
+void encodeVoteResult(std::vector<uint8_t>& out, uint32_t seq, uint32_t tick, uint32_t requestId,
+                      const std::string& text, uint8_t outcome, uint16_t yes, uint16_t no, uint16_t eligible);
 
 // ---------------------------------------------------------------- hit/miss replay (stream 20)
 
@@ -498,11 +503,12 @@ struct Command
     uint32_t session;      // filled by the I/O thread
     uint32_t requestId;
     uint8_t player;        // the player id; Say: the team or player id
-    uint8_t target;        // Say target, Map action, Ban "by", Subscribe/Unsubscribe stream
-    uint8_t flags;         // Teleport, SetHealth, KillPlayer, SetTeam, Rank flags; SetScore mask
-    uint8_t value8;        // SetTeam team, Rank rank, GameEvent/HudEvent event, Ban duration, Subscribe rate, SpawnObject team
+    uint8_t target;        // Say target, Map action, Ban "by", Subscribe/Unsubscribe stream, StartVote team
+    uint8_t flags;         // Teleport, SetHealth, KillPlayer, SetTeam, Rank flags; SetScore mask; StartVote minimum ballots
+    uint8_t value8;        // SetTeam team, Rank rank, GameEvent/HudEvent event, Ban duration, Subscribe rate, SpawnObject team,
+                           // StartVote percent
     int32_t ints[5];       // SetScore values; Medal medal and value; GameEvent/HudEvent data in [0]
-    uint32_t seconds;      // Ban
+    uint32_t seconds;      // Ban, StartVote
     uint16_t index;        // Map
     uint16_t size;         // Map
     uint16_t maxResults;   // ListObjects
@@ -510,7 +516,8 @@ struct Command
     ObjectRef ref;         // Teleport, SetHealth, SetObjectActive, DeleteObject
     float pos[3], rot[3];  // Teleport, SpawnObject
     float value;           // SetHealth
-    std::string text;      // Console line, Say text, Kick/Ban reason, ListObjects/SpawnObject template, Map name
+    std::string text;      // Console line, Say text, Kick/Ban reason, ListObjects/SpawnObject template, Map name,
+                           // StartVote question
     std::string text2;     // Map mode
     std::vector<std::string> filters;   // Subscribe
     std::string invalid;   // non-empty: a value check failed; the main thread answers Error 7 with it, in order

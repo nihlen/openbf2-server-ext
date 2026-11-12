@@ -3,6 +3,8 @@
 #include <cmath>
 #include <cstring>
 
+#include "Vote.h"
+
 namespace serverext {
 namespace admin {
 
@@ -911,6 +913,20 @@ void encodeWeapons(std::vector<uint8_t>& out, uint32_t seq, uint32_t tick, uint8
     w.finish();
 }
 
+void encodeVoteResult(std::vector<uint8_t>& out, uint32_t seq, uint32_t tick, uint32_t requestId,
+                      const std::string& text, uint8_t outcome, uint16_t yes, uint16_t no, uint16_t eligible)
+{
+    Writer w(out);
+    beginEvent(w, EvVoteResult, seq, tick);
+    w.u32(requestId);
+    w.str(text);
+    w.u8(outcome);
+    w.u16(yes);
+    w.u16(no);
+    w.u16(eligible);
+    w.finish();
+}
+
 void encodeProjectileCollision(std::vector<uint8_t>& out, uint32_t seq, uint32_t tick, const ProjectileCollisionEvent& e)
 {
     Writer w(out);
@@ -985,6 +1001,7 @@ bool isWebAdminMessage(uint16_t type)
     case CmdConsole: case CmdSay: case CmdTeleport: case CmdSetHealth: case CmdKillPlayer: case CmdSetTeam:
     case CmdSetScore: case CmdRank: case CmdMedal: case CmdGameEvent: case CmdHudEvent: case CmdKick: case CmdBan:
     case CmdMap: case CmdListObjects: case CmdSetObjectActive: case CmdSpawnObject: case CmdDeleteObject:
+    case CmdStartVote: case CmdCancelVote:
     case MsgPing: case MsgPong: case MsgError:
         return true;
     default:
@@ -1257,6 +1274,30 @@ bool parseCommand(uint16_t type, const uint8_t* p, size_t n, Command& out, std::
         if (out.value8 > 3)
             return bad(badValue, "team must be 0..3");
         return engineText(raw, kMaxTemplateName, false, out.text, badValue, "bad template name");
+
+    case CmdStartVote:
+        out.requestId = r.u32();
+        r.str(raw);
+        out.seconds = r.u16();
+        out.target = r.u8();
+        out.value8 = r.u8();
+        out.flags = r.u8();
+        if (!r.done())
+            return false;
+        if (out.seconds < static_cast<uint32_t>(vote::kMinSeconds) || out.seconds > static_cast<uint32_t>(vote::kMaxSeconds))
+            return bad(badValue, "seconds must be 5..600");
+        if (out.target > 2)
+            return bad(badValue, "team must be 0 (everyone), 1 or 2");
+        if (out.value8 < 1 || out.value8 > 100)
+            return bad(badValue, "percent must be 1..100");
+        if (out.flags > 64)
+            return bad(badValue, "minimum ballots must be 0..64");
+        return engineText(raw, vote::kMaxText, false, out.text, badValue,
+                          "the question must be 1..96 bytes of UTF-8 without control characters");
+
+    case CmdCancelVote:
+        out.requestId = r.u32();
+        return r.done();
 
     default:
         return false;

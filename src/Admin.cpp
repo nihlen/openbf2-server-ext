@@ -19,6 +19,9 @@
 #include "Core/EventManager.h"
 #include "Core/Ids.h"
 #include "Core/System.h"
+#include "Game/Common/IClientConnection.h"
+#include "Game/Common/StringManager.h"
+#include "Game/GameEvents/RadioMessageEvent.h"
 #include "Game/GameServer/IServerExtension.h"
 #include "Game/IEventListener.h"
 #include "Game/IGame.h"
@@ -38,6 +41,7 @@
 #include "Config.h"
 #include "EngineUtil.h"
 #include "Rotation.h"
+#include "Vote.h"
 
 using namespace dice::hfe;
 using namespace dice::hfe::world;
@@ -53,6 +57,9 @@ typedef IServerExtension::ScriptEventArg Arg;
 
 const unsigned int kGameStatusEventId = 1;    // ECGameLogic: ServerGameLogic::setGameStatus
 const unsigned int kUnloadHudEventId = 3;     // ECHud: GameServer::unload
+const unsigned int kChatEventId = 11;         // ECNetwork: StringReceivedEvent (every chat line, GameServer::say too)
+const unsigned int kRadioEventId = 13;        // ECNetwork: RadioMessageReceivedEvent (GameServer's radio queue)
+const int kServerConnection = 0xFF;           // RadioMessageReceivedEvent connection of the server's own game-info lines
 const int kStatusPlaying = 1, kStatusEndGame = 2, kStatusPaused = 4;
 const size_t kMaxCommandsPerTick = 64;
 const size_t kMaxTrackedProjectiles = 256;
@@ -185,6 +192,7 @@ public:
           m_tick(0), m_lastStatus(-2), m_lastBeginRound(-2), m_cpsScanned(false), m_lastCpScan(0), m_damageEvents(false),
           m_projectileEvents(false), m_fireEvents(false), m_weaponEvents(false), m_firesDropped(0), m_replay(false),
           m_collisionsThisTick(0), m_collisionsDropped(0), m_tracesSent(0), m_tracesSkipped(0), m_r4(false),
+          m_voteHook(false), m_voteRequest(0), m_voteReposts(0), m_selfPost(-1), m_selfSeen(false),
           m_eventsSent(0), m_eventsDropped(0), m_commands(0)
     {
         for (int i = 0; i < kCategories; ++i)
@@ -235,18 +243,20 @@ public:
         }
         const bool statusOk = m_em->registerEventHandler(ECGameLogic, this, 0);
         const bool hudOk = m_em->registerEventHandler(ECHud, this, 0);
+        m_voteHook = m_em->registerEventHandler(ECNetwork, this, 0);
         const bool damageOk = m_ext->addDamageObserver(this);
         const bool projectileOk = m_ext->addProjectileObserver(this);
         const bool collisionOk = m_ext->addProjectileCollisionObserver(this);
         char buf[512];
         std::snprintf(buf, sizeof(buf),
                       "admin channel: protocol v%u, dial %s:%d, server id '%s', TLS %s, identity %d, console %d, objects %d, "
-                      "queue %d bytes; R4 1, status hook %d, unload hook %d, damage %d, projectile %d, collision %d",
+                      "queue %d bytes; R4 1, status hook %d, unload hook %d, damage %d, projectile %d, collision %d, "
+                      "vote hook %d",
                       static_cast<unsigned>(kVersion), m_config.adminHost.c_str(), m_config.adminPort,
                       m_config.adminServerId.c_str(), m_config.adminTls ? "1.3 (pinned)" : "off (loopback test)",
                       m_config.adminIdentity() ? 1 : 0, m_config.adminAllowConsole ? 1 : 0,
                       m_config.adminAllowObjects ? 1 : 0, m_config.adminQueueBytes, statusOk ? 1 : 0, hudOk ? 1 : 0,
-                      damageOk ? 1 : 0, projectileOk ? 1 : 0, collisionOk ? 1 : 0);
+                      damageOk ? 1 : 0, projectileOk ? 1 : 0, collisionOk ? 1 : 0, m_voteHook ? 1 : 0);
         m_describe = buf;
         return true;
     }
@@ -261,6 +271,7 @@ public:
         m_tick = tick;
         m_collisionsThisTick = 0;
         processCommands();
+        updateVote();
         if (m_session)
         {
             sampleTraces();
@@ -294,10 +305,20 @@ public:
 
     // ---------------------------------------------------------------- engine listeners
 
-    virtual void handleEvent(EventCategory category, unsigned int id, EventNode*, void* data)
+    virtual void handleEvent(EventCategory category, unsigned int id, EventNode* node, void* data)
     {
+        if (category == ECNetwork)
+        {
+            if (id == kChatEventId && node)
+                onChatRow(static_cast<const StringReceivedEvent*>(node));
+            else if (id == kRadioEventId && node)
+                onRadio(static_cast<const RadioMessageReceivedEvent*>(node));
+            return;
+        }
         if (category == ECHud && id == kUnloadHudEventId)
         {
+            if (m_vote.running())
+                endVote(vote::OutcomeUnloaded, false);
             m_cps.clear();
             m_cpEvents.clear();
             m_cpsScanned = false;
@@ -327,6 +348,8 @@ public:
                     t.banned = true;
             }
         }
+        if (m_vote.running())
+            voteRowsFromScriptEvent(eventId, args, argc);
         if (!m_session)
             return;
         switch (eventId)
@@ -2018,10 +2041,217 @@ private:
         case CmdSetObjectActive: onSetObjectActive(c); return;
         case CmdSpawnObject: onSpawnObject(c); return;
         case CmdDeleteObject: onDeleteObject(c); return;
+        case CmdStartVote: onStartVote(c); return;
+        case CmdCancelVote: onCancelVote(c); return;
         default:
             error(c.requestId, ErrUnknownType, "unexpected message type");
             return;
         }
+    }
+
+    // ---------------------------------------------------------------- server votes
+
+    // StartVote: one vote at a time, and at least one human player on a voting team.
+    void onStartVote(const Command& c)
+    {
+        if (!m_voteHook)
+        {
+            error(c.requestId, ErrUnavailable, "the module could not listen for ballots");
+            return;
+        }
+        if (m_vote.running())
+        {
+            error(c.requestId, ErrRefused, "a vote is already running");
+            return;
+        }
+        vote::Params p;
+        p.text = c.text;
+        p.seconds = static_cast<int>(c.seconds);
+        p.team = c.target;
+        p.percent = c.value8;
+        p.minVotes = c.flags;
+        m_vote.start(p, now());
+        syncVoters();
+        int yes, no, eligible;
+        m_vote.counts(yes, no, eligible);
+        if (eligible == 0)
+        {
+            m_vote.stop();
+            error(c.requestId, ErrRefused, "no human player can vote");
+            return;
+        }
+        m_voteRequest = c.requestId;
+        m_voteReposts = 0;
+        logf("tick %lu: admin: vote started (request %u, %d s, team %d, %d%%, min %d, %d voters): %s", m_tick,
+             c.requestId, p.seconds, p.team, p.percent, p.minVotes, eligible, p.text.c_str());
+        ok(c.requestId);
+        postDueVoteLines();
+    }
+
+    void onCancelVote(const Command& c)
+    {
+        if (!m_vote.running())
+        {
+            error(c.requestId, ErrRefused, "no vote is running");
+            return;
+        }
+        endVote(vote::OutcomeCancelled, true);
+        ok(c.requestId);
+    }
+
+    // The human players on a voting team, with their ping.
+    void syncVoters()
+    {
+        m_vote.beginSync();
+        const std::list<world::IPlayer*>& players = m_players->getPlayers();
+        for (std::list<world::IPlayer*>::const_iterator it = players.begin(); it != players.end(); ++it)
+        {
+            world::IPlayer* p = *it;
+            if (!p || p->getIsAIPlayer() || !m_vote.eligibleTeam(p->getTeam()))
+                continue;
+            m_vote.present(p->getId(), p->getTeam(), p->getPing() / 1000.0);
+        }
+        m_vote.endSync();
+    }
+
+    // Per tick: ends the vote when it is decided, else (re)posts the vote line where it is gone.
+    void updateVote()
+    {
+        if (!m_vote.running())
+        {
+            m_voteConfirms.clear();
+            return;
+        }
+        syncVoters();
+        sendVoteConfirms();
+        const int outcome = m_vote.check(now());
+        if (outcome != vote::OutcomeNone)
+        {
+            endVote(outcome, true);
+            return;
+        }
+        postDueVoteLines();
+    }
+
+    void postDueVoteLines()
+    {
+        const double t = now();
+        const std::vector<int> due = m_vote.due(t);
+        for (size_t i = 0; i < due.size(); ++i)
+        {
+            // The line goes through GameServer::say, which posts it on ECNetwork at once; onChatRow
+            // recognises it by m_selfPost and does not count it as a row.
+            m_selfPost = due[i];
+            m_selfSeen = false;
+            m_server->say(m_vote.line(t), static_cast<TargetChannel>(14), static_cast<ChannelMessageType>(1), 0,
+                          static_cast<unsigned int>(due[i]));
+            m_selfPost = -1;
+            m_vote.posted(due[i], t, m_selfSeen);
+            ++m_voteReposts;
+        }
+    }
+
+    // announce: tell the players (not during a level unload).
+    void endVote(int outcome, bool announce)
+    {
+        int yes, no, eligible;
+        m_vote.counts(yes, no, eligible);
+        if (announce)
+        {
+            const std::string line = m_vote.resultLine(outcome);
+            if (m_vote.params().team == 0)
+                m_server->sayAll(line);
+            else
+                m_server->sayTeam(m_vote.params().team, line);
+        }
+        if (m_session)
+        {
+            std::vector<uint8_t> f;
+            encodeVoteResult(f, ++m_seq, tickNumber(), m_voteRequest, cp1252ToUtf8(m_vote.params().text),
+                             static_cast<uint8_t>(outcome), static_cast<uint16_t>(yes), static_cast<uint16_t>(no),
+                             static_cast<uint16_t>(eligible));
+            event(f);
+        }
+        logf("tick %lu: admin: vote ended (request %u, outcome %d, yes %d, no %d, voters %d, %d lines posted): %s",
+             m_tick, m_voteRequest, outcome, yes, no, eligible, m_voteReposts, m_vote.params().text.c_str());
+        m_vote.stop();
+    }
+
+    // Every chat line: lines of type 0/1 land in the server-message rows of their recipients' boxes
+    // (Game::outputChatString types 0/1 -> addTeamChat). Channel 14 goes to the player in m_flags,
+    // 13 to the team in m_flags (GameServer::sayTeam), the rest to everyone.
+    void onChatRow(const StringReceivedEvent* e)
+    {
+        if (!m_vote.running() || (e->m_type != 0 && e->m_type != 1))
+            return;
+        const double t = now();
+        if (e->m_channel == 14)
+        {
+            if (m_selfPost >= 0 && e->m_flags == m_selfPost && !m_selfSeen)
+            {
+                m_selfSeen = true;
+                return;
+            }
+            m_vote.row(e->m_flags, t);
+        }
+        else if (e->m_channel == 13)
+            m_vote.rowTeam(e->m_flags, t);
+        else
+            m_vote.rowAll(t);
+    }
+
+    // Radio: a player's roger_that/negative is a ballot; the server's own game-info lines (type 0)
+    // are server-message rows.
+    void onRadio(const RadioMessageReceivedEvent* e)
+    {
+        if (!m_vote.running())
+            return;
+        const int connection = e->m_connectionId;
+        if (connection == kServerConnection)
+        {
+            if (e->m_type == 0)
+            {
+                if (e->m_channel == 1 || e->m_channel == 13)
+                    m_vote.rowTeam(e->m_team, now());
+                else
+                    m_vote.rowAll(now());
+            }
+            return;
+        }
+        const int choice = e->m_messageId == vote::kYesRadioId ? vote::ChoiceYes
+                           : e->m_messageId == vote::kNoRadioId ? vote::ChoiceNo : vote::ChoiceNone;
+        if (choice == vote::ChoiceNone)
+            return;
+        IClientConnection* c = m_server->getConnection(connection);
+        world::IPlayer* p = c ? c->getPlayer() : 0;
+        if (!p || !m_vote.ballot(p->getId(), choice))
+            return;
+        // Confirmed on the next tick, not from inside this dispatch.
+        m_voteConfirms.push_back(std::make_pair(p->getId(), choice));
+        logf("tick %lu: admin: vote: player %d voted %s", m_tick, p->getId(), choice == vote::ChoiceYes ? "yes" : "no");
+    }
+
+    // The voters' private "<text> - you voted YES/NO" lines. Each is a row in that voter's box.
+    void sendVoteConfirms()
+    {
+        for (size_t i = 0; i < m_voteConfirms.size(); ++i)
+        {
+            const int id = m_voteConfirms[i].first;
+            if (!m_vote.isVoter(id))
+                continue;
+            m_server->say(m_vote.choiceLine(m_voteConfirms[i].second), static_cast<TargetChannel>(14),
+                          static_cast<ChannelMessageType>(1), 0, static_cast<unsigned int>(id));
+        }
+        m_voteConfirms.clear();
+    }
+
+    // Script events that put a row in every box: a kill-feed line (a kill with a killer, or a
+    // suicide), "player disconnected" (GameClient::destroyPlayer) and a control point captured/lost.
+    void voteRowsFromScriptEvent(int eventId, const Arg* args, int argc)
+    {
+        if ((eventId == SePlayerKilled && argPlayer(args, argc, 1)) || eventId == SePlayerDisconnect ||
+            eventId == SeControlPoint)
+            m_vote.rowAll(now());
     }
 
     void onSubscribe(const Command& c)
@@ -2599,6 +2829,15 @@ private:
     size_t m_collisionsThisTick;
     uint64_t m_collisionsDropped, m_tracesSent, m_tracesSkipped;
     bool m_r4;
+
+    // Server votes.
+    bool m_voteHook;            // the ECNetwork listener (chat rows and ballots) is registered
+    vote::Box m_vote;
+    uint32_t m_voteRequest;     // the StartVote that started the running vote
+    int m_voteReposts;
+    int m_selfPost;             // the player a vote line is being posted to, -1 otherwise
+    bool m_selfSeen;            // that line reached onChatRow while it was posted
+    std::vector<std::pair<int, int> > m_voteConfirms;   // (player, choice) ballots to confirm next tick
 
     std::vector<IObject*> m_vehicleRoots;
     std::vector<VehicleState> m_vehicles;

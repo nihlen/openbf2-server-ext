@@ -20,6 +20,7 @@
 #include "Neutral.h"
 #include "PendingInput.h"
 #include "SpawnPlan.h"
+#include "Vote.h"
 
 using namespace serverext;
 using namespace serverext::proto;
@@ -1453,6 +1454,113 @@ void testNeutral()
 
 } // namespace
 
+// Server votes: who gets the vote line (again), ballots and the verdict.
+void testVote()
+{
+    using namespace serverext::vote;
+    Box b;
+    CHECK(!b.running() && b.check(0.0) == OutcomeNone);
+    Params p;
+    p.text = "Enable mod X?";
+    p.seconds = 30;
+    p.team = 0;
+    p.percent = 60;
+    p.minVotes = 2;
+    b.start(p, 100.0);
+    b.beginSync();
+    b.present(1, 1, 0.05);
+    b.present(2, 2, 0.10);
+    b.present(3, 1, 0.0);
+    b.endSync();
+
+    // Everyone needs the line first.
+    std::vector<int> due = b.due(100.0);
+    CHECK(due.size() == 3);
+    b.posted(1, 100.0, true);
+    b.posted(2, 100.0, true);
+    b.posted(3, 100.0, false);   // the line is still on its way to 3's counter
+    CHECK(b.due(100.0).empty());
+
+    // Four rows keep the line; the fifth pushes it out. Player 3's own late line counts as no row.
+    for (int i = 0; i < 4; ++i)
+        b.rowAll(101.0 + i);
+    CHECK(b.due(105.0).empty());
+    b.rowAll(105.0);
+    due = b.due(105.0);
+    CHECK(due.size() == 2 && due[0] == 1 && due[1] == 2);
+    b.posted(1, 105.0, true);
+    b.posted(2, 105.0, true);
+    b.rowAll(106.0);
+    CHECK(b.due(106.0).size() == 1 && b.due(106.0)[0] == 3);
+    b.posted(3, 106.0, true);
+
+    // Team and single-player rows.
+    for (int i = 0; i < 5; ++i)
+        b.rowTeam(2, 107.0);
+    CHECK(b.due(107.0).size() == 1 && b.due(107.0)[0] == 2);
+    b.posted(2, 107.0, true);
+    for (int i = 0; i < 5; ++i)
+        b.row(3, 107.0);
+    CHECK(b.due(107.0).size() == 1 && b.due(107.0)[0] == 3);
+    b.posted(3, 107.0, true);
+    b.rowAll(107.0);
+
+    // A quiet box clears 20 s after its last row; the line returns after the margin and the ping.
+    CHECK(b.due(107.0 + kBoxSeconds + kClearMargin - 0.01).empty());
+    due = b.due(107.0 + kBoxSeconds + kClearMargin + 0.06);
+    CHECK(due.size() == 2 && due[0] == 1 && due[1] == 3);   // 2 has a 0.10 s ping
+    CHECK(b.due(107.0 + kBoxSeconds + kClearMargin + 0.11).size() == 3);
+    b.row(1, 110.0);   // a row restarts that box's timer
+    CHECK(b.due(107.0 + kBoxSeconds + kClearMargin + 0.11).size() == 2);
+
+    // Ballots: voters only, and a voter may change their mind.
+    CHECK(!b.ballot(9, ChoiceYes));
+    CHECK(!b.ballot(1, ChoiceNone));
+    CHECK(b.ballot(1, ChoiceNo));
+    CHECK(b.ballot(1, ChoiceYes));
+    int yes, no, eligible;
+    b.counts(yes, no, eligible);
+    CHECK(yes == 1 && no == 0 && eligible == 3);
+    CHECK(b.check(110.0) == OutcomeNone);
+    CHECK(b.verdict() == OutcomeFailed);   // one ballot, two needed
+    CHECK(b.ballot(2, ChoiceYes));
+    CHECK(b.verdict() == OutcomePassed);   // 2 of 2 >= 60 %
+    CHECK(b.ballot(3, ChoiceNo));
+    CHECK(b.check(110.0) == OutcomePassed);   // everyone voted: 2 of 3 = 66 % >= 60 %
+    CHECK(b.resultLine(OutcomePassed) == "VOTE PASSED: Enable mod X? (yes 2, no 1)");
+    CHECK(b.choiceLine(ChoiceYes) == "Enable mod X? - you voted YES");
+    CHECK(b.line(110.0) == "VOTE: Enable mod X? (PgUp yes / PgDn no, 20 s left)");
+
+    // A voter who leaves, or changes team out of a team vote, loses the ballot.
+    b.beginSync();
+    b.present(1, 1, 0.0);
+    b.present(2, 2, 0.0);
+    b.endSync();
+    b.counts(yes, no, eligible);
+    CHECK(yes == 2 && no == 0 && eligible == 2);
+    b.stop();
+
+    p.team = 2;
+    p.percent = 50;
+    p.minVotes = 0;
+    b.start(p, 0.0);
+    CHECK(!b.eligibleTeam(1) && b.eligibleTeam(2) && !b.eligibleTeam(0));
+    b.beginSync();
+    b.present(5, 2, 0.0);
+    b.present(6, 2, 0.0);
+    b.endSync();
+    CHECK(b.check(29.9) == OutcomeNone);
+    CHECK(b.check(30.0) == OutcomeFailed);   // no ballots: no pass even with a minimum of 0
+    CHECK(b.ballot(5, ChoiceYes) && b.ballot(6, ChoiceNo));
+    CHECK(b.check(1.0) == OutcomePassed);    // 1 of 2 = 50 %
+    b.beginSync();                           // 5 switched to team 1: no longer a voter
+    b.present(6, 2, 0.0);
+    b.endSync();
+    b.counts(yes, no, eligible);
+    CHECK(yes == 0 && no == 1 && eligible == 1);
+    CHECK(b.check(1.0) == OutcomeFailed);    // everyone left voted; 0 of 1
+}
+
 int main()
 {
     testNeutral();
@@ -1470,6 +1578,7 @@ int main()
     testFuzz();
     testChannel();
     testSpawnPlan();
+    testVote();
     std::printf("%d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;
 }
