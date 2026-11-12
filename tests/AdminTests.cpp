@@ -773,6 +773,9 @@ std::vector<Case> validCommands()
     w.u32(31); w.u8(StreamProjectileReplay); w.u8(0); w.u8(1); w.str("agm114_hellfire_tv"); CASE(MsgSubscribe);
     w.u32(32); w.str("Enable mod X?"); w.u16(30); w.u8(0); w.u8(50); w.u8(1); CASE(CmdStartVote);
     w.u32(33); CASE(CmdCancelVote);
+    w.u32(34); w.i16(-1); w.u8(43); w.u8(3); w.u8(1); w.u8(2); w.u8(3); CASE(CmdHudEventRaw);
+    w.u32(35); w.i16(3); w.f32(60.0f); CASE(CmdRoundClock);
+    w.u32(36); w.u8(2); w.u8(1); w.u8(7); w.u8(1); w.u32(1819); for (int i = 0; i < 9; ++i) w.f32(1.0f); CASE(CmdSquadOrder);
 #undef CASE
     return cs;
 }
@@ -872,6 +875,19 @@ void testCommandParsing()
     w.u32(1); w.str(""); w.u16(30); w.u8(0); w.u8(50); w.u8(1); BAD(CmdStartVote);              // no question
     w.u32(1); w.str(std::string(97, 'q')); w.u16(30); w.u8(0); w.u8(50); w.u8(1); BAD(CmdStartVote);
     w.u32(1); w.str("a\x01"); w.u16(30); w.u8(0); w.u8(50); w.u8(1); BAD(CmdStartVote);         // control byte
+    w.u32(1); w.i16(-1); w.u8(73); w.u8(0); BAD(CmdHudEventRaw);                                // frees its payload
+    w.u32(1); w.i16(-1); w.u8(38); w.u8(0); BAD(CmdHudEventRaw);                                // a pointer payload
+    w.u32(1); w.i16(-2); w.u8(66); w.u8(0); BAD(CmdHudEventRaw);
+    w.u32(1); w.i16(256); w.u8(66); w.u8(0); BAD(CmdHudEventRaw);
+    w.u32(1); w.i16(-1); w.u8(66); w.u8(53); for (int i = 0; i < 53; ++i) w.u8(0); BAD(CmdHudEventRaw);   // 53 bytes
+    w.u32(1); w.i16(-1); w.f32(-1.0f); BAD(CmdRoundClock);
+    w.u32(1); w.i16(-1); w.f32(std::numeric_limits<float>::quiet_NaN()); BAD(CmdRoundClock);
+    w.u32(1); w.i16(-1); w.f32(86401.0f); BAD(CmdRoundClock);
+    w.u32(1); w.u8(3); w.u8(1); w.u8(5); w.u8(0); w.u32(0); for (int i = 0; i < 9; ++i) w.f32(0); BAD(CmdSquadOrder);   // team 3
+    w.u32(1); w.u8(1); w.u8(0); w.u8(5); w.u8(0); w.u32(0); for (int i = 0; i < 9; ++i) w.f32(0); BAD(CmdSquadOrder);   // squad 0
+    w.u32(1); w.u8(1); w.u8(1); w.u8(5); w.u8(2); w.u32(0); for (int i = 0; i < 9; ++i) w.f32(0); BAD(CmdSquadOrder);   // flags
+    w.u32(1); w.u8(1); w.u8(1); w.u8(5); w.u8(0); w.u32(65536); for (int i = 0; i < 9; ++i) w.f32(0); BAD(CmdSquadOrder);
+    w.u32(1); w.u8(1); w.u8(1); w.u8(5); w.u8(0); w.u32(0); w.f32(std::numeric_limits<float>::infinity()); for (int i = 0; i < 8; ++i) w.f32(0); BAD(CmdSquadOrder);
 #undef BAD
     for (size_t i = 0; i < bads.size(); ++i)
     {
@@ -1620,7 +1636,7 @@ void testGolden()
 {
     const std::string path = std::string(SERVEREXT_FIXTURES) + "/admin-v1-golden.txt";
     std::map<std::string, std::vector<uint8_t> > golden = readGolden(path);
-    CHECK(golden.size() == 70);
+    CHECK(golden.size() == 73);
     if (golden.empty())
     {
         std::printf("  no golden fixtures at %s\n", path.c_str());
@@ -1817,8 +1833,11 @@ void testGolden()
         CHECK(ok);
         parsed[it->first] = c;
     }
-    CHECK(parsed.size() == 26);
+    CHECK(parsed.size() == 29);
     Command c;
+    c = parsed["cmd_hud_event_raw"]; CHECK(c.type == CmdHudEventRaw && c.requestId == 29 && c.target16 == -1 && c.value8 == 43 && c.bytes.size() == 20 && c.bytes[4] == 2 && c.bytes[19] == 0);
+    c = parsed["cmd_round_clock"]; CHECK(c.type == CmdRoundClock && c.requestId == 30 && c.target16 == 3 && c.value == 90.5f);
+    c = parsed["cmd_squad_order"]; CHECK(c.type == CmdSquadOrder && c.requestId == 31 && c.target == 2 && c.player == 1 && c.value8 == 8 && c.flags == 1 && c.netId == 1819 && c.points[0] == 10.0f && c.points[8] == 30.0f);
     c = parsed["cmd_start_vote"]; CHECK(c.type == CmdStartVote && c.requestId == 27 && c.text == "Enable mod X?" && c.seconds == 30 && c.target == 2 && c.value8 == 60 && c.flags == 3);
     c = parsed["cmd_cancel_vote"]; CHECK(c.type == CmdCancelVote && c.requestId == 28);
     c = parsed["cmd_request_snapshot"]; CHECK(c.type == MsgRequestSnapshot && c.requestId == 1);

@@ -52,6 +52,7 @@ CMD_SET_TEAM, CMD_SET_SCORE, CMD_RANK, CMD_MEDAL, CMD_GAME_EVENT = 0x1306, 0x130
 CMD_HUD_EVENT, CMD_KICK, CMD_BAN, CMD_MAP, CMD_LIST_OBJECTS = 0x130B, 0x130C, 0x130D, 0x130E, 0x130F
 CMD_SET_OBJECT_ACTIVE, CMD_SPAWN_OBJECT, CMD_DELETE_OBJECT = 0x1310, 0x1311, 0x1312
 CMD_START_VOTE, CMD_CANCEL_VOTE = 0x1313, 0x1314
+CMD_HUD_EVENT_RAW, CMD_ROUND_CLOCK, CMD_SQUAD_ORDER = 0x1315, 0x1316, 0x1317
 OK, CONSOLE_RESULT, OBJECT_LIST, OBJECT_SPAWNED = 0x1401, 0x1402, 0x1403, 0x1404
 PING, PONG, ERROR = 0x1501, 0x1502, 0xFFFF
 
@@ -414,6 +415,30 @@ def p_start_vote(req, text, seconds=30, team=0, percent=50, min_votes=1):
     return W().u32(req).s(text).u16(seconds).u8(team).u8(percent).u8(min_votes).b
 
 
+def p_hud_event_raw(req, player, event, payload=b""):
+    """R7: player -1 is every playing client; payload at most 52 bytes."""
+    w = W().u32(req).i16(player).u8(event).u8(len(payload))
+    for x in payload:
+        w.u8(x)
+    return w.b
+
+
+def p_round_clock(req, player, seconds): return W().u32(req).i16(player).f32(seconds).b
+
+
+def p_squad_order(req, team, squad, order, commander=False, target_net=0, points=((0, 0, 0),) * 3):
+    w = W().u32(req).u8(team).u8(squad).u8(order).u8(1 if commander else 0).u32(target_net)
+    for p in points:
+        w.vec3(p)
+    return w.b
+
+
+def spotted_payload(spotter, target, team, x, z, vehicle_type):
+    """HUD 43's payload (SpottedEvent's rebroadcast layout): u16 spotter, u16 target, u8 team at +4,
+    f32 x at +8, f32 z at +12, i32 vehicle type at +16."""
+    return struct.pack("<HHB3xffi", spotter, target, team, x, z, vehicle_type)
+
+
 def p_subscribe(req, stream, rate=1, filters=()):
     w = W().u32(req).u8(stream).u8(rate).u8(len(filters))
     for f in filters:
@@ -576,6 +601,10 @@ def golden_samples():
     s["cmd_start_vote"] = (CMD_START_VOTE, p_start_vote(27, "Enable mod X?", 30, 2, 60, 3))
     s["cmd_cancel_vote"] = (CMD_CANCEL_VOTE, W().u32(28).b)
     s["ev_vote_result"] = (EV_VOTE_RESULT, ev(27).u32(27).s("Enable mod §X?").u8(1).u16(3).u16(1).u16(5).b)
+    s["cmd_hud_event_raw"] = (CMD_HUD_EVENT_RAW, p_hud_event_raw(29, -1, 43, spotted_payload(0, 0, 2, 100.0, -50.0, 1)))
+    s["cmd_round_clock"] = (CMD_ROUND_CLOCK, p_round_clock(30, 3, 90.5))
+    s["cmd_squad_order"] = (CMD_SQUAD_ORDER, p_squad_order(31, 2, 1, 8, True, 1819,
+                                                           ((10.0, 0, 0), (0, 20.0, 0), (0, 0, 30.0))))
     return s
 
 
@@ -945,6 +974,39 @@ def scenario_listen(lst, args):
         log("link closed:", e)
     report_link(link, time.time() - t0)
     return 0
+
+
+def scenario_r7(lst, args):
+    """R7: HudEventRaw, RoundClock and SquadOrder against a running server. The server side only (what a client
+    shows needs a retail client): each command is accepted or refused as the contract says, and the server keeps
+    ticking (a Ping after them)."""
+    c = Checks()
+    link = lst.accept(args.accept_timeout)
+    rq = link.next_request
+    if args.vote_delay > 0:
+        link.pump(args.vote_delay)
+    r = link.request(CMD_HUD_EVENT_RAW, p_hud_event_raw(rq(), -1, 66, struct.pack("<i", 5)))
+    c.check(r["name"] == "OK", "HudEventRaw 66 (help hint 5) to every client -> Ok")
+    r = link.request(CMD_HUD_EVENT_RAW, p_hud_event_raw(rq(), -1, 43, spotted_payload(0, 0, 1, -200.0, 150.0, 1)))
+    c.check(r["name"] == "OK", "HudEventRaw 43 (spotted marker) -> Ok")
+    r = link.request(CMD_HUD_EVENT_RAW, p_hud_event_raw(rq(), -1, 66, bytes(52)))
+    c.check(r["name"] == "OK", "HudEventRaw with a 52-byte payload -> Ok")
+    r = link.request(CMD_HUD_EVENT_RAW, p_hud_event_raw(rq(), -1, 73, b""))
+    c.check(r["name"] == "ERROR" and r["code"] == ERR_INVALID, "HudEventRaw 73 (frees its payload) -> Error 7")
+    r = link.request(CMD_HUD_EVENT_RAW, p_hud_event_raw(rq(), 200, 66, b""))
+    c.check(r["name"] == "ERROR" and r["code"] == ERR_UNKNOWN_PLAYER, "HudEventRaw to no player -> Error 4")
+    r = link.request(CMD_ROUND_CLOCK, p_round_clock(rq(), -1, 60.0))
+    c.check(r["name"] == "OK", "RoundClock 60 s to every client -> Ok")
+    bots = bots_in(link.snapshot)
+    if bots:
+        r = link.request(CMD_ROUND_CLOCK, p_round_clock(rq(), bots[0]["id"], 0.0))
+        c.check(r["name"] == "OK", "RoundClock 0 s to one player -> Ok")
+    r = link.request(CMD_SQUAD_ORDER, p_squad_order(rq(), 1, 9, 6, False, 0, ((10, 150, 20),) * 3))
+    c.check(r["name"] == "ERROR" and r["code"] == ERR_REFUSED, "SquadOrder to an empty squad -> Error 6")
+    r = link.request(PING, p_ping(rq(), 77))
+    c.check(r["name"] == "PONG" and r["clock"] == 77, "the server still ticks (Ping -> Pong)")
+    c.summary("r7")
+    return 0 if not c.failed else 1
 
 
 def scenario_vote(lst, args):
@@ -1757,7 +1819,7 @@ def main():
     ap.add_argument("--write-golden", default="", help="write the golden fixtures to this file and exit")
     ap.add_argument("--scenario", default="listen",
                     choices=["listen", "commands", "resync", "stall", "soak", "wrongkey", "wrongpin", "mapchange", "extras",
-                             "viewer", "replay", "vote"])
+                             "viewer", "replay", "vote", "r7"])
     ap.add_argument("--fuzz", action="store_true")
     ap.add_argument("--fuzz-rounds", type=int, default=24)
     ap.add_argument("--seed", type=int, default=1)
@@ -1780,7 +1842,7 @@ def main():
     ap.add_argument("--vote-percent", type=int, default=50, help="vote: yes share of the ballots needed to pass")
     ap.add_argument("--vote-min", type=int, default=1, help="vote: ballots needed to pass")
     ap.add_argument("--vote-rows", type=int, default=0, help="vote: server messages to send from 3 s on (rows)")
-    ap.add_argument("--vote-delay", type=float, default=0.0, help="vote: seconds to wait after the link before StartVote")
+    ap.add_argument("--vote-delay", type=float, default=0.0, help="vote, r7: seconds to wait after the link first")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
     if args.write_golden:
@@ -1799,7 +1861,7 @@ def main():
                 "stall": scenario_stall, "soak": scenario_soak, "wrongkey": scenario_wrongkey,
                 "wrongpin": scenario_wrongpin, "mapchange": scenario_mapchange,
                 "extras": scenario_extras, "viewer": scenario_viewer, "replay": scenario_replay,
-                "vote": scenario_vote}[args.scenario](lst, args)
+                "vote": scenario_vote, "r7": scenario_r7}[args.scenario](lst, args)
     except KeyboardInterrupt:
         return 130
 

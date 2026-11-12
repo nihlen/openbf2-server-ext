@@ -2043,10 +2043,60 @@ private:
         case CmdDeleteObject: onDeleteObject(c); return;
         case CmdStartVote: onStartVote(c); return;
         case CmdCancelVote: onCancelVote(c); return;
+        case CmdHudEventRaw: onHudEventRaw(c); return;
+        case CmdRoundClock: onRoundClock(c); return;
+        case CmdSquadOrder: onSquadOrder(c); return;
         default:
             error(c.requestId, ErrUnknownType, "unexpected message type");
             return;
         }
+    }
+
+    // ---------------------------------------------------------------- R7 client presentation hooks
+
+    // True for -1 (every client) or a player that exists; else answers Error 4.
+    bool knownTarget(const Command& c)
+    {
+        if (c.target16 == -1 || player(static_cast<uint8_t>(c.target16)))
+            return true;
+        error(c.requestId, ErrUnknownPlayer, "no such player");
+        return false;
+    }
+
+    void onHudEventRaw(const Command& c)
+    {
+        if (!knownTarget(c))
+            return;
+        if (!m_ext->sendHudEventRaw(c.target16, c.value8, c.bytes.empty() ? 0 : &c.bytes[0],
+                                    static_cast<int>(c.bytes.size())))
+        {
+            error(c.requestId, ErrRefused, "the engine refused the HUD event");
+            return;
+        }
+        ok(c.requestId);
+    }
+
+    void onRoundClock(const Command& c)
+    {
+        if (!knownTarget(c))
+            return;
+        if (!m_ext->sendRoundClock(c.target16, c.value))
+        {
+            error(c.requestId, ErrRefused, "the engine refused the round clock");
+            return;
+        }
+        ok(c.requestId);
+    }
+
+    void onSquadOrder(const Command& c)
+    {
+        if (!m_ext->issueSquadOrder(c.target, c.player, c.value8, static_cast<unsigned short>(c.netId), c.points,
+                                    (c.flags & 1) != 0))
+        {
+            error(c.requestId, ErrRefused, "no such squad");
+            return;
+        }
+        ok(c.requestId);
     }
 
     // ---------------------------------------------------------------- server votes

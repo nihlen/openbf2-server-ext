@@ -169,7 +169,7 @@ designed and approved on its own.
 | R5 | Damage observer | Read-only, at the point where damage is applied. **The bot channel's approved v2 damage event needs the same hook**, so it is built once for both |
 | — | Appended `IServerExtension` methods | CD-key hash, team names, tickets, round time, game and HUD events, medal, rank, player message, and object spawn and delete if no typed path exists |
 | R6 | Veto hooks | Phase 3 only |
-| R7 | Client presentation hooks | Approved 2026-11-12, not implemented. Three appended `IServerExtension` methods; see "R7: client presentation hooks" below |
+| R7 | Client presentation hooks | Approved and implemented 2026-11-12. Three appended `IServerExtension` methods; see "R7: client presentation hooks" below |
 
 ## The C# side
 
@@ -749,6 +749,9 @@ request id) unless a typed result is listed. Failure is `Error` with the request
 | `0x1312` | DeleteObject | `ObjectRef` (kind 2 or 3) | `Ok`; `Error` 9 with `adminAllowObjects 0` |
 | `0x1313` | StartVote | string question (1-96 bytes), `u16` seconds (5-600), `u8` team (0 everyone, 1 or 2), `u8` percent (1-100), `u8` minimum ballots (0-64) | `Ok`; `Error` 6 when a vote is running or no human player can vote ("Server votes" below) |
 | `0x1314` | CancelVote | nothing after the request id | `Ok`; `Error` 6 when no vote is running |
+| `0x1315` | HudEventRaw | `i16` player (-1 every playing client), `u8` HUD event (40, 41, 42, 43, 44, 51, 64, 65, 66, 70, 71, 74 or 83), `u8` length N (0-52), N bytes payload | `Ok`; `Error` 4 no such player; `Error` 6 refused by the engine (R7a) |
+| `0x1316` | RoundClock | `i16` player (-1 every connected client), `f32` seconds from now (0-86400) | `Ok`; `Error` 4; `Error` 6 (R7b) |
+| `0x1317` | SquadOrder | `u8` team (1 or 2), `u8` squad (1-255), `u8` order id, `u8` flags (bit 0 a commander order), `u32` target networkable id (0 none, at most 65535), 3 × `Vec3` points | `Ok`; `Error` 6 when the squad has no members (R7c) |
 
 **`0x1402 ConsoleResult`**: `u32` request id, `u8` flags (bit 0 output truncated at 256 KiB), `u16`
 line count L, L × string. The output of `Console::executeLine` split at `\n`, without the final
@@ -907,7 +910,7 @@ moving player's position and rotation changes every frame. A full 64-player fram
 the cheap step is to skip entities unchanged since the last frame, with a full frame every second; it
 is a new stream encoding, not a protocol redesign.
 
-## R7: client presentation hooks (approved 2026-11-12, not implemented)
+## R7: client presentation hooks (approved 2026-11-12, implemented 2026-11-12)
 
 Lets the module drive HUD features the retail client already has, with no client mod: map markers, notices, a round
 clock and squad orders. Python's `sendHudEvent` carries only a 4-byte payload, and nothing sends the other two events on
@@ -918,9 +921,10 @@ tested on a retail client before it is relied on.
 
 **R7a `bool sendHudEventRaw(int playerId, int eventId, const void* payload, int size)`.** Sends
 `PostRemoteEvent(ECHud, eventId, payload, size)` to one player, or to every playing client for -1. Refuses an id outside
-the whitelist and a size above 52 (shorter payloads are zero-padded). The whitelist holds ids whose client handlers read
-the payload as plain data; an id joins it only after a retail-client test (42 may touch commander-only state; 64/65 do
-nothing unless both teams can capture the point):
+the whitelist and a size above 52. The payload is zero-padded and always sent as 52 bytes, so a handler that reads past
+what the caller gave sees zeros on any client. The whitelist holds ids whose client handlers read the payload as plain
+data (42 may touch commander-only state; 64/65 do nothing unless both teams can capture the point). As implemented the
+whitelist holds all of them; none is tested on a retail client yet, which the author does before relying on one:
 
 | Id | Effect | Payload |
 |---|---|---|
@@ -945,11 +949,26 @@ state is always the server's current one, so only the client's clock and banner 
 Calls the retail `SquadManager::issueSquadOrder` or the commander-order equivalent with a filled `SquadOrder`, so server
 squad state stays consistent and members get the retail HUD notices (and AI members the order). Order ids: 0 artillery,
 1 UAV, 2 vehicle drop, 3 supply, 5 attack, 6 defend, 7 repair, 8 destroy, 9 mines, 10 attack control point, anything
-else move. Refuses squad 0 and teams other than 1 and 2.
+else move. Refuses squad 0, teams other than 1 and 2, and a squad without members (a squad exists while it has
+members). `SquadOrder::flag2C` (the accepted flag) starts clear, as for a new order.
 
-**Module side.** Admin-channel commands `HudEvent` (player, id, bytes; the module checks the same whitelist), `RoundClock`
-(player, seconds) and `SquadOrder` (team, squad, order, target, points, commander), ids assigned when the byte layouts
-are written. Bot-channel equivalents can follow. The engine surface changes, so the admin protocol version bumps.
+**Module side.** Admin-channel commands `0x1315 HudEventRaw`, `0x1316 RoundClock` and `0x1317 SquadOrder` (layouts in
+the command table). The module checks the same whitelist when it parses `HudEventRaw` (`Error` 7) and answers `Error` 4
+for a player that does not exist and `Error` 6 when the engine refuses. Bot-channel equivalents can follow.
+
+**Protocol version: not bumped (deviation, awaiting the author).** This section said the admin version bumps because
+the engine surface changes. BF2WebAdmin refuses any version but 1 (`AdminHandshake.cs`), so a bump would cut the
+running WebAdmin off until its C# side is updated. The version stays 1: the three commands are new types, which an
+old WebAdmin never sends. The cost: a new WebAdmin that sends them to an older module gets `Error` 3 and the link
+closes, so engine, module and WebAdmin are deployed together. The module calls the new `IServerExtension` slots,
+so it must never be loaded into an engine built before R7 (as with every appended method).
+
+**Tested (2026-11-12)**, server side only, on a WSL server (OpenBF2 `serverext/r1` with R7 uncommitted on 824d4dc,
+dalian_2_v_2, ports 16583/16733/16734) with `adminclient.py --scenario r7` and one hovering bot: `HudEventRaw` 66 and
+43 to every client and a full 52-byte payload are accepted, 73 is `Error` 7, an unknown player `Error` 4, `RoundClock`
+60 s to every client is accepted, `SquadOrder` to an empty squad is `Error` 6, and the server keeps ticking. MSVC x86
+syntax checks of `GameServer.cpp`, `SpottedEvent.cpp` and `BF2Engine.cpp` pass. Not tested: what any of it shows on a
+retail client, a `SquadOrder` to a real squad, and `RoundClock` to one player.
 
 **Out of scope.** Raw `ECGameLogic` events (unknown subtypes abort the client), `KilledByEvent`, commander drops,
 control-point `takeOverCounter` (later R7 items), and veto hooks (other engine files).

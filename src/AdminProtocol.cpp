@@ -153,11 +153,22 @@ ProjectileHitEvent::ProjectileHitEvent() : id(0), owner(-1), flags(0), firstVict
 
 Command::Command()
     : type(0), session(0), requestId(0), player(0), target(0), flags(0), value8(0), seconds(0), index(0), size(0),
-      maxResults(0), clock(0), value(0.0f)
+      maxResults(0), clock(0), value(0.0f), target16(-1), netId(0)
 {
     for (int i = 0; i < 5; ++i)
         ints[i] = 0;
+    for (int i = 0; i < 9; ++i)
+        points[i] = 0.0f;
     zero3(pos); zero3(rot);
+}
+
+bool hudEventRawAllowed(uint8_t id)
+{
+    static const uint8_t kAllowed[] = { 40, 41, 42, 43, 44, 51, 64, 65, 66, 70, 71, 74, 83 };
+    for (size_t i = 0; i < sizeof(kAllowed); ++i)
+        if (kAllowed[i] == id)
+            return true;
+    return false;
 }
 
 // ---------------------------------------------------------------- structures
@@ -1001,7 +1012,7 @@ bool isWebAdminMessage(uint16_t type)
     case CmdConsole: case CmdSay: case CmdTeleport: case CmdSetHealth: case CmdKillPlayer: case CmdSetTeam:
     case CmdSetScore: case CmdRank: case CmdMedal: case CmdGameEvent: case CmdHudEvent: case CmdKick: case CmdBan:
     case CmdMap: case CmdListObjects: case CmdSetObjectActive: case CmdSpawnObject: case CmdDeleteObject:
-    case CmdStartVote: case CmdCancelVote:
+    case CmdStartVote: case CmdCancelVote: case CmdHudEventRaw: case CmdRoundClock: case CmdSquadOrder:
     case MsgPing: case MsgPong: case MsgError:
         return true;
     default:
@@ -1298,6 +1309,61 @@ bool parseCommand(uint16_t type, const uint8_t* p, size_t n, Command& out, std::
     case CmdCancelVote:
         out.requestId = r.u32();
         return r.done();
+
+    case CmdHudEventRaw:
+    {
+        out.requestId = r.u32();
+        out.target16 = r.i16();
+        out.value8 = r.u8();
+        const uint8_t length = r.u8();
+        for (uint8_t i = 0; i < length && r.ok(); ++i)
+            out.bytes.push_back(r.u8());
+        if (!r.done())
+            return false;
+        if (out.target16 < -1 || out.target16 > 255)
+            return bad(badValue, "player must be 0..255 or -1 (every client)");
+        if (!hudEventRawAllowed(out.value8))
+            return bad(badValue, "HUD event not allowed: 40, 41, 42, 43, 44, 51, 64, 65, 66, 70, 71, 74 or 83");
+        if (out.bytes.size() > kMaxHudPayload)
+            return bad(badValue, "the payload is at most 52 bytes");
+        return true;
+    }
+
+    case CmdRoundClock:
+        out.requestId = r.u32();
+        out.target16 = r.i16();
+        out.value = r.f32();
+        if (!r.done())
+            return false;
+        if (out.target16 < -1 || out.target16 > 255)
+            return bad(badValue, "player must be 0..255 or -1 (every client)");
+        if (!(out.value >= 0.0f) || out.value > kMaxRoundClockSeconds)
+            return bad(badValue, "seconds must be 0..86400");
+        return true;
+
+    case CmdSquadOrder:
+        out.requestId = r.u32();
+        out.target = r.u8();
+        out.player = r.u8();
+        out.value8 = r.u8();
+        out.flags = r.u8();
+        out.netId = r.u32();
+        for (int k = 0; k < 3; ++k)
+            readVec3(r, out.points + 3 * k);
+        if (!r.done())
+            return false;
+        if (out.target != 1 && out.target != 2)
+            return bad(badValue, "team must be 1 or 2");
+        if (out.player == 0)
+            return bad(badValue, "squad must be 1..255");
+        if (out.flags & ~1)
+            return bad(badValue, "unknown flags");
+        if (out.netId > 0xFFFF)
+            return bad(badValue, "the target networkable id must be 0..65535");
+        for (int k = 0; k < 3; ++k)
+            if (!finite3(out.points + 3 * k))
+                return bad(badValue, "a point is not finite");
+        return true;
 
     default:
         return false;

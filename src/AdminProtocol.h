@@ -26,6 +26,12 @@ const size_t kMaxConsoleOutput = 256 * 1024;
 const uint16_t kMaxListObjects = 4096;
 const uint32_t kNoObjectId = 0xFFFFFFFFu;
 const uint16_t kNoIndex = 0xFFFF;
+const size_t kMaxHudPayload = 52;   // PostRemoteEvent's payload (R7)
+const float kMaxRoundClockSeconds = 86400.0f;
+
+// R7: the HUD event ids HudEventRaw accepts, the engine's sendHudEventRaw whitelist: their retail
+// client handlers read the payload as plain data.
+bool hudEventRawAllowed(uint8_t id);
 
 enum Type : uint16_t
 {
@@ -48,7 +54,7 @@ enum Type : uint16_t
     CmdSetTeam = 0x1306, CmdSetScore = 0x1307, CmdRank = 0x1308, CmdMedal = 0x1309, CmdGameEvent = 0x130A,
     CmdHudEvent = 0x130B, CmdKick = 0x130C, CmdBan = 0x130D, CmdMap = 0x130E, CmdListObjects = 0x130F,
     CmdSetObjectActive = 0x1310, CmdSpawnObject = 0x1311, CmdDeleteObject = 0x1312, CmdStartVote = 0x1313,
-    CmdCancelVote = 0x1314,
+    CmdCancelVote = 0x1314, CmdHudEventRaw = 0x1315, CmdRoundClock = 0x1316, CmdSquadOrder = 0x1317,
     // replies
     MsgOk = 0x1401, MsgConsoleResult = 0x1402, MsgObjectList = 0x1403, MsgObjectSpawned = 0x1404,
     // keepalive, either direction
@@ -519,6 +525,10 @@ struct Command
     std::string text;      // Console line, Say text, Kick/Ban reason, ListObjects/SpawnObject template, Map name,
                            // StartVote question
     std::string text2;     // Map mode
+    int16_t target16;      // HudEventRaw, RoundClock: the player, -1 every client
+    std::vector<uint8_t> bytes;   // HudEventRaw payload
+    float points[9];       // SquadOrder: three positions
+    uint32_t netId;        // SquadOrder target networkable id, 0 none
     std::vector<std::string> filters;   // Subscribe
     std::string invalid;   // non-empty: a value check failed; the main thread answers Error 7 with it, in order
     Command();
