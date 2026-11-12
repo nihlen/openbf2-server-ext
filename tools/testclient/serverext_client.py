@@ -2963,6 +2963,129 @@ def run_tvswitch(args):
     return cl.finish()
 
 
+def run_tvwreck(args):
+    """The TV camera defect (the tv-bugs investigation; OpenBF2 tv-wreck-hold): crew A hovers and its gunner fires
+    a TV missile out to sea (it flies its whole life, 4 s); at once crew B, hovering --tv-range to the side, steers a
+    TV missile into A's heli. In retail the wreck goes into the object cache before A's missile ends, so the
+    missile's camera stays in A's gunner seat. After A's crew has respawned and boarded again, B fires a TV missile
+    (it takes the cached missile whose camera is stale) and A fires while it flies: the server's [TVT] trace shows
+    NOT-REMOVED and STALE-KEPT in retail, [tv-wreck-hold] lines and neither marker with the setting on."""
+    cl = Client(args, "serverext testclient tvwreck")
+    other = 3 - args.team
+    crew_a = board_crew(cl, args.team, args.name + " A")
+    crew_b = board_crew(cl, other, args.name + " B") if crew_a else None
+    if not crew_b:
+        return cl.finish()
+    pa, ga, heli_a = crew_a
+    pb, gb, heli_b = crew_b
+    for g in (ga, gb):
+        cl.pulses[g] = BTN_ALT_FIRE
+        cl.run_for(1.5)
+        if not cl.check(f"gunner {g} on the TV launcher: {slot0_name(cl, g)}", has_tv(cl, g)):
+            return cl.finish()
+    holder = Holder(cl)
+    pad = cl.states[pa]["pos"]
+    hdg = seaward(pad)
+    alt = pad[1] + 25.0
+    if args.tvwreck_out > 0:
+        if not climb_hold(cl, holder, pa, alt, hdg, "A"):
+            return cl.finish()
+        out = ahead(pad, hdg, args.tvwreck_out, alt)
+        kind, data = cl.teleport(pa, out, hdg)
+        if not cl.check(f"A teleported {args.tvwreck_out:.0f} m out to sea: {kind} {data}", kind == "ack"):
+            return cl.finish()
+        cl.run_for(4.0)
+    else:
+        # Over the pad, facing inland: the wreck lands where the spawner clears it when it respawns the heli.
+        alt = pad[1] + args.tvwreck_hover
+        if not climb_hold(cl, holder, pa, alt, (hdg + 180.0) % 360.0, "A over its pad"):
+            return cl.finish()
+    side_hdg = (hdg + args.tvwreck_side) % 360.0
+    side = ahead(cl.states[pa]["pos"], side_hdg, args.tv_range, alt)
+    kind, data = cl.teleport(pb, side, (side_hdg + 180.0) % 360.0)
+    if not cl.check(f"B teleported {args.tv_range:.0f} m to A's side: {kind} {data}", kind == "ack"):
+        return cl.finish()
+    holder.hold(pb, alt, (side_hdg + 180.0) % 360.0)
+    cl.run_for(5.0)
+
+    def ready(g):
+        w = slot0(cl, g)
+        return has_tv(cl, g) and w["ammo"] > 0 and not w["reloading"] and not own_tv_missiles(cl, g)
+
+    if not cl.run_for(20.0, lambda: ready(ga) and ready(gb)):
+        log(f"launchers not ready: A {slot0(cl, ga)}, B {slot0(cl, gb)}")
+        return cl.finish()
+    far_a = ahead(cl.states[pa]["pos"], cl.states[pa]["ypr"][0], 900.0, cl.states[pa]["pos"][1] + 250.0)
+    holder.aim = lambda: {ga: (eye(cl, ga), far_a) if cl.in_vehicle(ga) else None,
+                          gb: (eye(cl, gb), cl.states[pa]["pos"]) if cl.in_vehicle(pa) and cl.in_vehicle(gb) else None}
+    log(f"A at {tuple(round(v, 1) for v in cl.states[pa]['pos'])}, B at {tuple(round(v, 1) for v in cl.states[pb]['pos'])}")
+    wait_ticks(cl, 6)
+    cl.pulses[ga] = BTN_FIRE
+    log(f"A fires out to sea after tick {cl.tick}")
+    wait_ticks(cl, 3)
+    cl.pulses[gb] = BTN_FIRE
+    log(f"B fires at A's heli {heli_a} after tick {cl.tick}")
+    a_missile = []
+    dead_at = []
+
+    def watch():
+        m = own_tv_missiles(cl, ga)
+        if cl.tick % 6 == 0:
+            for p in [x for x in cl.projectiles if x["name"].lower() == TV_PROJECTILE]:
+                log(f"  tick {cl.tick} missile {p['id']} owner {p['owner']} at {tuple(round(v, 1) for v in p['pos'])} ttl {p['ttl']:.2f}")
+        if m and not a_missile:
+            a_missile.append((cl.tick, m[0]["id"]))
+            log(f"A's missile {m[0]['id']} seen at tick {cl.tick}")
+        v = cl.vehicles.get(heli_a)
+        if not dead_at and (v is None or v["flags"] & 1):
+            dead_at.append(cl.tick)
+            log(f"A's heli {heli_a} destroyed or gone at tick {cl.tick} (A's missile flying: {bool(m)})")
+        return False
+
+    cl.run_for(6.0, watch)
+    holder.aim = None
+    cl.steers.pop(ga, None)
+    cl.steers.pop(gb, None)
+    if not cl.check(f"A's heli destroyed while A's missile flew (missile {a_missile}, destroyed {dead_at})",
+                    dead_at and a_missile and dead_at[0] - a_missile[0][0] < 110):
+        return cl.finish()
+    holder.plans.pop(pa, None)
+    t_dead = time.time()
+    # A's crew respawns and boards whatever heli its spawner gives it (the cached one in retail).
+    if not cl.check("A's pilot boarded again", ensure_boarded(cl, pa, args.team, "A pilot")):
+        return cl.finish()
+    heli_a2 = cl.states[pa]["root"]
+    log(f"A's heli back as {heli_a2} {time.time() - t_dead:.1f} s after the kill")
+    if not cl.check("A's gunner boarded seat 1 again",
+                    ensure_boarded(cl, ga, args.team, "A gunner", seat=1, vehicle_id=heli_a2, spinup=0.5)):
+        return cl.finish()
+    cl.pulses[ga] = BTN_ALT_FIRE
+    cl.run_for(1.5)
+    if not has_tv(cl, ga):
+        cl.pulses[ga] = BTN_ALT_FIRE
+        cl.run_for(1.5)
+    if not cl.check(f"A's gunner on the TV launcher: {slot0_name(cl, ga)}", has_tv(cl, ga)):
+        return cl.finish()
+    if not cl.run_for(20.0, lambda: ready(ga) and ready(gb)):
+        log(f"launchers not ready: A {slot0(cl, ga)}, B {slot0(cl, gb)}")
+        return cl.finish()
+    pos_a = cl.states[pa]["pos"]
+    far_b = ahead(cl.states[pb]["pos"], side_hdg, 900.0, cl.states[pb]["pos"][1] + 40.0)
+    far_a2 = ahead(pos_a, hdg, 900.0, pos_a[1] + 40.0)
+    holder.aim = lambda: {gb: (eye(cl, gb), far_b), ga: (eye(cl, ga), far_a2)}
+    wait_ticks(cl, 6)
+    cl.pulses[gb] = BTN_FIRE
+    log(f"B fires away from A after tick {cl.tick}")
+    wait_ticks(cl, 15)
+    cl.pulses[ga] = BTN_FIRE
+    log(f"A fires again after tick {cl.tick} (B's missile flying: {bool(own_tv_missiles(cl, gb))})")
+    cl.run_for(6.0)
+    holder.aim = None
+    log("tvwreck done: check the server's [TVT] cam lines, [tv-wreck-hold] and [tv-bug-hint]")
+    holder.stop()
+    return cl.finish()
+
+
 def run_viewer(args):
     """Drives the admin channel's viewer additions (adminclient.py --scenario viewer reads them): a pilot
     and a gunner share a heli over the sea. The pilot cycles its camera views, fires rockets and flares;
@@ -3035,7 +3158,7 @@ def run_viewer(args):
 
 
 SCENARIOS_V3 = {"burst": run_burst, "tv": run_tv, "soak3": run_soak3, "q12": run_q12, "viewer": run_viewer,
-                "tvswitch": run_tvswitch}
+                "tvswitch": run_tvswitch, "tvwreck": run_tvwreck}
 
 
 # ------------------------------------------------------------------------------------- fuzz
@@ -3308,7 +3431,7 @@ def main():
     ap.add_argument("--vehicle-log-every", type=float, default=60.0, help="seconds between VehicleList summaries")
     ap.add_argument("--scenario", choices=["hover", "walk", "buttons", "blockpad", "allblocked", "wreck", "q9", "q5", "teamswitch",
                                            "view", "weapons", "damage", "spot", "round", "teleport", "multiconn", "soak2",
-                                           "burst", "tv", "soak3", "q12", "viewer", "tvswitch"],
+                                           "burst", "tv", "soak3", "q12", "viewer", "tvswitch", "tvwreck"],
                     default="hover")
     ap.add_argument("--rcon-port", type=int, default=4723, help="q9: ModManager RCON port")
     ap.add_argument("--rcon-password", default="", help="q9: ModManager RCON password")
@@ -3353,6 +3476,9 @@ def main():
     ap.add_argument("--switch-ticks", default="20,26,28,29,30,31,32,33,34,36,40",
                     help="tvswitch: ticks after the fire press at which the gunner switches to the gun")
     ap.add_argument("--switch-repeats", type=int, default=2, help="tvswitch: runs per offset")
+    ap.add_argument("--tvwreck-hover", type=float, default=10.0, help="tvwreck: A's hover height over its pad (--tvwreck-out 0)")
+    ap.add_argument("--tvwreck-side", type=float, default=270.0, help="tvwreck: B's bearing from A, degrees from seaward")
+    ap.add_argument("--tvwreck-out", type=float, default=200.0, help="tvwreck: metres seaward of the pad for A's hover (0: A stays on its pad)")
     ap.add_argument("--switch-hold", type=float, default=12.0, help="tvswitch: seconds on the gun")
     args = ap.parse_args()
     try:
