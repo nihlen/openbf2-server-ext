@@ -39,7 +39,7 @@ How the pieces of the contract were built that it leaves open:
 | Item | Value |
 |---|---|
 | OpenBF2 | `serverext/r1` working tree on `824d4dc` (with the author's uncommitted R7 changes, which the module's `f7de037` needs), built into `~/bf2-linux-scripts` (`testenv/build-linux.sh`), `bf2` md5 `de9c5acb3baa04352a1f943af230a591` |
-| Module | this change on `1d3f5a7`, built into `~/serverext-build/scripts`, `libserverext.so` md5 `1ee08066c6a8e31b3d1d623145515adf` |
+| Module | this change on `1d3f5a7` (`a0ba53b`, with the budget check every 100 rounds), built into `~/serverext-build/scripts`, `libserverext.so` md5 `524a1d6426da6fd7fab83bb5fe575781` |
 | Server | WSL, the netsky `2v2-nocheck` content copied from an earlier run directory into `~/serverext-scripts/srv` (the image is not on this PC any more), `dalian_2_v_2` `gpm_cq` 16; game 16585/udp, GameSpy 29909, RCON 127.0.0.1:4729, bot channel 127.0.0.1:16735, admin dial-out to 127.0.0.1:16736 (`adminTls 0`, loopback) |
 | WebAdmin | `tools/adminclient/adminclient.py --no-tls --port 16736`; logs `~/serverext-scripts/logs/final-*.log` |
 | Bots | `tools/testclient/serverext_client.py --hover-height 60` (a Z-10 hovering 60 m over its pad, the pilot holding height, attitude and heading), and a bot that spawns and stands (`~/serverext-scripts/soldier.py`, the test client's `Client` class) |
@@ -49,11 +49,12 @@ afterwards.
 
 ## Results
 
-Unit tests: `serverext_tests`, `serverext_admin_tests` and `serverext_script_tests` (524 checks) pass. The golden
+Unit tests: `serverext_tests`, `serverext_admin_tests` and `serverext_script_tests` (530 checks) pass. The golden
 file has 80 frames (new: `cmd_start_script`, `cmd_stop_script`, `cmd_script_message`, `cmd_list_scripts`,
 `script_list`, `ev_script_finished`, `ev_script_event`). The script tests also pass built with
 `-fsanitize=address,undefined` and QuickJS's asserts on (no leak, no assert), except one whose result depends on
-speed (under the sanitizer the time budget ends the memory-filling loop before the memory limit does).
+speed (under the sanitizer the time budget ends the memory-filling loop before the memory limit does). The sanitizer
+run was made with the first build (the budget check every 10000 rounds) and not repeated with the final one.
 
 Live, the final build: `script` without a bot **32/32**, with the helicopter **43/43**, with the soldier **39/39**;
 `scriptends` **9/9**; `--fuzz` **3/3**; the server ran on and its log has no abort.
@@ -75,6 +76,27 @@ Live, the final build: `script` without a bot **32/32**, with the helicopter **4
 | Level unload | `Map` next: both scripts end with reason 5; the stop handler ran first, still counted the player and its chat line `script stop: level unload` reached the bot client; `ListScripts` empty on the new map, and a script starts there |
 | Closed link | the listener closes the socket with a script running: the module logs `ending 1 scripts with the link`, the stop handler's `script stop: link closed` reaches the bot client, the next link has session + 1 and no scripts, and the instance can be used again |
 | Fuzz | 24 rounds of hostile frames, the new types included: the module answers with `Error` and dials back; a clean link answers `Ping` |
+
+## End to end with BF2WebAdmin
+
+The same server and module, with BF2WebAdmin `f2ca979` (branch `admin-channel`) in place of the reference client:
+published for `linux-x64` (self-contained) and run in WSL with a SQLite database of its own, its plain loopback
+listener on 16736 (`ServerSettings:AdminChannel:PlainLoopbackPort`), web API on 127.0.0.1:5056, the server saved in a
+server group with `Heli2v2Module`. The commands were sent with `POST /api/servers/scripts-test/chat` and the API key,
+and watched in the bot client's own log (the hovering Z-10 at 213.9 m).
+
+| Check | Result |
+|---|---|
+| Link | `Welcome` capabilities 11; WebAdmin's commands list `nasa` from `PracticeModule` |
+| `.nasa 60` (a world height of 200 m) | WebAdmin starts the script `nasa`; one second later the helicopter is at 204.2 m sinking at 7.9 m/s, after four seconds it stays at 200.15 m while its pilot keeps asking for 213.9 |
+| `.nasa 50` | a `ScriptMessage`, no new script: 190.15 m after four seconds |
+| `.nasa 0` | `StopScript`; `ScriptFinished` reason 2 after 605 calls, 15.3 ms of CPU in all (25 µs per tick), 95 µs the longest; the helicopter climbs back |
+| `.dance` | the script `dance`, sampled every tick: the position stays within 0.01 m, the yaw advances 12 degrees per tick (one turn a second), pitch and roll swing to 14.3 degrees, and after 150 ticks the helicopter is level at its old yaw. `ScriptFinished` reason 1 after 152 calls, 4.7 ms of CPU in all |
+| A map change with `nasa` running | `ScriptFinished` reason 5 reaches WebAdmin (`LevelUnload`); the server loads the next map and goes on |
+| `adminAllowScripts 0` | `Welcome` capabilities 3; WebAdmin logs that the module runs no scripts and starts none: `.nasa 60` is its old way (a teleport back to 200.0 m every 0.25 s; the helicopter is stopped each time and climbs to 200.5 m in between), `.dance` its old loop |
+| Module stats line with `nasa` running | `admin cost (us) p50 10 p99 60` |
+
+Everything was stopped afterwards.
 
 ## Cost
 
@@ -116,6 +138,8 @@ For comparison the admin channel without scripts costs 20 to 40 µs per tick at 
   pilot's client, so that pilot may see corrections, as with the `Teleport` command.
 - More than one player in a script on a live server (the unit tests cover it against the mock world), and a full
   server.
+- A link that drops while WebAdmin keeps running, with a script on (WebAdmin's unit tests cover its restart of
+  `nasa`; the module's `scriptends` scenario covers the module's side).
 - The release and localtest image builds were not run. They build this repo with the same preset and run `ctest`,
   and their builders have `gcc` (it comes with `g++`), so they need no change; `git archive` carries `third_party/`.
   The localtest image cannot be built from commits at the moment for another reason: the module's R7 commands need

@@ -1191,6 +1191,9 @@ As implemented:
 bot helicopter hovering 60 m up and with a bot soldier: every command and reply, every end reason, the limits, the
 host API against the player stream of the same tick, `teleport`, both speed setters, a soft ceiling that holds a
 helicopter whose pilot keeps climbing (within 0.2 m of the ceiling after 8 s), a level unload and a closed link; and
-`--fuzz`. Results and costs: `docs/findings/scripts.md`. **Not tested:** what a client sees of any of it (no human
+`--fuzz`. And end to end with BF2WebAdmin `f2ca979` on the same server: `.nasa` (the script `nasa` holds the
+helicopter at the ceiling, a message changes it, `.nasa 0` stops it), `.dance` (the script `dance`: position held, one
+turn of yaw a second), a map change with a script running, and WebAdmin's old way against a module with
+`adminAllowScripts 0`. Results and costs: `docs/findings/scripts.md`. **Not tested:** what a client sees of any of it (no human
 client; a body moved by `setVelocity` is predicted by its own pilot's client, so that pilot may see corrections),
 more than one player per script on a live server, a server under load, and a Windows build.
