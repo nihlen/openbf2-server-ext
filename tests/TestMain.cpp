@@ -19,6 +19,7 @@
 #include "AdminProtocol.h"
 #include "Neutral.h"
 #include "PendingInput.h"
+#include "SeatOrder.h"
 #include "SpawnPlan.h"
 #include "Vote.h"
 
@@ -1454,6 +1455,212 @@ void testNeutral()
 
 } // namespace
 
+// Seat preferences: seat::plan against a model of the engine's spawn pass.
+namespace {
+
+seat::Entry seatEntry(int id, uint8_t preference, uint32_t spawnAtTick, int team = 1, int group = 4, bool dead = true)
+{
+    seat::Entry e;
+    e.id = id;
+    e.team = team;
+    e.group = group;
+    e.dead = dead;
+    e.spawnAtTick = spawnAtTick;
+    e.preference = preference;
+    return e;
+}
+
+// ServerGameLogic::uPlayingSpawning and the enter-on-spawn seat sweep, reduced to what matters: the tick count is
+// incremented, then every third tick (phase) the players are walked in list order and every dead one that is due
+// is spawned into the first free seat; then the module's tick hook runs (after the pass, the same tick count).
+// hookAfterPass false runs the hook before the pass instead, with the same count. Returns each player's seat, -1
+// if it never spawned.
+std::vector<int> simulateSeats(std::vector<seat::Entry> players, uint32_t now, int phase, bool hookAfterPass = true)
+{
+    std::vector<int> seatOf(players.size(), -1);
+    std::vector<seat::Delay> delays;
+    int nextSeat = 0;
+    if (hookAfterPass)
+        seat::plan(players, now, delays);
+    for (uint32_t t = now + 1; t < now + 1000; ++t)
+    {
+        if (!hookAfterPass)
+            seat::plan(players, t, delays);
+        if (static_cast<int>(t % 3) == phase)
+        {
+            std::vector<size_t> due;
+            for (size_t i = 0; i < players.size(); ++i)
+                if (players[i].dead && !seat::after(players[i].spawnAtTick, t))
+                    due.push_back(i);
+            for (size_t k = 0; k < due.size(); ++k)
+            {
+                players[due[k]].dead = false;
+                seatOf[due[k]] = nextSeat++;
+            }
+        }
+        if (hookAfterPass)
+            seat::plan(players, t, delays);
+    }
+    return seatOf;
+}
+
+} // namespace
+
+void testSeatOrder()
+{
+    using namespace serverext::seat;
+    std::vector<Delay> out;
+
+    CHECK(validPreference(0) && validPreference(1) && validPreference(255) && !validPreference(2) && !validPreference(254));
+    CHECK(rank(kFirst) < rank(kNone) && rank(kNone) < rank(kSecond));
+
+    // Two teammates killed in the same tick (spawn time 15 s), every pass phase, both list orders: the one who
+    // wants the second seat always gets it, and so does the teammate of one who wants the first seat.
+    const uint8_t pairs[][2] = { { kSecond, kNone }, { kNone, kFirst }, { kSecond, kFirst } };
+    for (int pr = 0; pr < 3; ++pr)
+        for (int phase = 0; phase < 3; ++phase)
+            for (int order = 0; order < 2; ++order)
+            {
+                std::vector<Entry> ps;
+                ps.push_back(seatEntry(1, pairs[pr][0], 1450));   // wants the later seat
+                ps.push_back(seatEntry(2, pairs[pr][1], 1450));
+                if (order)
+                    std::swap(ps[0], ps[1]);
+                const std::vector<int> seats = simulateSeats(ps, 1000, phase);
+                const int later = order ? 1 : 0;
+                CHECK(seats[later] == 1 && seats[1 - later] == 0);
+                // The hook before the pass (not where it runs, but the rule must not depend on it).
+                const std::vector<int> early = simulateSeats(ps, 1000, phase, false);
+                CHECK(early[later] == 1 && early[1 - later] == 0);
+            }
+    // Without the rule the engine's order decides: the first in the list takes seat 0.
+    {
+        std::vector<Entry> ps;
+        ps.push_back(seatEntry(1, kNone, 1450));
+        ps.push_back(seatEntry(2, kNone, 1450));
+        const std::vector<int> seats = simulateSeats(ps, 1000, 1);
+        CHECK(seats[0] == 0 && seats[1] == 1);
+    }
+
+    // The delay itself: base = max(Y's tick, now + 1), and X is moved to base + 3.
+    {
+        std::vector<Entry> ps;
+        ps.push_back(seatEntry(1, kSecond, 1450));
+        ps.push_back(seatEntry(2, kNone, 1450));
+        plan(ps, 1000, out);
+        CHECK(out.size() == 1 && out[0].player == 1 && out[0].after == 2 && out[0].from == 1450 && out[0].to == 1453 &&
+              out[0].afterTick == 1450);
+        CHECK(ps[0].spawnAtTick == 1453 && ps[1].spawnAtTick == 1450);
+        // Idempotent: the next ticks change nothing while Y's tick is ahead.
+        for (uint32_t now = 1000; now < 1449; ++now)
+        {
+            plan(ps, now, out);
+            CHECK(out.empty());
+        }
+        CHECK(ps[0].spawnAtTick == 1453 && ps[1].spawnAtTick == 1450);
+    }
+    // One preference is enough: pilot only (the teammate without one waits).
+    {
+        std::vector<Entry> ps;
+        ps.push_back(seatEntry(5, kNone, 1450));
+        ps.push_back(seatEntry(9, kFirst, 1451));
+        plan(ps, 1000, out);
+        CHECK(out.size() == 1 && out[0].player == 5 && out[0].to == 1454);
+    }
+    // Both want the same seat: left to the engine.
+    {
+        std::vector<Entry> ps;
+        ps.push_back(seatEntry(1, kFirst, 1450));
+        ps.push_back(seatEntry(2, kFirst, 1450));
+        plan(ps, 1000, out);
+        CHECK(out.empty());
+        ps[0].preference = ps[1].preference = kSecond;
+        plan(ps, 1000, out);
+        CHECK(out.empty());
+    }
+    // Not teammates, not the same spawn group, no spawn group, or the teammate is alive: nothing.
+    {
+        std::vector<Entry> ps;
+        ps.push_back(seatEntry(1, kSecond, 1450, 1, 4));
+        ps.push_back(seatEntry(2, kNone, 1450, 2, 4));
+        plan(ps, 1000, out);
+        CHECK(out.empty() && !anyPair(ps));
+        ps[1] = seatEntry(2, kNone, 1450, 1, 3);
+        plan(ps, 1000, out);
+        CHECK(out.empty() && !anyPair(ps));
+        ps[0] = seatEntry(1, kSecond, 1450, 1, 0);
+        ps[1] = seatEntry(2, kNone, 1450, 1, 0);
+        plan(ps, 1000, out);
+        CHECK(out.empty() && !anyPair(ps));
+        ps[0] = seatEntry(1, kSecond, 1450);
+        ps[1] = seatEntry(2, kNone, 900, 1, 4, false);
+        plan(ps, 1000, out);
+        CHECK(out.empty() && !anyPair(ps));
+        ps[1].dead = true;
+        CHECK(anyPair(ps));
+    }
+    // Already at least a pass later: nothing.
+    {
+        std::vector<Entry> ps;
+        ps.push_back(seatEntry(1, kSecond, 1453));
+        ps.push_back(seatEntry(2, kNone, 1450));
+        plan(ps, 1000, out);
+        CHECK(out.empty() && ps[0].spawnAtTick == 1453);
+        ps[0].spawnAtTick = 1452;
+        plan(ps, 1000, out);
+        CHECK(out.size() == 1 && ps[0].spawnAtTick == 1453);
+    }
+    // X due before Y (it died first): it waits for Y.
+    {
+        std::vector<Entry> ps;
+        ps.push_back(seatEntry(1, kSecond, 1200));
+        ps.push_back(seatEntry(2, kNone, 1450));
+        plan(ps, 1000, out);
+        CHECK(out.size() == 1 && ps[0].spawnAtTick == 1453);
+    }
+    // Overdue ticks (both due already, the pass has not come): base is now + 1, every phase still works.
+    {
+        std::vector<Entry> ps;
+        ps.push_back(seatEntry(1, kSecond, 995));
+        ps.push_back(seatEntry(2, kNone, 990));
+        plan(ps, 1000, out);
+        CHECK(out.size() == 1 && ps[0].spawnAtTick == 1004);
+        for (int phase = 0; phase < 3; ++phase)
+            for (int order = 0; order < 2; ++order)
+            {
+                std::vector<Entry> qs;
+                qs.push_back(seatEntry(1, kSecond, 999));
+                qs.push_back(seatEntry(2, kFirst, 998));
+                if (order)
+                    std::swap(qs[0], qs[1]);
+                const std::vector<int> seats = simulateSeats(qs, 1000, phase);
+                const int later = order ? 1 : 0;
+                CHECK(seats[later] == 1 && seats[1 - later] == 0);
+            }
+    }
+    // Three ranks: the one without a preference waits for the pilot, the gunner for both.
+    {
+        std::vector<Entry> ps;
+        ps.push_back(seatEntry(1, kSecond, 1450));
+        ps.push_back(seatEntry(2, kNone, 1450));
+        ps.push_back(seatEntry(3, kFirst, 1450));
+        plan(ps, 1000, out);
+        CHECK(out.size() == 2 && ps[1].spawnAtTick == 1453 && ps[0].spawnAtTick == 1456 && ps[2].spawnAtTick == 1450);
+        plan(ps, 1000, out);
+        CHECK(out.empty());
+        const std::vector<int> seats = simulateSeats(ps, 1000, 2);
+        CHECK(seats[2] == 0 && seats[1] == 1 && seats[0] == 2);
+    }
+    // Tick numbers wrap.
+    {
+        std::vector<Entry> ps;
+        ps.push_back(seatEntry(1, kSecond, 0xFFFFFFFEu));
+        ps.push_back(seatEntry(2, kNone, 0xFFFFFFFFu));
+        plan(ps, 0xFFFFFF00u, out);
+        CHECK(out.size() == 1 && ps[0].spawnAtTick == 2u);
+    }
+}
+
 // Server votes: who gets the vote line (again), ballots and the verdict.
 void testVote()
 {
@@ -1578,6 +1785,7 @@ int main()
     testFuzz();
     testChannel();
     testSpawnPlan();
+    testSeatOrder();
     testVote();
     std::printf("%d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;

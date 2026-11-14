@@ -42,6 +42,7 @@
 #include "EngineUtil.h"
 #include "Rotation.h"
 #include "Script.h"
+#include "SeatOrder.h"
 #include "Vote.h"
 
 using namespace dice::hfe;
@@ -195,10 +196,16 @@ public:
           m_projectileEvents(false), m_fireEvents(false), m_weaponEvents(false), m_firesDropped(0), m_replay(false),
           m_collisionsThisTick(0), m_collisionsDropped(0), m_tracesSent(0), m_tracesSkipped(0), m_r4(false),
           m_voteHook(false), m_voteRequest(0), m_voteReposts(0), m_selfPost(-1), m_selfSeen(false),
-          m_scripts(this), m_scriptEventsDropped(0), m_eventsSent(0), m_eventsDropped(0), m_commands(0)
+          m_scripts(this), m_scriptEventsDropped(0), m_seatPrefCount(0), m_seatDelays(0), m_seatProbes(0),
+          m_eventsSent(0), m_eventsDropped(0), m_commands(0)
     {
         for (int i = 0; i < kCategories; ++i)
             m_bytes[i] = 0;
+        for (int i = 0; i < 256; ++i)
+        {
+            m_seatPref[i] = seat::kNone;
+            m_seatLogged[i] = SeatLogged();
+        }
     }
 
     bool init(ClassManager* cm, std::string& error)
@@ -274,6 +281,9 @@ public:
         m_tick = tick;
         m_collisionsThisTick = 0;
         processCommands();
+        // With or without a link: the preferences outlive it. After this tick's spawn pass, before the next.
+        if (m_seatPrefCount)
+            orderSeats();
         updateVote();
         if (m_session)
         {
@@ -357,6 +367,13 @@ public:
                 else
                     t.banned = true;
             }
+        }
+        if (eventId == SePlayerConnect || eventId == SePlayerDisconnect)
+        {
+            // Ids are reused: a seat preference belongs to the player that set it. Without a link too.
+            world::IPlayer* p = argPlayer(args, argc, 0);
+            if (p)
+                setSeatPreference(p->getId(), seat::kNone);
         }
         if (m_vote.running())
             voteRowsFromScriptEvent(eventId, args, argc);
@@ -671,6 +688,11 @@ private:
              static_cast<unsigned long long>(scripts.maxTickUs), static_cast<unsigned long long>(scripts.logsDropped),
              static_cast<unsigned long long>(m_scriptEventsDropped),
              m_cost.pct(0.5), m_cost.pct(0.99), m_cost.max());
+        if (m_seatPrefCount || m_seatDelays || m_seatProbes)
+            logf("tick %lu: admin: seat preferences %d set, %llu spawn delays, %llu tick probes this minute", m_tick,
+                 m_seatPrefCount, static_cast<unsigned long long>(m_seatDelays),
+                 static_cast<unsigned long long>(m_seatProbes));
+        m_seatDelays = m_seatProbes = 0;
         m_scriptEventsDropped = 0;
         m_firesDropped = 0;
         m_collisionsDropped = m_tracesSent = m_tracesSkipped = 0;
@@ -1057,7 +1079,8 @@ private:
             w.maxPlayers = clampU8(server.maxPlayers);
         }
         w.capabilities = (m_config.adminAllowConsole ? kCapConsole : 0) | (m_config.adminAllowObjects ? kCapObjects : 0) |
-                         (m_config.adminIdentity() ? kCapIdentity : 0) | (m_config.adminAllowScripts ? kCapScripts : 0);
+                         (m_config.adminIdentity() ? kCapIdentity : 0) | (m_config.adminAllowScripts ? kCapScripts : 0) |
+                         kCapSeatPreference;
         w.map = cp1252ToUtf8(m_game->getCurrentMapName());
         w.mode = cp1252ToUtf8(m_game->getCurrentMapGameMode());
         const int size = m_game->getCurrentMapSize();
@@ -2074,6 +2097,7 @@ private:
         case CmdStopScript: onStopScript(c); return;
         case CmdScriptMessage: onScriptMessage(c); return;
         case CmdListScripts: onListScripts(c); return;
+        case CmdSeatPreference: onSeatPreference(c); return;
         default:
             error(c.requestId, ErrUnknownType, "unexpected message type");
             return;
@@ -2138,6 +2162,125 @@ private:
         std::vector<uint8_t> f;
         encodeScriptList(f, c.requestId, scripts);
         reply(f);
+    }
+
+    // ---------------------------------------------------------------- seat preferences
+    // (docs/admin-channel-draft.md "Seat preferences"; the rule is seat::plan in SeatOrder.h)
+
+    static const char* seatName(uint8_t v)
+    {
+        return v == seat::kFirst ? "first seat" : v == seat::kSecond ? "second seat" : "none";
+    }
+
+    void setSeatPreference(int id, uint8_t preference)
+    {
+        if (id < 0 || id > 255)
+            return;
+        m_seatPrefCount += (preference != seat::kNone ? 1 : 0) - (m_seatPref[id] != seat::kNone ? 1 : 0);
+        m_seatPref[id] = preference;
+        m_seatLogged[id] = SeatLogged();
+    }
+
+    void onSeatPreference(const Command& c)
+    {
+        world::IPlayer* p = player(c.player);
+        if (!p)
+        {
+            error(c.requestId, ErrUnknownPlayer, "no such player");
+            return;
+        }
+        const uint8_t old = m_seatPref[c.player];
+        setSeatPreference(c.player, c.value8);
+        if (old != c.value8)
+            logf("tick %lu: admin: player %u '%s' seat preference %s (was %s), %d set", m_tick, c.player,
+                 cp1252ToUtf8(p->getName()).c_str(), seatName(c.value8), seatName(old), m_seatPrefCount);
+        ok(c.requestId);
+    }
+
+    // The engine's tick count (WorldPref::getTickCount), which has no getter the module can call. A dead
+    // player's getTimeToSpawn is (spawnAtTick - tick count) / 30 s, clamped at 0 (OpenBF2 Player.cpp:1567-1577),
+    // so any entry still waiting gives it exactly. When every entry is due, the first one is asked with a far
+    // spawnAtTick that is put back at once (main thread, nothing runs in between).
+    bool engineTick(uint32_t& now)
+    {
+        uint32_t far = m_seatEntries[0].spawnAtTick;
+        for (size_t i = 0; i < m_seatEntries.size(); ++i)
+        {
+            const float t = m_seatPlayers[i]->getTimeToSpawn();
+            if (t > 0.0f)
+            {
+                now = m_seatEntries[i].spawnAtTick - static_cast<uint32_t>(std::lround(static_cast<double>(t) * 30.0));
+                return true;
+            }
+            far = seat::later(far, m_seatEntries[i].spawnAtTick);
+        }
+        far += 65536;   // under 2^23 ticks ahead, so the float seconds still give whole ticks
+        world::IPlayer* p = m_seatPlayers[0];
+        p->setSpawnAtTick(far);
+        const float t = p->getTimeToSpawn();
+        p->setSpawnAtTick(m_seatEntries[0].spawnAtTick);
+        ++m_seatProbes;
+        if (!(t > 0.0f))
+            return false;   // overdue by more than 36 minutes: no spawn pass runs, nothing to order
+        now = far - static_cast<uint32_t>(std::lround(static_cast<double>(t) * 30.0));
+        return true;
+    }
+
+    // Every tick while a preference is set. The module's tick event is dispatched after gameLogic->update, so
+    // after this tick's spawn pass and before the next one (GameServer.cpp:2995-3001, ServerGameLogic.cpp:542).
+    void orderSeats()
+    {
+        m_seatEntries.clear();
+        m_seatPlayers.clear();
+        const std::list<world::IPlayer*>& players = m_players->getPlayers();
+        for (std::list<world::IPlayer*>::const_iterator it = players.begin(); it != players.end(); ++it)
+        {
+            world::IPlayer* p = *it;
+            if (!p || p->getIsAlive())
+                continue;
+            const int id = p->getId();
+            const int group = p->getSpawnGroup();
+            if (id < 0 || id > 255 || group <= 0)
+                continue;
+            seat::Entry e;
+            e.id = id;
+            e.team = p->getTeam();
+            e.group = group;
+            e.dead = true;
+            e.spawnAtTick = p->getSpawnAtTick();
+            e.preference = m_seatPref[id];
+            m_seatEntries.push_back(e);
+            m_seatPlayers.push_back(p);
+        }
+        if (!seat::anyPair(m_seatEntries))
+            return;
+        uint32_t now = 0;
+        if (!engineTick(now))
+            return;
+        seat::plan(m_seatEntries, now, m_seatPlan);
+        for (size_t k = 0; k < m_seatPlan.size(); ++k)
+        {
+            const seat::Delay& d = m_seatPlan[k];
+            for (size_t i = 0; i < m_seatEntries.size(); ++i)
+                if (m_seatEntries[i].id == d.player)
+                {
+                    m_seatPlayers[i]->setSpawnAtTick(d.to);
+                    break;
+                }
+            ++m_seatDelays;
+            SeatLogged& last = m_seatLogged[d.player];
+            if (last.after == d.after && last.afterTick == d.afterTick)
+                continue;   // the same wait, moved on while the teammate's spawn is due
+            last.after = d.after;
+            last.afterTick = d.afterTick;
+            world::IPlayer* x = player(static_cast<uint8_t>(d.player));
+            world::IPlayer* y = player(static_cast<uint8_t>(d.after));
+            logf("tick %lu: admin: seat order: player %d '%s' (%s) spawns after player %d '%s' (%s): spawn tick %u -> %u "
+                 "(+%d), teammate's %u, engine tick %u",
+                 m_tick, d.player, x ? cp1252ToUtf8(x->getName()).c_str() : "?", seatName(m_seatPref[d.player]), d.after,
+                 y ? cp1252ToUtf8(y->getName()).c_str() : "?", seatName(m_seatPref[d.after]), d.from, d.to,
+                 static_cast<int>(d.to - d.from), d.afterTick, now);
+        }
     }
 
     // script::World: the game as a script sees it. Called from inside m_scripts' entry points, on the
@@ -3132,6 +3275,21 @@ private:
 
     script::Host m_scripts;
     uint64_t m_scriptEventsDropped;
+
+    // Seat preferences ("Seat preferences" in the contract), by player id; kept across links and level loads.
+    struct SeatLogged
+    {
+        int after;           // the teammate of the last logged delay, -1 none
+        uint32_t afterTick;  // that teammate's spawnAtTick then
+        SeatLogged() : after(-1), afterTick(0) {}
+    };
+    uint8_t m_seatPref[256];
+    int m_seatPrefCount;
+    SeatLogged m_seatLogged[256];
+    std::vector<seat::Entry> m_seatEntries;
+    std::vector<world::IPlayer*> m_seatPlayers;
+    std::vector<seat::Delay> m_seatPlan;
+    uint64_t m_seatDelays, m_seatProbes;
 
     uint64_t m_eventsSent, m_eventsDropped, m_commands;
     double m_bytes[kCategories];

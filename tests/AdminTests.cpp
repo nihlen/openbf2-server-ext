@@ -780,6 +780,9 @@ std::vector<Case> validCommands()
     w.u32(38); w.u32(7); CASE(CmdStopScript);
     w.u32(39); w.u32(7); w.str("{\"altitude\":250}"); CASE(CmdScriptMessage);
     w.u32(40); CASE(CmdListScripts);
+    w.u32(41); w.u8(3); w.u8(1); CASE(CmdSeatPreference);
+    w.u32(42); w.u8(3); w.u8(0); CASE(CmdSeatPreference);
+    w.u32(43); w.u8(255); w.u8(255); CASE(CmdSeatPreference);
 #undef CASE
     return cs;
 }
@@ -822,6 +825,10 @@ void testCommandParsing()
         CHECK(cmd.target == 1 && cmd.value8 == 2 && cmd.seconds == 3600 && cmd.text == "tk");
         CHECK(parseCommand(cs[23].type, &cs[23].payload[0], cs[23].payload.size(), cmd, 0));
         CHECK(cmd.clock == 99);
+        CHECK(parseCommand(cs[40].type, &cs[40].payload[0], cs[40].payload.size(), cmd, 0));
+        CHECK(cmd.type == CmdSeatPreference && cmd.requestId == 41 && cmd.player == 3 && cmd.value8 == 1);
+        CHECK(parseCommand(cs[42].type, &cs[42].payload[0], cs[42].payload.size(), cmd, 0));
+        CHECK(cmd.requestId == 43 && cmd.player == 255 && cmd.value8 == 255);
     }
     // Bad values: well-formed, so Error 7 for that request, not a framing error.
     struct Bad { uint16_t type; std::vector<uint8_t> payload; };
@@ -905,6 +912,8 @@ void testCommandParsing()
     w.u32(1); w.u32(7); w.u8(1); w.u8(0); w.str("n"); w.str(""); w.str("1;\xC0\x80"); BAD(CmdStartScript);    // source not UTF-8
     w.u32(1); w.u32(7); w.str(std::string(8193, '1')); BAD(CmdScriptMessage);
     w.u32(1); w.u32(7); w.str("\xED\xA0\x80"); BAD(CmdScriptMessage);                                       // a surrogate
+    w.u32(1); w.u8(3); w.u8(2); BAD(CmdSeatPreference);                                                    // seat 2
+    w.u32(1); w.u8(3); w.u8(254); BAD(CmdSeatPreference);
 #undef BAD
     for (size_t i = 0; i < bads.size(); ++i)
     {
@@ -1657,7 +1666,7 @@ void testGolden()
 {
     const std::string path = std::string(SERVEREXT_FIXTURES) + "/admin-v1-golden.txt";
     std::map<std::string, std::vector<uint8_t> > golden = readGolden(path);
-    CHECK(golden.size() == 80);
+    CHECK(golden.size() == 82);
     if (golden.empty())
     {
         std::printf("  no golden fixtures at %s\n", path.c_str());
@@ -1862,8 +1871,10 @@ void testGolden()
         CHECK(ok);
         parsed[it->first] = c;
     }
-    CHECK(parsed.size() == 33);
+    CHECK(parsed.size() == 35);
     Command c;
+    c = parsed["cmd_seat_preference"]; CHECK(c.type == CmdSeatPreference && c.requestId == 34 && c.player == 3 && c.value8 == 1);
+    c = parsed["cmd_seat_preference_none"]; CHECK(c.type == CmdSeatPreference && c.requestId == 35 && c.player == 3 && c.value8 == 255);
     c = parsed["cmd_start_script"]; CHECK(c.type == CmdStartScript && c.requestId == 30 && c.instance == 7 && c.value8 == 1 && c.flags == 0 && c.text == "nasa" && c.text2 == "{\"altitude\":300}" && c.source == "script.onTick(() => {});");
     c = parsed["cmd_stop_script"]; CHECK(c.type == CmdStopScript && c.requestId == 31 && c.instance == 7);
     c = parsed["cmd_script_message"]; CHECK(c.type == CmdScriptMessage && c.requestId == 32 && c.instance == 7 && c.text2 == "{\"altitude\":250}");

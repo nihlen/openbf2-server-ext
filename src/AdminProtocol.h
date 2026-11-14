@@ -60,6 +60,7 @@ enum Type : uint16_t
     CmdSetObjectActive = 0x1310, CmdSpawnObject = 0x1311, CmdDeleteObject = 0x1312, CmdStartVote = 0x1313,
     CmdCancelVote = 0x1314, CmdHudEventRaw = 0x1315, CmdRoundClock = 0x1316, CmdSquadOrder = 0x1317,
     CmdStartScript = 0x1318, CmdStopScript = 0x1319, CmdScriptMessage = 0x131A, CmdListScripts = 0x131B,
+    CmdSeatPreference = 0x131C,
     // replies
     MsgOk = 0x1401, MsgConsoleResult = 0x1402, MsgObjectList = 0x1403, MsgObjectSpawned = 0x1404,
     MsgScriptList = 0x1405,
@@ -79,6 +80,7 @@ const uint8_t kCapConsole = 1;
 const uint8_t kCapObjects = 2;
 const uint8_t kCapIdentity = 4;
 const uint8_t kCapScripts = 8;   // the script commands (docs/admin-channel-draft.md "Scripts")
+const uint8_t kCapSeatPreference = 16;   // SeatPreference (docs/admin-channel-draft.md "Seat preferences")
 
 // Subscribe streams.
 enum Stream : uint8_t
@@ -531,7 +533,7 @@ struct Command
     uint8_t flags;         // Teleport, SetHealth, KillPlayer, SetTeam, Rank flags; SetScore mask; StartVote minimum ballots;
                            // StartScript flags
     uint8_t value8;        // SetTeam team, Rank rank, GameEvent/HudEvent event, Ban duration, Subscribe rate, SpawnObject team,
-                           // StartVote percent, StartScript API version
+                           // StartVote percent, StartScript API version, SeatPreference seat
     int32_t ints[5];       // SetScore values; Medal medal and value; GameEvent/HudEvent data in [0]
     uint32_t seconds;      // Ban, StartVote
     uint16_t index;        // Map

@@ -19,6 +19,8 @@ Python 3 standard library plus the openssl command-line tool (certificate creati
   python3 adminclient.py --key <hex> --scenario script                  # scripts; with a bot also the host API
   python3 adminclient.py --key <hex> --scenario runscript --script-file x.js --script-args '{"a":1}' --seconds 20
   python3 adminclient.py --key <hex> --scenario scriptends              # a map change and a closed link end scripts
+  python3 adminclient.py --key <hex> --scenario seat                    # SeatPreference: capability, Ok, Error 4 and 7
+  python3 adminclient.py --key <hex> --scenario seat --seat-player 0 --seat 1 --seat-keep --seconds 600
 
 Scenarios: listen, commands, resync, stall, soak, wrongkey, mapchange, script and more. Port 16567 is refused.
 """
@@ -59,13 +61,15 @@ CMD_SET_OBJECT_ACTIVE, CMD_SPAWN_OBJECT, CMD_DELETE_OBJECT = 0x1310, 0x1311, 0x1
 CMD_START_VOTE, CMD_CANCEL_VOTE = 0x1313, 0x1314
 CMD_HUD_EVENT_RAW, CMD_ROUND_CLOCK, CMD_SQUAD_ORDER = 0x1315, 0x1316, 0x1317
 CMD_START_SCRIPT, CMD_STOP_SCRIPT, CMD_SCRIPT_MESSAGE, CMD_LIST_SCRIPTS = 0x1318, 0x1319, 0x131A, 0x131B
+CMD_SEAT_PREFERENCE = 0x131C
 OK, CONSOLE_RESULT, OBJECT_LIST, OBJECT_SPAWNED, SCRIPT_LIST = 0x1401, 0x1402, 0x1403, 0x1404, 0x1405
 PING, PONG, ERROR = 0x1501, 0x1502, 0xFFFF
 
 NAMES = {v: k for k, v in list(globals().items()) if isinstance(v, int) and k.isupper() and 0x1000 <= v <= 0xFFFF
          and k not in ("VERSION",)}
 EVENT_TYPES = range(0x1201, 0x121E)
-CAP_CONSOLE, CAP_OBJECTS, CAP_IDENTITY, CAP_SCRIPTS = 1, 2, 4, 8
+CAP_CONSOLE, CAP_OBJECTS, CAP_IDENTITY, CAP_SCRIPTS, CAP_SEAT_PREFERENCE = 1, 2, 4, 8, 16
+SEAT_FIRST, SEAT_SECOND, SEAT_NONE = 0, 1, 255
 VOTE_OUTCOMES = {1: "passed", 2: "failed", 3: "cancelled", 4: "level unload"}
 
 STREAMS = {"players": 1, "vehicles": 2, "projectiles": 3, "game": 4, "aim": 5, "damage": 16, "projectile-events": 17,
@@ -441,6 +445,9 @@ def p_hud_event_raw(req, player, event, payload=b""):
 def p_round_clock(req, player, seconds): return W().u32(req).i16(player).f32(seconds).b
 
 
+def p_seat_preference(req, player, seat): return W().u32(req).u8(player).u8(seat).b
+
+
 def p_start_script(req, instance, name, source, args="", api=1, flags=0):
     """args is JSON text, or empty for none; source is JavaScript."""
     return W().u32(req).u32(instance).u8(api).u8(flags).s(name).s(args).s(source).b
@@ -637,6 +644,8 @@ def golden_samples():
     s["ev_script_finished"] = (EV_SCRIPT_FINISHED, ev(28).u32(7).s("nasa").u8(1).s('{"ticks":90}').u32(90).u32(1234)
                                .u32(56).b)
     s["ev_script_event"] = (EV_SCRIPT_EVENT, ev(29).u32(7).u8(1).s('{"player":3,"y":301.5}').b)
+    s["cmd_seat_preference"] = (CMD_SEAT_PREFERENCE, p_seat_preference(34, 3, SEAT_SECOND))
+    s["cmd_seat_preference_none"] = (CMD_SEAT_PREFERENCE, p_seat_preference(35, 3, SEAT_NONE))
     return s
 
 
@@ -1039,6 +1048,109 @@ def scenario_r7(lst, args):
     c.check(r["name"] == "PONG" and r["clock"] == 77, "the server still ticks (Ping -> Pong)")
     c.summary("r7")
     return 0 if not c.failed else 1
+
+
+def scenario_seat(lst, args):
+    """SeatPreference (docs/admin-channel-draft.md "Seat preferences"): Welcome capability bit 4, Error 4 for no
+    such player, Error 7 for a seat that is not 0, 1 or 255, and Ok for a player on the server (--seat-player, else
+    the snapshot's first). With --seat-keep the preference is left set and the link held for --seconds, so a live
+    spawn can be watched in the server log ("seat order: ..."); without it the preference is cleared again."""
+    c = Checks()
+    link = lst.accept(args.accept_timeout)
+    rq = link.next_request
+    caps = link.welcome["caps"]
+    c.check(caps & CAP_SEAT_PREFERENCE, "Welcome capability bit 4 (SeatPreference) is set: caps %d" % caps)
+    ids = [p["id"] for p in link.snapshot["players"]]
+    missing = next(i for i in range(256) if i not in ids)
+    r = link.request(CMD_SEAT_PREFERENCE, p_seat_preference(rq(), missing, SEAT_SECOND))
+    c.check(r["name"] == "ERROR" and r["code"] == ERR_UNKNOWN_PLAYER, "SeatPreference for no player (%d) -> Error 4" % missing)
+    for bad in (2, 254):
+        r = link.request(CMD_SEAT_PREFERENCE, p_seat_preference(rq(), ids[0] if ids else missing, bad))
+        c.check(r["name"] == "ERROR" and r["code"] == ERR_INVALID, "SeatPreference seat %d -> Error 7" % bad)
+    target = args.seat_player if args.seat_player >= 0 else (ids[0] if ids else -1)
+    if target < 0:
+        log("no player on the server: the Ok path is not tested")
+    else:
+        r = link.request(CMD_SEAT_PREFERENCE, p_seat_preference(rq(), target, args.seat))
+        c.check(r["name"] == "OK", "SeatPreference player %d seat %d -> Ok" % (target, args.seat))
+        if args.seat_keep:
+            log("holding the link for %.0f s with player %d's preference set" % (args.seconds, target))
+            link.pump(args.seconds)
+        else:
+            r = link.request(CMD_SEAT_PREFERENCE, p_seat_preference(rq(), target, SEAT_NONE))
+            c.check(r["name"] == "OK", "SeatPreference player %d seat 255 (clear) -> Ok" % target)
+    if args.seat_pair:
+        seat_pair(link, c, args)
+    r = link.request(PING, p_ping(rq(), 78))
+    c.check(r["name"] == "PONG" and r["clock"] == 78, "the server still ticks (Ping -> Pong)")
+    return c.summary("seat")
+
+
+def seat_pair(link, c, args):
+    """--seat-pair: two bot-channel bots on one team with the same spawn group (their pad), killed in the same tick,
+    once without a preference and then with each kind. This goes through the engine's spawn pass, so it shows the
+    module moving a real spawnAtTick; it does not show seats (the bots spawn on foot)."""
+    rq = link.next_request
+    ids, teams, end = None, {}, time.time() + 60
+    while ids is None and time.time() < end:
+        link.request(REQUEST_SNAPSHOT, W().u32(rq()).b)   # the bots may come after the link
+        teams = {}
+        for p in bots_in(link.snapshot):
+            teams.setdefault(p["state"]["team"], []).append(p["id"])
+        ids = next((v[:2] for v in teams.values() if len(v) >= 2), None)
+        if ids is None:
+            link.pump(2.0)
+    if not c.check(ids is not None, "two bot-channel bots on one team (%s)" % teams):
+        return
+    a, b = ids
+    link.request(SUBSCRIBE, p_subscribe(rq(), 1, 10, []))
+
+    def alive(pid):
+        st = dict(link.last_player_stream["players"]).get(pid) if link.last_player_stream else None
+        return bool(st and st["life"] == 1)
+
+    def round_(label, prefs):
+        for pid in (a, b):
+            r = link.request(CMD_SEAT_PREFERENCE, p_seat_preference(rq(), pid, prefs.get(pid, SEAT_NONE)))
+            c.check(r["name"] == "OK", "%s: SeatPreference %d %d -> Ok" % (label, pid, prefs.get(pid, SEAT_NONE)))
+        end = time.time() + 40
+        while time.time() < end and not (alive(a) and alive(b)):
+            link.pump(0.3)
+        if not c.check(alive(a) and alive(b), "%s: both bots alive" % label):
+            return None
+        start = len(link.events)
+        ra, rb = rq(), rq()
+        link.send(CMD_KILL_PLAYER, p_kill(ra, a))   # back to back: run in the same tick
+        link.send(CMD_KILL_PLAYER, p_kill(rb, b))
+        deaths, spawns = {}, {}
+        end = time.time() + 60
+        while time.time() < end and len(spawns) < 2:
+            link.pump(0.3)
+            for m in link.events[start:]:
+                if m["type"] == EV_DEATH and m["player"] in (a, b):
+                    deaths.setdefault(m["player"], m["tick"])
+                elif m["type"] == EV_SPAWN and m["player"] in deaths:
+                    spawns.setdefault(m["player"], m["tick"])
+        c.check(len(deaths) == 2 and deaths[a] == deaths[b], "%s: both died in one tick %s" % (label, deaths))
+        if not c.check(len(spawns) == 2, "%s: both respawned %s" % (label, spawns)):
+            return None
+        log("%s: deaths %s, spawns %s" % (label, deaths, spawns))
+        return spawns
+
+    s = round_("no preference", {})
+    if s:
+        c.check(s[a] == s[b], "no preference: both spawn in the same pass (tick %d and %d)" % (s[a], s[b]))
+    s = round_("A second seat", {a: SEAT_SECOND})
+    if s:
+        c.check(s[a] >= s[b] + 3, "A (%d) wants the second seat: A spawns a pass after B (tick %d, B %d)" % (a, s[a], s[b]))
+    s = round_("B second seat", {b: SEAT_SECOND})
+    if s:
+        c.check(s[b] >= s[a] + 3, "B (%d) wants the second seat: B spawns a pass after A (tick %d, A %d)" % (b, s[b], s[a]))
+    s = round_("B first seat", {b: SEAT_FIRST})
+    if s:
+        c.check(s[a] >= s[b] + 3, "B (%d) wants the first seat: A spawns a pass after B (tick %d, B %d)" % (b, s[a], s[b]))
+    for pid in (a, b):
+        link.request(CMD_SEAT_PREFERENCE, p_seat_preference(rq(), pid, SEAT_NONE))
 
 
 def scenario_vote(lst, args):
@@ -2284,7 +2396,7 @@ def main():
     ap.add_argument("--write-golden", default="", help="write the golden fixtures to this file and exit")
     ap.add_argument("--scenario", default="listen",
                     choices=["listen", "commands", "resync", "stall", "soak", "wrongkey", "wrongpin", "mapchange", "extras",
-                             "viewer", "replay", "vote", "r7", "script", "runscript", "scriptends"])
+                             "viewer", "replay", "vote", "r7", "script", "runscript", "scriptends", "seat"])
     ap.add_argument("--fuzz", action="store_true")
     ap.add_argument("--fuzz-rounds", type=int, default=24)
     ap.add_argument("--seed", type=int, default=1)
@@ -2311,6 +2423,11 @@ def main():
     ap.add_argument("--script-file", default="", help="runscript: the JavaScript file to run")
     ap.add_argument("--script-args", default="", help="runscript: the script's arguments, JSON text")
     ap.add_argument("--script-name", default="", help="runscript: the script's name (default: the file's)")
+    ap.add_argument("--seat-player", type=int, default=-1, help="seat: the player (default: the snapshot's first)")
+    ap.add_argument("--seat", type=int, default=SEAT_SECOND, help="seat: 0 first seat, 1 second seat, 255 none")
+    ap.add_argument("--seat-keep", action="store_true", help="seat: leave the preference set, hold the link --seconds")
+    ap.add_argument("--seat-pair", action="store_true",
+                    help="seat: with two bot-channel bots on one team, kill both in one tick and compare their respawns")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
     if args.write_golden:
@@ -2330,7 +2447,8 @@ def main():
                 "wrongpin": scenario_wrongpin, "mapchange": scenario_mapchange,
                 "extras": scenario_extras, "viewer": scenario_viewer, "replay": scenario_replay,
                 "vote": scenario_vote, "r7": scenario_r7, "script": scenario_script,
-                "runscript": scenario_runscript, "scriptends": scenario_scriptends}[args.scenario](lst, args)
+                "runscript": scenario_runscript, "scriptends": scenario_scriptends,
+                "seat": scenario_seat}[args.scenario](lst, args)
     except KeyboardInterrupt:
         return 130
 

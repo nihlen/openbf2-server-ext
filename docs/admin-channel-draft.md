@@ -21,6 +21,9 @@ every tick in an embedded QuickJS-NG): capability bit 3, the commands `StartScri
 `ListScripts`, the reply `ScriptList` and the events `ScriptFinished` and `ScriptEvent` (the section "Scripts" at the
 end). No engine change; the version stays 1. **Module side implemented 2026-11-14** and tested on a WSL server:
 `docs/findings/scripts.md`.
+**Seat preferences approved by the author on 2026-11-14** (`.pilot`/`.gunner` in WebAdmin for an enter-on-spawn
+helicopter): capability bit 4 and the command `SeatPreference` (the section "Seat preferences" at the end). No engine
+change; the version stays 1. **Implemented 2026-11-14.**
 The author has decided that the BF2WebAdmin C# side may change as much as needed, and that the
 author keeps deployments from running `mm_webadmin.py` and the native channel at the same time.
 Evidence for the engine side: `docs/findings/admin-channel-a1-a4.md`. Inventory of today's
@@ -334,7 +337,7 @@ Pm = HMAC-SHA256(K, T("OBF2-ADMIN-1 server"))
 | `u16` | game port (`sv.serverPort`) |
 | `u16` | GameSpy query port (`sv.gameSpyPort`) |
 | `u8` | maximum players (`sv.maxPlayers`) |
-| `u8` | capabilities: bit 0 `Console` allowed, bit 1 `SpawnObject`/`DeleteObject` allowed, bit 2 IPs and CD-key hashes are sent, bit 3 scripts can be run ("Scripts" below) |
+| `u8` | capabilities: bit 0 `Console` allowed, bit 1 `SpawnObject`/`DeleteObject` allowed, bit 2 IPs and CD-key hashes are sent, bit 3 scripts can be run ("Scripts" below), bit 4 the module accepts `SeatPreference` ("Seat preferences" below) |
 | string | current map name |
 | string | current game mode |
 | `u16` | current map size (`IGame::getCurrentMapSize`) |
@@ -763,6 +766,7 @@ request id) unless a typed result is listed. Failure is `Error` with the request
 | `0x1319` | StopScript | `u32` instance | `Ok`, then `ScriptFinished` with reason 2; `Error` 5 no such script |
 | `0x131A` | ScriptMessage | `u32` instance, string message (JSON text, at most 8192 bytes) | `Ok` once the script's message handlers have run; `Error` 5 no such script; `Error` 7 not JSON |
 | `0x131B` | ListScripts | nothing after the request id | `ScriptList` |
+| `0x131C` | SeatPreference | `u8` player, `u8` seat: 0 the first seat (a helicopter's pilot), 1 the second seat (its gunner), 255 none (clears it) | `Ok`; `Error` 4 no such player; `Error` 7 any other seat value. Sent only when `Welcome` capability bit 4 is set |
 
 **`0x1402 ConsoleResult`**: `u32` request id, `u8` flags (bit 0 output truncated at 256 KiB), `u16`
 line count L, L × string. The output of `Console::executeLine` split at `\n`, without the final
@@ -849,6 +853,11 @@ server's `serverext.cfg`.
   template is `Error` 5.
 - **DeleteObject**: `ObjectManager::destroyObject`, what `object.delete` runs. The module refuses
   (`Error` 6) a soldier, a camera, or a vehicle with a player in it.
+- **SeatPreference**: stores the player's preference in the module, by player id; nothing else happens until the
+  player and a teammate are dead with the same spawn group, when the module may move the player's spawn tick
+  ("Seat preferences" below). A seat value other than 0, 1 or 255 is `Error` 7 whether or not the player exists.
+  Setting the value a player already has is `Ok`. The preference is dropped when that player connects or
+  disconnects (ids are reused) and is kept across admin links, level loads and team changes.
 
 ### Configuration (`serverext.cfg`)
 
@@ -1197,3 +1206,97 @@ turn of yaw a second), a map change with a script running, and WebAdmin's old wa
 `adminAllowScripts 0`. Results and costs: `docs/findings/scripts.md`. **Not tested:** what a client sees of any of it (no human
 client; a body moved by `setVelocity` is predicted by its own pilot's client, so that pilot may see corrections),
 more than one player per script on a live server, a server under load, and a Windows build.
+
+## Seat preferences (approved 2026-11-14, implemented 2026-11-14)
+
+On `dalian_2_v_2` each base has a spawn point that puts a player straight into the attack helicopter (`setEnterOnSpawn
+1`). Two teammates who die together and both have that spawn selected are spawned in the same spawn pass, and the
+engine seats them in player-list order: the first gets seat 0 (pilot), the second the next free seat (gunner). With
+`SeatPreference` a player chooses; one player's preference is enough, the teammate needs none. No engine change: the
+module only moves a dead player's spawn tick, through `IPlayer`'s typed virtual calls.
+
+**The engine (OpenBF2 `serverext/r1`).**
+
+- *Tick count.* `WorldPref::getTickCount` advances once per `ServerGameLogic::uPlaying`, at its top
+  (`Game/GameLogic/ServerGameLogic.cpp:418`), and `uPlaying`'s common tail then runs the spawn pass
+  (`uPlayingSpawning`, `:542`).
+- *Spawn pass.* `uPlayingSpawning` (`ServerGameLogic.cpp:633-689`) first clears stale spawn-group choices, then, every
+  third call only (the function-local `static int spawnDelay`, `:661-665`, reset to 2 at `:688`), walks
+  `playerManager->getPlayers()` in list order and spawns every dead player whose `getSpawnAtTick()` is not after the
+  tick count (`:674`) and that has a spawn group (`:685-686`). A man-down player is killed first in the same walk
+  (`:677-684`).
+- *Spawn tick.* `killPlayer` sets `spawnAtTick` = tick count + spawn time × 30 (`:3479`, `:3511-3513`); a man-down
+  player gets the time left. Nothing else moves it while the player is dead, except a round start (`:750`),
+  `reSpawnPlayer` (`:1901`) and a revive (`:3965`).
+- *Seat.* `spawnPlayer` enters the soldier, then for an enter-on-spawn point calls `toggleEntryPoint(player, false)`
+  (`:2109-2113`), which looks for a seat with `BFfindEntryPoint` (`:1736-1737`). Its seat sweep walks the vehicle's
+  `getPcos()` map in ascending seat order and takes the first unoccupied seat
+  (`Game/Objects/Game/PlayerControlObjectHelpers.cpp:441-457`).
+- *Interfaces.* `IPlayer::getIsAlive`, `getSpawnAtTick`, `setSpawnAtTick`, `getTimeToSpawn` and `getSpawnGroup` are
+  virtual (`Game/Objects/IPlayer.h:65`, `:98-100`, `:125`). `setSpawnAtTick` only stores the value
+  (`Game/GameLogic/Player.cpp:1537-1540`), and the value is in the player's state sync to the clients
+  (`Player.cpp:3244`, `getStateSync`), so a client's spawn countdown follows a moved tick.
+- *Where the module runs.* The module's tick handler is an `EventManager` event (`docs/findings/engine-q1-q4.md`, Q1),
+  dispatched by `eventManager->processEvents` after `gameLogic->update` in `GameServer::simulateFrame`
+  (`Game/GameServer/GameServer.cpp:2995-3001`). So it runs after this tick's spawn pass, with the tick count that pass
+  saw, and the next pass sees that count plus 1 or more.
+
+**The rule** (`src/SeatOrder.h`, `seat::plan`; every module tick while any preference is set, with or without a
+link). Rank a first-seat preference 0, none 1, a second-seat preference 2. Let *now* be the tick count. For every two
+players X and Y that are both dead (not alive; a man-down player is alive), on the same team, with the same spawn
+group above 0, and rank(X) > rank(Y): let base = max(Y.spawnAtTick, now + 1); if X.spawnAtTick ≤ base + 2, set
+X.spawnAtTick = base + 3.
+
+- *Why it is enough.* Y is spawned by the first pass at or after base, which is at most base + 2 because passes are
+  three ticks apart; X is spawned by a pass at or after base + 3. So X is in a later pass than Y whatever the pass
+  phase, Y takes the first free seat and X the next.
+- *now + 1, not now.* The module runs after the pass of tick *now*, so a Y that is due (its tick passed) but still
+  dead is spawned by a pass after *now*. With base = max(Y.spawnAtTick, now) a Y whose spawn group was chosen after
+  that pass could share the pass at now + 3 with X. The rule also holds if the handler ran before the pass (it would
+  then be one tick more cautious than needed); the unit test models both.
+- *Order and fixed point.* Ranks are a strict order, so nothing cycles: the module settles rank 1 players, then rank 2
+  players against all lower ranks, and one call is a fixed point. While Y's tick is ahead nothing changes on later
+  ticks. While Y is due and waiting for the pass (at most three ticks), X is moved on every tick to stay three ahead;
+  that costs X nothing, since it could not join Y's pass anyway.
+- *Equal ranks* (both pilot, both gunner, both none) are left to the engine's order.
+- *X died first.* The rule does not ask when X died: a player who wants the second seat waits for a dead teammate
+  with a lower rank in the same group, up to that teammate's full spawn time. This is what one-sided preferences need
+  (the teammate without a preference must not take the pilot seat by being due first), and in a 2v2 the two die
+  together. A teammate who picks another spawn group, or whose group is cleared, releases X at once.
+- *The tick count.* No `IServerExtension` getter returns it, and the engine exports no symbols. The module derives it
+  from a dead player still waiting: `getTimeToSpawn` is (spawnAtTick − tick count) / 30 s, clamped at 0
+  (`Player.cpp:1567-1577`), so now = spawnAtTick − round(30 × getTimeToSpawn). When every such player is already due,
+  the module sets the first one's tick 65536 ticks past the largest, reads `getTimeToSpawn`, and puts the tick back
+  at once (main thread, nothing runs in between).
+- *Logging.* Each new wait is logged: `tick N: admin: seat order: player X 'name' (second seat) spawns after player
+  Y 'name' (none): spawn tick A -> B (+d), teammate's C, engine tick T`. The moves while Y is due are not logged
+  again. The minute stats add a line with the preferences set, the moves and the tick probes when any is non-zero.
+- *Cost.* Nothing while no preference is set. Otherwise one walk of the player list and a pairwise check of the dead
+  players in a spawn group, with vectors the module keeps; no allocation per tick once they have grown.
+
+**Lifetime.** A preference is kept by player id in the module: across admin links (WebAdmin need not resend it after
+a reconnect, though doing so is harmless), level loads and team changes. It is dropped when a player with that id
+connects or disconnects (script events 14 and 15, seen with or without a link).
+
+**Availability.** `Welcome` capability bit 4 is always set by a module that has the command. WebAdmin sends
+`SeatPreference` only then: an older module answers an unknown type with `Error` 3 and closes the link.
+
+**Tested (2026-11-14).** Unit tests (`serverext_tests`, `testSeatOrder`): `seat::plan` against a model of the spawn pass
+and the seat sweep, for every pass phase, both list orders and the handler before or after the pass: one preference
+only (second seat, first seat), opposite preferences, equal preferences, another team, another group, no group, a live
+teammate, already a pass later, a player who died first, due (overdue) ticks, three ranks, idempotence over the
+following ticks and a wrapping tick counter. Codec (`serverext_admin_tests`): valid frames, seats 2 and 254
+(`Error` 7), every truncation and one extra byte, and the golden frames `cmd_seat_preference` and
+`cmd_seat_preference_none`. Live, on a WSL server (OpenBF2 `serverext/r1` working tree on `824d4dc` as in "Scripts",
+`dalian_2_v_2`, ports 16587/29911/16737/16738, `adminTls 0`) with `adminclient.py --scenario seat --seat-pair` and two
+bot-channel bots on team 1 (spawn group 3, their pad; on foot, so this shows the spawn order, not seats): capability
+bit 4 is set, `Error` 4 for no player, `Error` 7 for seats 2 and 254, `Ok` set and clear; both bots killed in one tick
+respawn in the same pass without a preference, and with one (second seat on either bot, or first seat on the other)
+the later one respawns exactly one pass (3 ticks) after its teammate, with the module's log line; the engine tick it
+derived matched (the spawn tick less `sv.spawnTime`). **Not tested:** seats (no two human clients), the tick probe
+(every entry already due) and a disconnect dropping a preference on a live server.
+
+**Out of scope.** Seats after the second (a third teammate with no preference is ordered like the others, but nobody
+can ask for seat 2), and man-down players: they are alive when the module looks, and the pass that ends their
+man-down state can spawn them at once (`ServerGameLogic.cpp:677-686`). The rule does not look at the spawn point
+itself: in a group without an enter-on-spawn point it only delays the later player by a pass or two.

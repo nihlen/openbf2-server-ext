@@ -202,6 +202,7 @@ protocol.md "Testing". Their run dirs are agent-owned (`~/serverext-<task>/srv`)
 | 16571, 29903, 4723, bot 16701 (WSL) / 16702 (Docker) | `testenv/` servers | 16700 is held by a stale `wslrelay`: leave it |
 | 16703, 16710, 16573, 29905, 4725 | used by the admin-channel phase-1 WSL runs | |
 | 16585/udp, 29909/udp, 4729, 16735, 16736 | used by the scripts WSL runs (findings/scripts.md) | run dir `~/serverext-scripts`, stopped |
+| 16587/udp, 29911/udp, 4731, 16737, 16738 | used by the seat-preference WSL run (admin-channel-draft.md "Seat preferences") | run dir `~/serverext-seatpref`, stopped |
 | 55124, 55126/udp | VoIP inside each server | two WSL servers at once collide; containers do not |
 
 ## Which test proves what

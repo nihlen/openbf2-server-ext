@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstring>
 
+#include "SeatOrder.h"
 #include "Vote.h"
 
 namespace serverext {
@@ -1056,7 +1057,7 @@ bool isWebAdminMessage(uint16_t type)
     case CmdSetScore: case CmdRank: case CmdMedal: case CmdGameEvent: case CmdHudEvent: case CmdKick: case CmdBan:
     case CmdMap: case CmdListObjects: case CmdSetObjectActive: case CmdSpawnObject: case CmdDeleteObject:
     case CmdStartVote: case CmdCancelVote: case CmdHudEventRaw: case CmdRoundClock: case CmdSquadOrder:
-    case CmdStartScript: case CmdStopScript: case CmdScriptMessage: case CmdListScripts:
+    case CmdStartScript: case CmdStopScript: case CmdScriptMessage: case CmdListScripts: case CmdSeatPreference:
     case MsgPing: case MsgPong: case MsgError:
         return true;
     default:
@@ -1391,6 +1392,15 @@ bool parseCommand(uint16_t type, const uint8_t* p, size_t n, Command& out, std::
         out.requestId = r.u32();
         out.instance = r.u32();
         return r.done();
+
+    case CmdSeatPreference:
+        out.requestId = r.u32();
+        out.player = r.u8();
+        out.value8 = r.u8();
+        if (!r.done())
+            return false;
+        return seat::validPreference(out.value8) ? true
+                                                 : bad(badValue, "seat must be 0 (first), 1 (second) or 255 (none)");
 
     case CmdScriptMessage:
     {
