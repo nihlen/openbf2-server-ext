@@ -67,7 +67,7 @@ add_library(serverext_admin_io STATIC src/AdminIo_posix.cpp)
 target_link_libraries(serverext_admin_io PUBLIC serverext_core OpenSSL::SSL OpenSSL::Crypto)
 target_compile_options(serverext_admin_io PRIVATE ${SERVEREXT_COMMON_FLAGS})
 
-# QuickJS-NG, unmodified (third_party/quickjs-ng/README.md), built as its own CMakeLists.txt builds
+# QuickJS-NG with one local change (third_party/quickjs-ng/README.md), built as its own CMakeLists.txt builds
 # the library: C11 with GNU extensions, _GNU_SOURCE, unsigned char and its warning set. NDEBUG in
 # every build type: its asserts must never abort a game server. Hidden visibility keeps its JS_*
 # symbols out of libserverext.so's exports.
@@ -78,7 +78,10 @@ add_library(serverext_qjs STATIC
     "${SERVEREXT_QJS_DIR}/libunicode.c"
     "${SERVEREXT_QJS_DIR}/quickjs.c")
 set_target_properties(serverext_qjs PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON C_EXTENSIONS ON)
-target_compile_definitions(serverext_qjs PRIVATE _GNU_SOURCE QUICKJS_NG_BUILD NDEBUG)
+# JS_INTERRUPT_COUNTER_INIT: how many loop rounds and calls pass between two checks of a script's time budget
+# (upstream 10000; the one local change in quickjs.c makes it settable). 100 keeps a loop around a slow built-in
+# from running far past the budget.
+target_compile_definitions(serverext_qjs PRIVATE _GNU_SOURCE QUICKJS_NG_BUILD NDEBUG JS_INTERRUPT_COUNTER_INIT=100)
 target_compile_options(serverext_qjs PRIVATE
     -Wall -Wextra -Wformat=2 -Wno-implicit-fallthrough -Wno-sign-compare -Wno-missing-field-initializers
     -Wno-unused-parameter -Wno-unused-but-set-variable -Wno-unused-result -Wno-stringop-truncation -Wno-array-bounds

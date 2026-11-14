@@ -9,8 +9,11 @@ The JavaScript engine of the admin channel's scripts (`src/Script.cpp`, `docs/ad
 | Tarball sha256 | `28bcd89aa3683fd2a946537e5ce3f11cc46b5cbf3383c7561aaef3df5ff9f1dd` |
 | License | MIT (`LICENSE`) |
 
-The files are the tarball's, byte for byte (`.gitattributes` here turns line-ending conversion off). Only what the
-library itself needs is here:
+The files are the tarball's, byte for byte (`.gitattributes` here turns line-ending conversion off), with one local
+change: in `quickjs.c` the line `#define JS_INTERRUPT_COUNTER_INIT 10000` is wrapped in `#ifndef`/`#endif`, so the
+build can set how often a script's time budget is checked (`CMakeLists.txt` sets 100; with 10000 a loop around a slow
+built-in runs far past the budget, `docs/findings/scripts.md` "Limits of the limits"). Only what the library itself
+needs is here:
 
 - sources: `quickjs.c`, `dtoa.c`, `libregexp.c`, `libunicode.c`
 - headers: `quickjs.h`, `quickjs-atom.h`, `quickjs-opcode.h`, `quickjs-c-atomics.h`, `cutils.h`, `dtoa.h`,
@@ -28,10 +31,10 @@ plus `NDEBUG` in every build type and hidden visibility.
 ## Updating
 
 1. Download the new tag's tarball and check it against the release.
-2. Replace the files above with the tarball's (check `quickjs.c`'s `#include "..."` lines for new headers) and update
-   this table.
+2. Replace the files above with the tarball's (check `quickjs.c`'s `#include "..."` lines for new headers), make the
+   one local change again, and update this table.
 3. Run the unit tests (`serverext_script_tests` covers what the script host relies on: the limits, the interrupt
    handler, what the language has and has not) and `tools/adminclient/adminclient.py --scenario script` against a
    test server.
 
-Do not edit the files. A change the module needs belongs in `src/Script.cpp` or upstream.
+Do not edit the files beyond that. A change the module needs belongs in `src/Script.cpp` or upstream.

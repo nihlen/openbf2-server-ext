@@ -67,7 +67,8 @@ public:
     std::vector<Event> events;
     std::vector<Finished> finished;
     uint32_t tickNumber;
-    bool fakeClock;        // every cpuMicros() call advances a fake clock by fakeStep
+    bool fakeClock;        // a fake CPU clock that every game.say of a script advances by fakeStep (the budget
+                           // check reads the clock at times the tests cannot count, so reading never advances it)
     uint64_t fakeNow, fakeStep;
 
     virtual void players(std::vector<int>& ids)
@@ -113,16 +114,18 @@ public:
     }
     virtual bool setVelocity(int id, const float v[3]) { return speed(id, v, false); }
     virtual bool setAngularVelocity(int id, const float v[3]) { return speed(id, v, true); }
-    virtual void say(const std::string& text, int player) { says.push_back(std::make_pair(text, player)); }
+    virtual void say(const std::string& text, int player)
+    {
+        says.push_back(std::make_pair(text, player));
+        if (fakeClock)
+            fakeNow += fakeStep;
+    }
     virtual std::string map() { return "dalian_2_v_2"; }
     virtual uint32_t tick() { return tickNumber; }
     virtual double time() { return tickNumber / 30.0; }
     virtual uint64_t cpuMicros()
     {
-        if (!fakeClock)
-            return threadCpuMicros();
-        fakeNow += fakeStep;
-        return fakeNow;
+        return fakeClock ? fakeNow : threadCpuMicros();
     }
     virtual void log(uint32_t instance, const std::string& name, const std::string& line)
     {
@@ -475,9 +478,10 @@ void testTimeBudget()
     }
     {
         // The budget is checked where QuickJS polls for interrupts: at loop back-edges and calls of
-        // script code, once per 10000 of them. A loop whose every round spends long inside one
-        // built-in is therefore ended later than a loop of script code (printed, and bounded here
-        // for two built-ins that take a few microseconds a round).
+        // script code, once per JS_INTERRUPT_COUNTER_INIT of them (100 in this build, CMakeLists.txt).
+        // A loop whose every round spends its time inside one built-in is therefore ended a little
+        // later than a loop of script code (printed, and bounded here for two built-ins that take a
+        // few microseconds a round).
         const struct { const char* what; const char* body; } loops[] = {
             { "JSON.stringify of 40 numbers", "JSON.stringify(data);" },
             { "a 4 KiB typed-array fill", "bytes.fill(1);" },
@@ -497,6 +501,28 @@ void testTimeBudget()
         }
     }
     {
+        // One built-in call is never interrupted; what it can cost is bounded by the memory limit,
+        // which a large call runs into first. Measured for arrays of numbers that are sorted (as
+        // strings: the default order), joined and written as JSON, each in a single call (printed).
+        const int sizes[] = { 5000, 20000, 100000 };
+        for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); ++i)
+        {
+            Fixture f;
+            char source[320];
+            std::snprintf(source, sizeof(source),
+                          "const big = Array.from({ length: %d }, (_, i) => (i * 7919) %% 100003);\n"
+                          "script.onTick(() => { big.sort(); big.join(','); JSON.stringify(big); });", sizes[i]);
+            CHECK(f.start(1, source) == Ok);
+            const std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+            f.tick();
+            const double ms = wallMs(t0);
+            CHECK(ms < 2000.0);
+            std::printf("  sort, join and JSON.stringify of %d numbers in one tick: %.1f ms, %s\n", sizes[i], ms,
+                        f.world.finished.empty() ? "the script goes on"
+                                                 : f.world.finished[0].result.substr(0, 60).c_str());
+        }
+    }
+    {
         // The top-level code has 50 ms; running over it is a failed start.
         Fixture f;
         const std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
@@ -509,7 +535,7 @@ void testTimeBudget()
         Fixture f;
         f.world.fakeClock = true;
         f.world.fakeStep = 0;
-        CHECK(f.start(1, "script.onTick(() => {});") == Ok);
+        CHECK(f.start(1, "script.onTick(() => { game.say('work'); });") == Ok);
         f.world.fakeStep = 2000;
         f.tick(15);
         CHECK(f.host.count() == 1);   // 30 ms exactly
@@ -526,7 +552,7 @@ void testTimeBudget()
         // 1 ms per tick never ends it, and time older than 30 ticks is forgotten.
         Fixture f;
         f.world.fakeClock = true;
-        CHECK(f.start(1, "script.onTick(() => {});") == Ok);
+        CHECK(f.start(1, "script.onTick(() => { game.say('work'); });") == Ok);
         f.world.fakeStep = 1000;
         f.tick(100);
         CHECK(f.host.count() == 1);

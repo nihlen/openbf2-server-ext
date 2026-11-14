@@ -9,7 +9,7 @@ side (the TypeScript sources, their build and the C# runner) is in that repo.
 
 | Item | Where |
 |---|---|
-| QuickJS-NG v0.18.0, unmodified | `third_party/quickjs-ng/` (its `README.md` has the source, the sha256 and how to update); the static library `serverext_qjs` |
+| QuickJS-NG v0.18.0, with one line changed (the budget check interval is settable) | `third_party/quickjs-ng/` (its `README.md` has the source, the sha256 and how to update); the static library `serverext_qjs` |
 | The script host | `src/Script.h`, `src/Script.cpp`: engine-free, one QuickJS runtime and context per script, the `script` and `game` objects, the life cycle, the limits. It reaches the game only through `script::World` |
 | The engine side | `src/Admin.cpp`: the four commands, `script::World` on the engine (the bodies of the `Teleport` and `Say` commands, `IPhysicsNode::setPositionalSpeed` and `setRotationalSpeed` with `setIsAwake`), the scripts' tick after the tick's commands, level unload, link down, capability bit 3, a `scripts ...` part in the stats line |
 | Codec and config | `src/AdminProtocol.*` (types `0x1318`-`0x131B`, `0x1405`, `0x121C`, `0x121D`, `kCapScripts`), `src/Config.*` (`adminAllowScripts`, default 1) |
@@ -25,8 +25,9 @@ How the pieces of the contract were built that it leaves open:
   `JS_NewContextRaw` plus `JS_AddIntrinsicBaseObjects`, `JSON`, `MapSet`, `TypedArrays` and `Promise`. The bytecode
   never leaves the process, so reading it is safe.
 - **The time budget** is the runtime's interrupt handler, which compares `CLOCK_THREAD_CPUTIME_ID` with the call's
-  deadline. QuickJS calls it once per 10000 polls (loop back-edges and calls of script code, and some loops inside its
-  built-ins). An interruption cannot be caught by the script. After every call the host also compares the time the call
+  deadline. QuickJS calls it once per `JS_INTERRUPT_COUNTER_INIT` polls (loop back-edges and calls of script code, and
+  some loops inside its built-ins): 100 in this build, set in `CMakeLists.txt`. Upstream's 10000 is the one line of
+  `quickjs.c` that is changed, to make it settable. An interruption cannot be caught by the script. After every call the host also compares the time the call
   took with its budget, and the sum over the last 30 ticks with 30 ms.
 - **Unhandled rejections**: the runtime's rejection tracker remembers a rejected promise until a handler is attached;
   what is left when the call's promise jobs have run ends the script (reason 3).
@@ -95,13 +96,16 @@ For comparison the admin channel without scripts costs 20 to 40 µs per tick at 
 
 ## Limits of the limits
 
-- **The time budget stops mistakes, not attacks.** It is checked where QuickJS polls: an endless `for (;;) {}` ends
-  after 5.0 ms and an endless `indexOf` over a sparse array of 2^32 elements after 5.1 ms, but a loop whose every
-  round is one long built-in call is only checked every 10000 rounds: 23 ms around `JSON.stringify` of 40 numbers,
-  5.2 ms around a 4 KiB `fill`. A script written to stall (a loop around a sort of a large array) can hold the main
-  thread for seconds before it is ended. Fixing that needs a smaller poll interval inside `quickjs.c`
-  (`JS_INTERRUPT_COUNTER_INIT`, not configurable from outside), that is a patched QuickJS, which this change does
-  not do. Scripts come only from WebAdmin over the authenticated link, the same trust the `Console` command has.
+- **The time budget stops mistakes, not attacks.** It is checked where QuickJS polls, every 100 loop rounds and calls
+  of script code. Measured with that interval: an endless `for (;;) {}` ends after 5.0 ms, an endless `indexOf` over
+  a sparse array of 2^32 elements after 5.1 ms, and endless loops around `JSON.stringify` of 40 numbers or a 4 KiB
+  `fill` after 5.1 to 5.7 ms. With upstream's interval of 10000 (the first build of this change) the
+  `JSON.stringify` loop ran 23 ms, and a loop around a slower built-in would have run far longer, which is why the
+  interval was lowered. One built-in call is never interrupted: what it can cost is bounded by the 4 MiB memory
+  limit. Sorting, joining and writing as JSON an array of numbers in one tick took 1.2 ms for 5000 numbers and 5.6 ms
+  for 20000 (which ends the script for the time it took); 100000 run out of memory first. So a script can still cost
+  one tick some milliseconds too many, and is then ended. Scripts come only from WebAdmin over the authenticated
+  link, the same trust the `Console` command has.
 - **Wall time is not counted**, only the main thread's CPU time, so a descheduled server thread does not end a script
   and a script cannot block: there is nothing in the API that waits.
 - **`log` writes to the module's log on the main thread**, at most 16 lines per script and tick.

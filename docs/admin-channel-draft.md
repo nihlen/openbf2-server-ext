@@ -1133,11 +1133,13 @@ As implemented:
   one `ScriptMessage`, or all stop handlers, each with the promise jobs they leave. `ScriptFinished` counts these. The
   top-level code is not part of the 30-tick sum.
 - **The budget is a guard against mistakes, not against a hostile author.** QuickJS checks for an interruption at
-  loop back-edges and calls of script code, once per 10000 of them, and in some loops of its built-ins. An endless
-  `for (;;) {}` ends after 5.0 ms and an endless `indexOf` over a 2^32-element sparse array after 5.1 ms, but a loop
-  whose every round spends its time inside one built-in call ends after about 10000 rounds: 23 ms around a
-  `JSON.stringify` of 40 numbers (measured), and longer the slower the built-in is. A call that came back by itself
-  after more than its budget ends the script too (reason 4). Whoever can start a script holds the admin key.
+  loop back-edges and calls of script code, once per 100 of them in this build (`JS_INTERRUPT_COUNTER_INIT`; upstream
+  has 10000, with which a loop around `JSON.stringify` of 40 numbers ran 23 ms), and in some loops of its built-ins.
+  Measured: an endless `for (;;) {}` ends after 5.0 ms, an endless `indexOf` over a 2^32-element sparse array after
+  5.1 ms, and endless loops around a `JSON.stringify` of 40 numbers or a 4 KiB `fill` after 5.1 to 5.7 ms. One
+  built-in call is never interrupted; the memory limit bounds what it can cost (sorting, joining and writing as JSON
+  20000 numbers in one tick: 5.6 ms; 100000 numbers run out of memory first). A call that came back by itself after
+  more than its budget ends the script too (reason 4). Whoever can start a script holds the admin key.
 - `finish`'s result is at most 60000 bytes of JSON; more throws a `RangeError`.
 - The memory a script uses before it has allocated anything of its own is about 175 KiB.
 

@@ -555,7 +555,9 @@ enum {
 
 /* must be large enough to have a negligible runtime cost and small
    enough to call the interrupt callback often. */
+#ifndef JS_INTERRUPT_COUNTER_INIT /* openbf2-server-ext: settable from the build, see README.md */
 #define JS_INTERRUPT_COUNTER_INIT 10000
+#endif
 
 struct JSContext {
     JSGCObjectHeader header; /* must come first */
