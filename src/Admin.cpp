@@ -345,6 +345,7 @@ public:
             m_projectiles.clear();
             m_fires.clear();
             m_traces.clear();
+            m_collisionOff.clear();   // the level's objects go with it
             logf("tick %lu: admin: level unload; control points and projectiles forgotten", m_tick);
             return;
         }
@@ -375,6 +376,8 @@ public:
             if (p)
                 setSeatPreference(p->getId(), seat::kNone);
         }
+        if (eventId == SeVehicleDestroyed && !m_collisionOff.empty())
+            forgetCollision(rootOf(argObject(args, argc, 0)));   // without a link too
         if (m_vote.running())
             voteRowsFromScriptEvent(eventId, args, argc);
         if (!m_session)
@@ -1080,7 +1083,7 @@ private:
         }
         w.capabilities = (m_config.adminAllowConsole ? kCapConsole : 0) | (m_config.adminAllowObjects ? kCapObjects : 0) |
                          (m_config.adminIdentity() ? kCapIdentity : 0) | (m_config.adminAllowScripts ? kCapScripts : 0) |
-                         kCapSeatPreference;
+                         kCapSeatPreference | kCapSetCollision;
         w.map = cp1252ToUtf8(m_game->getCurrentMapName());
         w.mode = cp1252ToUtf8(m_game->getCurrentMapGameMode());
         const int size = m_game->getCurrentMapSize();
@@ -2098,6 +2101,7 @@ private:
         case CmdScriptMessage: onScriptMessage(c); return;
         case CmdListScripts: onListScripts(c); return;
         case CmdSeatPreference: onSeatPreference(c); return;
+        case CmdSetCollision: onSetCollision(c); return;
         default:
             error(c.requestId, ErrUnknownType, "unexpected message type");
             return;
@@ -3144,6 +3148,92 @@ private:
         ok(c.requestId);
     }
 
+    // SetCollision (docs/admin-channel-draft.md "Command semantics"): the root object and every descendant, walked as
+    // the engine's world::updateFlagsRecursive does (OpenBF2 Scene/Object/ObjectUtil.cpp:172-177), with
+    // IObject::updateFlags on OFHasCollision; Object::updateFlags then adds the object to or removes it from the
+    // response physics (Scene/Object/Object.cpp:858-867). Off clears the bit where it is set and remembers those
+    // objects; on sets it only on objects this module cleared, so parts that never collided stay as they were. A
+    // remembered pointer is only compared, never followed: the walk reaches live objects only. A destroyed vehicle's
+    // records are dropped: its wreck keeps the collision the engine gives it (ArmorGLComp::setUseDestroyedCollision,
+    // Game/Objects/GameLogicComp/ArmorGLComp.cpp:780-791).
+    static const size_t kMaxCollisionOff = 16384;
+    static const int kMaxCollisionWalk = 4096;
+
+    void collisionWalk(IObject* root, IObject* o, bool on, int depth, int& walked, int& changed)
+    {
+        ++walked;
+        const bool has = (o->getFlags() & IObject::OFHasCollision) != 0;
+        if (on)
+        {
+            if (m_collisionOff.erase(o) && !has)
+            {
+                o->updateFlags(IObject::OFHasCollision, 0);
+                ++changed;
+            }
+        }
+        else if (has && m_collisionOff.size() < kMaxCollisionOff)
+        {
+            o->updateFlags(0, IObject::OFHasCollision);
+            m_collisionOff[o] = root;
+            ++changed;
+        }
+        if (depth >= 32)
+            return;
+        for (IObject* child = o->getChild(); child && walked < kMaxCollisionWalk; child = child->getSibling())
+            collisionWalk(root, child, on, depth + 1, walked, changed);
+    }
+
+    void forgetCollision(IObject* root)
+    {
+        if (!root)
+            return;
+        size_t n = 0;
+        for (std::map<IObject*, IObject*>::iterator it = m_collisionOff.begin(); it != m_collisionOff.end();)
+        {
+            if (it->second == root)
+            {
+                m_collisionOff.erase(it++);
+                ++n;
+            }
+            else
+                ++it;
+        }
+        if (n)
+            logf("tick %lu: admin: '%s' destroyed; %zu objects without collision forgotten, %zu left", m_tick,
+                 templateName(root).c_str(), n, m_collisionOff.size());
+    }
+
+    void onSetCollision(const Command& c)
+    {
+        uint16_t code;
+        const char* why = "";
+        IObject* o = resolve(c.ref, code, why);
+        if (!o)
+        {
+            error(c.requestId, code, why);
+            return;
+        }
+        IObject* root = rootOf(o);
+        if (root->getFlags() & kCachedObjectFlag)
+        {
+            error(c.requestId, ErrUnavailable, "the object is in the object cache");
+            return;
+        }
+        const bool on = (c.flags & 1) != 0;
+        if (!on && m_collisionOff.size() >= kMaxCollisionOff)
+        {
+            error(c.requestId, ErrRefused, "too many objects without collision until the next level");
+            return;
+        }
+        int walked = 0, changed = 0;
+        collisionWalk(root, root, on, 0, walked, changed);
+        logf("tick %lu: admin: collision %s for '%s' (net id %u, console id %u): %d of %d objects changed, %zu without "
+             "collision",
+             m_tick, on ? "on" : "off", templateName(root).c_str(), netIdOf(root), objectIdOf(root), changed, walked,
+             m_collisionOff.size());
+        ok(c.requestId);
+    }
+
     void onSpawnObject(const Command& c)
     {
         if (!m_config.adminAllowObjects)
@@ -3284,6 +3374,9 @@ private:
         SeatLogged() : after(-1), afterTick(0) {}
     };
     uint8_t m_seatPref[256];
+    // Objects whose collision SetCollision turned off (object -> its root then), until it turns them on, the root is
+    // destroyed or the level unloads.
+    std::map<IObject*, IObject*> m_collisionOff;
     int m_seatPrefCount;
     SeatLogged m_seatLogged[256];
     std::vector<seat::Entry> m_seatEntries;

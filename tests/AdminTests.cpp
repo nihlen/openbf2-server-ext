@@ -783,6 +783,9 @@ std::vector<Case> validCommands()
     w.u32(41); w.u8(3); w.u8(1); CASE(CmdSeatPreference);
     w.u32(42); w.u8(3); w.u8(0); CASE(CmdSeatPreference);
     w.u32(43); w.u8(255); w.u8(255); CASE(CmdSeatPreference);
+    w.u32(44); w.u8(1); w.u32(3); w.u8(0); CASE(CmdSetCollision);
+    w.u32(45); w.u8(2); w.u32(1819); w.u8(1); CASE(CmdSetCollision);
+    w.u32(46); w.u8(3); w.u32(29328); w.u8(0); CASE(CmdSetCollision);
 #undef CASE
     return cs;
 }
@@ -829,6 +832,12 @@ void testCommandParsing()
         CHECK(cmd.type == CmdSeatPreference && cmd.requestId == 41 && cmd.player == 3 && cmd.value8 == 1);
         CHECK(parseCommand(cs[42].type, &cs[42].payload[0], cs[42].payload.size(), cmd, 0));
         CHECK(cmd.requestId == 43 && cmd.player == 255 && cmd.value8 == 255);
+        CHECK(parseCommand(cs[43].type, &cs[43].payload[0], cs[43].payload.size(), cmd, 0));
+        CHECK(cmd.type == CmdSetCollision && cmd.requestId == 44 && cmd.ref.kind == RefPlayer && cmd.ref.id == 3 && cmd.flags == 0);
+        CHECK(parseCommand(cs[44].type, &cs[44].payload[0], cs[44].payload.size(), cmd, 0));
+        CHECK(cmd.requestId == 45 && cmd.ref.kind == RefNetId && cmd.ref.id == 1819 && cmd.flags == 1);
+        CHECK(parseCommand(cs[45].type, &cs[45].payload[0], cs[45].payload.size(), cmd, 0));
+        CHECK(cmd.requestId == 46 && cmd.ref.kind == RefConsoleId && cmd.ref.id == 29328 && cmd.flags == 0);
     }
     // Bad values: well-formed, so Error 7 for that request, not a framing error.
     struct Bad { uint16_t type; std::vector<uint8_t> payload; };
@@ -914,6 +923,10 @@ void testCommandParsing()
     w.u32(1); w.u32(7); w.str("\xED\xA0\x80"); BAD(CmdScriptMessage);                                       // a surrogate
     w.u32(1); w.u8(3); w.u8(2); BAD(CmdSeatPreference);                                                    // seat 2
     w.u32(1); w.u8(3); w.u8(254); BAD(CmdSeatPreference);
+    w.u32(1); w.u8(1); w.u32(3); w.u8(2); BAD(CmdSetCollision);                                          // flag bit 1
+    w.u32(1); w.u8(1); w.u32(3); w.u8(0x81); BAD(CmdSetCollision);
+    w.u32(1); w.u8(0); w.u32(3); w.u8(1); BAD(CmdSetCollision);                                          // kind 0
+    w.u32(1); w.u8(4); w.u32(3); w.u8(1); BAD(CmdSetCollision);                                          // kind 4
 #undef BAD
     for (size_t i = 0; i < bads.size(); ++i)
     {
@@ -1666,7 +1679,7 @@ void testGolden()
 {
     const std::string path = std::string(SERVEREXT_FIXTURES) + "/admin-v1-golden.txt";
     std::map<std::string, std::vector<uint8_t> > golden = readGolden(path);
-    CHECK(golden.size() == 82);
+    CHECK(golden.size() == 84);
     if (golden.empty())
     {
         std::printf("  no golden fixtures at %s\n", path.c_str());
@@ -1871,8 +1884,10 @@ void testGolden()
         CHECK(ok);
         parsed[it->first] = c;
     }
-    CHECK(parsed.size() == 35);
+    CHECK(parsed.size() == 37);
     Command c;
+    c = parsed["cmd_set_collision_off"]; CHECK(c.type == CmdSetCollision && c.requestId == 36 && c.ref.kind == RefPlayer && c.ref.id == 3 && c.flags == 0);
+    c = parsed["cmd_set_collision_on"]; CHECK(c.type == CmdSetCollision && c.requestId == 37 && c.ref.kind == RefNetId && c.ref.id == 1819 && c.flags == 1);
     c = parsed["cmd_seat_preference"]; CHECK(c.type == CmdSeatPreference && c.requestId == 34 && c.player == 3 && c.value8 == 1);
     c = parsed["cmd_seat_preference_none"]; CHECK(c.type == CmdSeatPreference && c.requestId == 35 && c.player == 3 && c.value8 == 255);
     c = parsed["cmd_start_script"]; CHECK(c.type == CmdStartScript && c.requestId == 30 && c.instance == 7 && c.value8 == 1 && c.flags == 0 && c.text == "nasa" && c.text2 == "{\"altitude\":300}" && c.source == "script.onTick(() => {});");

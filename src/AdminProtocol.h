@@ -60,7 +60,7 @@ enum Type : uint16_t
     CmdSetObjectActive = 0x1310, CmdSpawnObject = 0x1311, CmdDeleteObject = 0x1312, CmdStartVote = 0x1313,
     CmdCancelVote = 0x1314, CmdHudEventRaw = 0x1315, CmdRoundClock = 0x1316, CmdSquadOrder = 0x1317,
     CmdStartScript = 0x1318, CmdStopScript = 0x1319, CmdScriptMessage = 0x131A, CmdListScripts = 0x131B,
-    CmdSeatPreference = 0x131C,
+    CmdSeatPreference = 0x131C, CmdSetCollision = 0x131D,
     // replies
     MsgOk = 0x1401, MsgConsoleResult = 0x1402, MsgObjectList = 0x1403, MsgObjectSpawned = 0x1404,
     MsgScriptList = 0x1405,
@@ -81,6 +81,7 @@ const uint8_t kCapObjects = 2;
 const uint8_t kCapIdentity = 4;
 const uint8_t kCapScripts = 8;   // the script commands (docs/admin-channel-draft.md "Scripts")
 const uint8_t kCapSeatPreference = 16;   // SeatPreference (docs/admin-channel-draft.md "Seat preferences")
+const uint8_t kCapSetCollision = 32;     // SetCollision (docs/admin-channel-draft.md "Command semantics")
 
 // Subscribe streams.
 enum Stream : uint8_t
@@ -530,7 +531,7 @@ struct Command
     uint32_t requestId;
     uint8_t player;        // the player id; Say: the team or player id
     uint8_t target;        // Say target, Map action, Ban "by", Subscribe/Unsubscribe stream, StartVote team
-    uint8_t flags;         // Teleport, SetHealth, KillPlayer, SetTeam, Rank flags; SetScore mask; StartVote minimum ballots;
+    uint8_t flags;         // Teleport, SetHealth, KillPlayer, SetTeam, Rank, SetCollision flags; SetScore mask; StartVote minimum ballots;
                            // StartScript flags
     uint8_t value8;        // SetTeam team, Rank rank, GameEvent/HudEvent event, Ban duration, Subscribe rate, SpawnObject team,
                            // StartVote percent, StartScript API version, SeatPreference seat

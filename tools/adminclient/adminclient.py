@@ -21,6 +21,8 @@ Python 3 standard library plus the openssl command-line tool (certificate creati
   python3 adminclient.py --key <hex> --scenario scriptends              # a map change and a closed link end scripts
   python3 adminclient.py --key <hex> --scenario seat                    # SeatPreference: capability, Ok, Error 4 and 7
   python3 adminclient.py --key <hex> --scenario seat --seat-player 0 --seat 1 --seat-keep --seconds 600
+  python3 adminclient.py --key <hex> --scenario collision --seconds 40   # SetCollision; with serverext_client.py
+                                                                        # --scenario wreck: does the heli fall through?
 
 Scenarios: listen, commands, resync, stall, soak, wrongkey, mapchange, script and more. Port 16567 is refused.
 """
@@ -61,14 +63,14 @@ CMD_SET_OBJECT_ACTIVE, CMD_SPAWN_OBJECT, CMD_DELETE_OBJECT = 0x1310, 0x1311, 0x1
 CMD_START_VOTE, CMD_CANCEL_VOTE = 0x1313, 0x1314
 CMD_HUD_EVENT_RAW, CMD_ROUND_CLOCK, CMD_SQUAD_ORDER = 0x1315, 0x1316, 0x1317
 CMD_START_SCRIPT, CMD_STOP_SCRIPT, CMD_SCRIPT_MESSAGE, CMD_LIST_SCRIPTS = 0x1318, 0x1319, 0x131A, 0x131B
-CMD_SEAT_PREFERENCE = 0x131C
+CMD_SEAT_PREFERENCE, CMD_SET_COLLISION = 0x131C, 0x131D
 OK, CONSOLE_RESULT, OBJECT_LIST, OBJECT_SPAWNED, SCRIPT_LIST = 0x1401, 0x1402, 0x1403, 0x1404, 0x1405
 PING, PONG, ERROR = 0x1501, 0x1502, 0xFFFF
 
 NAMES = {v: k for k, v in list(globals().items()) if isinstance(v, int) and k.isupper() and 0x1000 <= v <= 0xFFFF
          and k not in ("VERSION",)}
 EVENT_TYPES = range(0x1201, 0x121E)
-CAP_CONSOLE, CAP_OBJECTS, CAP_IDENTITY, CAP_SCRIPTS, CAP_SEAT_PREFERENCE = 1, 2, 4, 8, 16
+CAP_CONSOLE, CAP_OBJECTS, CAP_IDENTITY, CAP_SCRIPTS, CAP_SEAT_PREFERENCE, CAP_SET_COLLISION = 1, 2, 4, 8, 16, 32
 SEAT_FIRST, SEAT_SECOND, SEAT_NONE = 0, 1, 255
 VOTE_OUTCOMES = {1: "passed", 2: "failed", 3: "cancelled", 4: "level unload"}
 
@@ -446,6 +448,7 @@ def p_round_clock(req, player, seconds): return W().u32(req).i16(player).f32(sec
 
 
 def p_seat_preference(req, player, seat): return W().u32(req).u8(player).u8(seat).b
+def p_set_collision(req, kind, ident, on): return p_ref(W().u32(req), kind, ident).u8(1 if on else 0).b
 
 
 def p_start_script(req, instance, name, source, args="", api=1, flags=0):
@@ -646,6 +649,8 @@ def golden_samples():
     s["ev_script_event"] = (EV_SCRIPT_EVENT, ev(29).u32(7).u8(1).s('{"player":3,"y":301.5}').b)
     s["cmd_seat_preference"] = (CMD_SEAT_PREFERENCE, p_seat_preference(34, 3, SEAT_SECOND))
     s["cmd_seat_preference_none"] = (CMD_SEAT_PREFERENCE, p_seat_preference(35, 3, SEAT_NONE))
+    s["cmd_set_collision_off"] = (CMD_SET_COLLISION, p_set_collision(36, REF_PLAYER, 3, False))
+    s["cmd_set_collision_on"] = (CMD_SET_COLLISION, p_set_collision(37, REF_NET, 1819, True))
     return s
 
 
@@ -1151,6 +1156,90 @@ def seat_pair(link, c, args):
         c.check(s[a] >= s[b] + 3, "B (%d) wants the first seat: A spawns a pass after B (tick %d, B %d)" % (b, s[a], s[b]))
     for pid in (a, b):
         link.request(CMD_SEAT_PREFERENCE, p_seat_preference(rq(), pid, SEAT_NONE))
+
+
+def scenario_collision(lst, args):
+    """SetCollision (docs/admin-channel-draft.md "Command semantics"): Welcome capability bit 5, Error 4, 5 and 7, and
+    with a bot-channel bot seated in a vehicle (serverext_client.py --scenario wreck: it climbs, then its pilot is
+    removed and the heli falls): collision off on the bot's root object (sent twice: the second changes nothing, see
+    the server log's "collision off ... N of M objects changed"), the vehicle's height and health logged for --seconds
+    or until it is destroyed, then on by networkable id (twice). --collision-control leaves collision on: the
+    comparison run. --collision-off-seconds turns it on again after that long, while the height is still logged."""
+    c = Checks()
+    link = lst.accept(args.accept_timeout)
+    rq = link.next_request
+    caps = link.welcome["caps"]
+    c.check(caps & CAP_SET_COLLISION, "Welcome capability bit 5 (SetCollision) is set: caps %d" % caps)
+    ids = [p["id"] for p in link.snapshot["players"]]
+    missing = next(i for i in range(256) if i not in ids)
+    r = link.request(CMD_SET_COLLISION, p_set_collision(rq(), REF_PLAYER, missing, False))
+    c.check(r["name"] == "ERROR" and r["code"] == ERR_UNKNOWN_PLAYER, "SetCollision of no player (%d) -> Error 4" % missing)
+    r = link.request(CMD_SET_COLLISION, p_set_collision(rq(), REF_CONSOLE, 0xFFFFFFF0, False))
+    c.check(r["name"] == "ERROR" and r["code"] == ERR_UNAVAILABLE, "SetCollision of an unknown console id -> Error 5")
+    r = link.request(CMD_SET_COLLISION, p_set_collision(rq(), REF_NET, 0, True))
+    c.check(r["name"] == "ERROR" and r["code"] == ERR_UNAVAILABLE, "SetCollision of networkable id 0 -> Error 5")
+    r = link.request(CMD_SET_COLLISION, W().u32(rq()).u8(REF_NET).u32(1).u8(2).b)
+    c.check(r["name"] == "ERROR" and r["code"] == ERR_INVALID, "SetCollision flags 2 -> Error 7 (%s)" % r.get("message"))
+    r = link.request(CMD_SET_COLLISION, W().u32(rq()).u8(4).u32(1).u8(0).b)
+    c.check(r["name"] == "ERROR" and r["code"] == ERR_INVALID, "SetCollision reference kind 4 -> Error 7")
+
+    link.request(SUBSCRIBE, p_subscribe(rq(), 1, 30))
+    link.request(SUBSCRIBE, p_subscribe(rq(), 2, 10))
+    seated, end = None, time.time() + args.collision_wait
+    while seated is None and time.time() < end:
+        link.pump(0.2)
+        for pid, st in (link.last_player_stream or {}).get("players", []):
+            if st["life"] == 1 and st["flags"] & 1 and st["root_net"]:
+                seated = (pid, st)
+    if not c.check(seated is not None, "a player seated in a vehicle within %.0f s" % args.collision_wait):
+        return c.summary("collision")
+    pid, st = seated
+    net = st["root_net"]
+    if args.collision_control:
+        log("control run: collision stays on for player %d's vehicle %d" % (pid, net))
+    else:
+        for n in (1, 2):
+            r = link.request(CMD_SET_COLLISION, p_set_collision(rq(), REF_PLAYER, pid, False))
+            c.check(r["name"] == "OK", "SetCollision off (%d) of player %d's root object (vehicle %d) -> Ok" % (n, pid, net))
+    y0 = st["pos"][1]
+    start = time.time()
+    low, last, end, next_log, back_on = y0, None, start + args.seconds, 0.0, False
+    while time.time() < end:
+        link.pump(0.2)
+        if args.collision_off_seconds > 0 and not back_on and time.time() - start >= args.collision_off_seconds:
+            back_on = True
+            r = link.request(CMD_SET_COLLISION, p_set_collision(rq(), REF_NET, net, True))
+            c.check(r["name"] == "OK", "SetCollision on after %.1f s by networkable id %d -> %s (lowest so far %+.1f)" % (
+                args.collision_off_seconds, net, r["name"], low - y0))
+        v = [x for x in (link.last_vehicle_stream or {}).get("vehicles", []) if x["net"] == net]
+        if not v:
+            if last is not None:
+                log("vehicle %d is gone from the vehicle stream" % net)
+                break
+            continue
+        last = v[0]
+        low = min(low, last["pos"][1])
+        if time.time() >= next_log:
+            next_log = time.time() + 1.0
+            log("vehicle %d y %.1f (%+.1f from the start, lowest %+.1f), health %.2f, flags %d" % (
+                net, last["pos"][1], last["pos"][1] - y0, low - y0, last["health"], last["flags"]))
+        if last["flags"] & 1:
+            ev = [m for m in link.events if m["type"] == EV_VEHICLE_DESTROYED and m["net"] == net]
+            y = ev[0]["pos"][1] if ev else last["pos"][1]
+            log("vehicle %d destroyed at y %.1f (%+.1f from the start)" % (net, y, y - y0))
+            break
+    destroyed = [m for m in link.events if m["type"] == EV_VEHICLE_DESTROYED and m["net"] == net]
+    log("%s: vehicle %d lowest y %.1f (%+.1f from the start y %.1f), last %s, VehicleDestroyed events %d" % (
+        "control" if args.collision_control else "collision off", net, low, low - y0, y0,
+        last and "y %.1f health %.2f flags %d" % (last["pos"][1], last["health"], last["flags"]), len(destroyed)))
+    for n in (1, 2):
+        r = link.request(CMD_SET_COLLISION, p_set_collision(rq(), REF_NET, net, True))
+        c.check(r["name"] == "OK" or (r["name"] == "ERROR" and r["code"] == ERR_UNAVAILABLE),
+                "SetCollision on (%d) by networkable id %d -> %s%s" % (n, net, r["name"],
+                                                                        " (the vehicle is gone)" if r["name"] == "ERROR" else ""))
+    r = link.request(PING, p_ping(rq(), 79))
+    c.check(r["name"] == "PONG" and r["clock"] == 79, "the server still ticks (Ping -> Pong)")
+    return c.summary("collision")
 
 
 def scenario_vote(lst, args):
@@ -2396,7 +2485,8 @@ def main():
     ap.add_argument("--write-golden", default="", help="write the golden fixtures to this file and exit")
     ap.add_argument("--scenario", default="listen",
                     choices=["listen", "commands", "resync", "stall", "soak", "wrongkey", "wrongpin", "mapchange", "extras",
-                             "viewer", "replay", "vote", "r7", "script", "runscript", "scriptends", "seat"])
+                             "viewer", "replay", "vote", "r7", "script", "runscript", "scriptends", "seat",
+                             "collision"])
     ap.add_argument("--fuzz", action="store_true")
     ap.add_argument("--fuzz-rounds", type=int, default=24)
     ap.add_argument("--seed", type=int, default=1)
@@ -2428,6 +2518,11 @@ def main():
     ap.add_argument("--seat-keep", action="store_true", help="seat: leave the preference set, hold the link --seconds")
     ap.add_argument("--seat-pair", action="store_true",
                     help="seat: with two bot-channel bots on one team, kill both in one tick and compare their respawns")
+    ap.add_argument("--collision-wait", type=float, default=90.0,
+                    help="collision: seconds to wait for a player seated in a vehicle")
+    ap.add_argument("--collision-control", action="store_true", help="collision: leave collision on (comparison run)")
+    ap.add_argument("--collision-off-seconds", type=float, default=0.0,
+                    help="collision: turn collision on again after this many seconds (0: at the end)")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
     if args.write_golden:
@@ -2448,7 +2543,7 @@ def main():
                 "extras": scenario_extras, "viewer": scenario_viewer, "replay": scenario_replay,
                 "vote": scenario_vote, "r7": scenario_r7, "script": scenario_script,
                 "runscript": scenario_runscript, "scriptends": scenario_scriptends,
-                "seat": scenario_seat}[args.scenario](lst, args)
+                "seat": scenario_seat, "collision": scenario_collision}[args.scenario](lst, args)
     except KeyboardInterrupt:
         return 130
 

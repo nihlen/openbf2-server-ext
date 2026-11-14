@@ -1058,6 +1058,7 @@ bool isWebAdminMessage(uint16_t type)
     case CmdMap: case CmdListObjects: case CmdSetObjectActive: case CmdSpawnObject: case CmdDeleteObject:
     case CmdStartVote: case CmdCancelVote: case CmdHudEventRaw: case CmdRoundClock: case CmdSquadOrder:
     case CmdStartScript: case CmdStopScript: case CmdScriptMessage: case CmdListScripts: case CmdSeatPreference:
+    case CmdSetCollision:
     case MsgPing: case MsgPong: case MsgError:
         return true;
     default:
@@ -1401,6 +1402,18 @@ bool parseCommand(uint16_t type, const uint8_t* p, size_t n, Command& out, std::
             return false;
         return seat::validPreference(out.value8) ? true
                                                  : bad(badValue, "seat must be 0 (first), 1 (second) or 255 (none)");
+
+    case CmdSetCollision:
+        out.requestId = r.u32();
+        readRef(r, out.ref);
+        out.flags = r.u8();
+        if (!r.done())
+            return false;
+        if (out.ref.kind < RefPlayer || out.ref.kind > RefConsoleId)
+            return bad(badValue, "unknown object reference kind");
+        if (out.flags & ~1)
+            return bad(badValue, "unknown flags (bit 0 is collision on)");
+        return true;
 
     case CmdScriptMessage:
     {

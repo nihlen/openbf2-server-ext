@@ -24,6 +24,10 @@ end). No engine change; the version stays 1. **Module side implemented 2026-11-1
 **Seat preferences approved by the author on 2026-11-14** (`.pilot`/`.gunner` in WebAdmin for an enter-on-spawn
 helicopter): capability bit 4 and the command `SeatPreference` (the section "Seat preferences" at the end). No engine
 change; the version stays 1. **Implemented 2026-11-14.**
+**SetCollision asked for by the author on 2026-11-14** (WebAdmin's `.noclip`, whose `object.hasCollision` console
+lines OpenBF2 answers with "Unknown object or method!", `IO/Console/Console.cpp:596`): capability bit 5 and the
+command `SetCollision` ("Command semantics"). No engine change; the version stays 1. **Implemented and tested on a WSL
+server 2026-11-14.**
 The author has decided that the BF2WebAdmin C# side may change as much as needed, and that the
 author keeps deployments from running `mm_webadmin.py` and the native channel at the same time.
 Evidence for the engine side: `docs/findings/admin-channel-a1-a4.md`. Inventory of today's
@@ -337,7 +341,7 @@ Pm = HMAC-SHA256(K, T("OBF2-ADMIN-1 server"))
 | `u16` | game port (`sv.serverPort`) |
 | `u16` | GameSpy query port (`sv.gameSpyPort`) |
 | `u8` | maximum players (`sv.maxPlayers`) |
-| `u8` | capabilities: bit 0 `Console` allowed, bit 1 `SpawnObject`/`DeleteObject` allowed, bit 2 IPs and CD-key hashes are sent, bit 3 scripts can be run ("Scripts" below), bit 4 the module accepts `SeatPreference` ("Seat preferences" below) |
+| `u8` | capabilities: bit 0 `Console` allowed, bit 1 `SpawnObject`/`DeleteObject` allowed, bit 2 IPs and CD-key hashes are sent, bit 3 scripts can be run ("Scripts" below), bit 4 the module accepts `SeatPreference` ("Seat preferences" below), bit 5 the module accepts `SetCollision` ("Command semantics" below) |
 | string | current map name |
 | string | current game mode |
 | `u16` | current map size (`IGame::getCurrentMapSize`) |
@@ -767,6 +771,7 @@ request id) unless a typed result is listed. Failure is `Error` with the request
 | `0x131A` | ScriptMessage | `u32` instance, string message (JSON text, at most 8192 bytes) | `Ok` once the script's message handlers have run; `Error` 5 no such script; `Error` 7 not JSON |
 | `0x131B` | ListScripts | nothing after the request id | `ScriptList` |
 | `0x131C` | SeatPreference | `u8` player, `u8` seat: 0 the first seat (a helicopter's pilot), 1 the second seat (its gunner), 255 none (clears it) | `Ok`; `Error` 4 no such player; `Error` 7 any other seat value. Sent only when `Welcome` capability bit 4 is set |
+| `0x131D` | SetCollision | `ObjectRef`, `u8` flags (bit 0 collision on; 0 turns it off; other bits must be 0) | `Ok`; `Error` 4 no such player, 6 the player is dead (kind 1); `Error` 5 no such object, or it is in the object cache; `Error` 6 when 16384 objects are already without collision; `Error` 7 an unknown reference kind or flags. Acts on the target's root object and all its descendants. Sent only when `Welcome` capability bit 5 is set |
 
 **`0x1402 ConsoleResult`**: `u32` request id, `u8` flags (bit 0 output truncated at 256 KiB), `u16`
 line count L, L × string. The output of `Console::executeLine` split at `\n`, without the final
@@ -858,6 +863,26 @@ server's `serverext.cfg`.
   ("Seat preferences" below). A seat value other than 0, 1 or 255 is `Error` 7 whether or not the player exists.
   Setting the value a player already has is `Ok`. The preference is dropped when that player connects or
   disconnects (ids are reused) and is kept across admin links, level loads and team changes.
+- **SetCollision**: the target's root object (as for `Teleport`) and every descendant, walked as the engine's
+  `world::updateFlagsRecursive` walks them (root first, then `getChild` and the `getSibling` chain,
+  `Scene/Object/ObjectUtil.cpp:172-177`), with `IObject::updateFlags` (`Game/Objects/IObject.h:76`) on
+  `OFHasCollision` (bit 8, `IObject.h:194`). `Object::updateFlags` adds a newly set object to the response physics
+  and removes a newly cleared one, each followed by `setResponseCacheToDirty` (`Scene/Object/Object.cpp:858-867`).
+  Off clears the bit on every object of the tree that has it and the module remembers those objects; on sets it again
+  only on remembered objects that still lack it, so parts that never had collision (the engine sets the bit at creation
+  only for templates with collision physics, `Game/Objects/Base/SimpleObject.cpp:207-208`) are never given any.
+  Sending the state an object already has changes nothing and is `Ok`. The module forgets an object when on is sent
+  for its tree, when its root is reported destroyed (script event 24; the wreck then has the collision the engine's
+  `ArmorGLComp::setUseDestroyedCollision` gives it, `Game/Objects/GameLogicComp/ArmorGLComp.cpp:780-791`) and at a
+  level unload, with or without a link. A vehicle respawned from the object cache gets its creation flags back
+  (`Object::enableCachedObject`, `Object.cpp:689-695`, flags saved by `setObjectCacheID`, `Object.cpp:746`).
+  Nothing is sent to clients: the flag is the server's. Observed on a WSL server (bot-channel bot in an `ahe_z10` on
+  its pad, `adminclient.py --scenario collision` with `serverext_client.py --scenario wreck`): off cleared 18 of the
+  tree's 52 objects and the heli sank through the pad and the ground below it, 58 m in 5 s, until the engine destroyed
+  it (no attacker); with collision on it stood on the pad. On again 0.6 s after off restored all 18 objects, but the
+  hull was 1-2.5 m inside the pad by then and the engine destroyed it 7 ticks later: turning collision on while a
+  vehicle is inside other geometry wrecks it. What a human client sees of a vehicle without collision on the server
+  is untested.
 
 ### Configuration (`serverext.cfg`)
 
