@@ -1,81 +1,153 @@
 # openbf2-server-ext
 
-A native module for the OpenBF2 dedicated server that gives out-of-process tools a stable, typed
-interface to the running game: per-tick state, bot players driven by external input, and later the
-admin events and commands that BF2WebAdmin uses today through `mm_webadmin.py`.
+A native module for the [OpenBF2](https://github.com/B2BF/OpenBF2) dedicated server. It runs inside the server
+process and gives external programs a typed, versioned interface to the running game, over two channels:
 
-Status: bot channel protocol v3 implemented for Linux x86-64 (`libserverext.so`) and tested on a WSL server;
-see [docs/findings/module-v3.md](docs/findings/module-v3.md) (module-v2.md, module-v1.md and module-v0.md for earlier versions). Start with
-the contract in [docs/protocol.md](docs/protocol.md). The admin channel (phase 1 of
-[docs/admin-channel-draft.md](docs/admin-channel-draft.md)) is implemented beside it; its byte layouts, configuration and
-results are in [docs/findings/admin-phase1.md](docs/findings/admin-phase1.md); the viewer additions (view mode, aim, gunfire,
-weapons) in [docs/findings/admin-viewer.md](docs/findings/admin-viewer.md). What a TV missile can hit on a helicopter, and
-which parts the server tests at a lag-compensated (rewound) pose: [docs/findings/tv-hitbox.md](docs/findings/tv-hitbox.md).
-Scripts: WebAdmin pushes JavaScript over the admin channel and the module runs it every tick in an embedded
-QuickJS-NG, with a small `game` API and memory and CPU-time limits (the contract's "Scripts" section; how it was built,
-tested and what it costs: [docs/findings/scripts.md](docs/findings/scripts.md)). `adminAllowScripts 0` in
-`serverext.cfg` turns them off.
+- **The bot channel** lets a program create bot players, read the game state on every simulation tick and send each
+  bot's input: flight axes, buttons, guided-missile aim, chat. The bots are ordinary players to the engine, with no AI
+  library involved, so the program on the other end decides everything they do.
+- **The admin channel** replaces RCON and Python admin scripts for server administration. The server dials out to an
+  admin client over TLS and gives it a snapshot of the game, live state streams, sequence-numbered events (chat,
+  kills, damage, joins, vehicles, projectiles) and typed commands (kick, ban, say, map control, teleport, object
+  spawning, votes, seat preferences, and JavaScript game scripts that run on the server).
+  [BF2WebAdmin](https://github.com/nihlen/BF2WebAdmin) is the client it was built for.
 
-## Layout and build
+The module is Linux x86-64 only (`libserverext.so`). It is in use on live servers, and the protocols are still
+changing; see [Versioning](docs/protocol.md#versioning).
 
-| Path | Contents |
-|---|---|
-| `src/` | The module. `Protocol`, `Config`, `Channel` and `Session` are engine-free; `Module.cpp` is the engine side; `IoThread_posix.cpp` is the socket thread. The admin channel: `AdminProtocol`, `AdminCrypto`, `AdminLink` and `AdminSession` (engine-free), `AdminIo_posix.cpp` (its dial-out and TLS thread) and `Admin.cpp` (its engine side). `Script` is the admin channel's script host (engine-free: QuickJS runtimes, the `script` and `game` objects, the limits); `Admin.cpp` gives it the game. |
-| `third_party/quickjs-ng/` | QuickJS-NG v0.18.0, the scripts' JavaScript engine: the library's files with one line changed (its `README.md`), built as a static library and linked into `libserverext.so`. Its `README.md` has the source, the checksum and how to update. |
-| `tests/` | Unit tests for the engine-free layer (framing, parsing, hostile input, config, queues); `AdminTests.cpp` for the admin channel, TLS included; `ScriptTests.cpp` for the script host against a mock world; `fixtures/admin-v1-golden.txt`, the golden frames shared with the C# codec. |
-| `tools/testclient/` | `serverext_client.py`, a Python 3 stdlib test client: hover flight, `--fuzz`, the v1 scenarios (`--scenario` walk, buttons, blockpad, allblocked, wreck) and the v2 scenarios (view, weapons, damage, spot, round, teleport, multiconn, soak2; the watchdog neutral is q5) and the v3 scenarios (burst, tv, soak3). `tvscan.py`: scripted TV-missile passes for the hit/miss replay tests (docs/findings/tv-hitbox.md). |
-| `tools/adminclient/` | `adminclient.py`, the reference WebAdmin for the admin channel: a TLS listener (it creates the certificate and prints its pin), the HMAC handshake, snapshot, subscriptions, every command, scenarios and `--fuzz`; `--write-golden` writes the fixtures. For scripts: `--scenario script` and `scriptends` (the checks), and `--scenario runscript --script-file x.js` to run one script on a test server and see its events, errors and CPU time. |
-| `testenv/` | WSL and Docker test-server scripts; `deploy-module.sh` installs the module into a run directory. |
-| `probe/` | The superseded `[TEMP]` R1 smoke probe, kept as the evidence behind `docs/findings/r1-smoke.md`. |
-
-Build in WSL. It needs the tools from `testenv/tools-linux.sh` and an OpenBF2 checkout carrying the
-`IServerExtension` engine changes. By default that is `C:\Data\Projects\OpenBF2`, branch `main`; override it with
-the first argument or `OPENBF2_SRC`:
+## How it fits together
 
 ```
+ OpenBF2 dedicated server (bf2)
+   mods/bf2/openbf2.con:  openbf2.addModDll serverext
+   └─ libserverext.so     runs once per simulation tick (30 Hz) on the main thread;
+        │                 all socket I/O is on its own threads
+        ├─ bot channel:   TCP listener on botListen (loopback, no authentication)
+        │                   ◄── a bot controller, or tools/testclient/serverext_client.py
+        └─ admin channel: dials OUT to adminConnect over TLS 1.3 (pinned certificate, HMAC handshake)
+                            ──► BF2WebAdmin, or tools/adminclient/adminclient.py
+```
+
+The engine exports no symbols, so the module uses only typed virtual calls on engine interfaces. The few things it
+cannot do from outside are a small set of additions to the engine, on the
+[`serverext/r1` branch of nihlen/OpenBF2](https://github.com/nihlen/OpenBF2/tree/serverext/r1). The module does not
+load into an OpenBF2 build without them.
+
+## Documentation
+
+| Document | Contents |
+|---|---|
+| [docs/protocol.md](docs/protocol.md) | The bot channel: wire format, every message, spawning, the watchdog, stepped time, the engine requirements. |
+| [docs/admin-channel.md](docs/admin-channel.md) | The admin channel: security model, wire format, state, events, commands, votes, scripts. |
+| [docs/configuration.md](docs/configuration.md) | Every `serverext.cfg` key. |
+
+The two protocol documents are the contracts. The code follows them, and a client is written against them.
+
+## Install
+
+Each [release](../../releases) is a zip to unpack into the server's `bin/amd-64` directory. It holds everything that
+replaces the retail binaries:
+
+| File | From |
+|---|---|
+| `bf2`, `libdice_py.so` | OpenBF2, with the engine additions the module needs |
+| `libserverext.so` | this repo |
+| `libbf2hub.so` | [OpenBF2-BF2Hub](https://github.com/B2BF/OpenBF2-BF2Hub), for servers listed on BF2Hub |
+| `source.txt` | which commits the zip was built from, the builder image, and per binary its SHA-256, newest glibc symbol version and shared libraries |
+
+The zip is named `openbf2-serverext-<openbf2>-<module>-<bf2hub>-<backend>.zip`: the three commits, then the GameSpy
+backend it reports to. Each release also carries the zip's `.sha512` and a `-debug.tar.gz` with the unstripped
+binaries.
+
+1. Install a retail BF2 1.5 Linux dedicated server. The zip replaces its binaries; the game content stays the retail
+   server's.
+2. Unpack the zip into `bin/amd-64`.
+3. Load the modules in `mods/bf2/openbf2.con`:
+
+   ```
+   openbf2.addModDll bf2hub
+   openbf2.addModDll serverext
+   ```
+
+4. Write `serverext.cfg` in the server's working directory ([docs/configuration.md](docs/configuration.md)). With no
+   file, the bot channel listens on `127.0.0.1:16700` and the admin channel is off.
+
+The binaries need glibc 2.35 or newer and OpenSSL 3 (`libssl.so.3`); Debian 12 and 13 and Ubuntu 22.04 and newer have
+both. OpenBF2 has no PunkBuster.
+
+[bf2-docker](https://github.com/nihlen/bf2-docker) has Docker images that do all of this (`images/netsky-openbf2-*`
+on its `combined` branch) and write `serverext.cfg` from environment variables on every start.
+
+## Build
+
+The build needs Linux (WSL works), CMake 3.21 or newer, Ninja, GCC with C and C++ compilers, `libssl-dev`, and an
+OpenBF2 checkout of the `serverext/r1` branch. `testenv/tools-linux.sh` installs CMake and Ninja into `~/tools`
+without root.
+
+```
+git clone -b serverext/r1 https://github.com/nihlen/OpenBF2.git ../OpenBF2
 ./build-module.sh [openbf2-checkout] [build-dir]
 ```
 
-That configures the `linux-x64` preset, builds `libserverext.so` and runs the unit tests. The admin
-channel needs OpenSSL 1.1.1 or 3.x (`libssl-dev` to build; `libssl3` or `libssl1.1` at run time, linked
-dynamically). QuickJS-NG is C, so the build needs a C compiler beside the C++ one (`gcc` comes with `g++`); it adds
-no shared library. A Windows build (`serverext.dll`) is not implemented yet.
+That configures the `linux-x64` preset, builds `libserverext.so` and runs the unit tests. The OpenBF2 checkout
+defaults to `../OpenBF2`, or `$OPENBF2_SRC`; the build directory defaults to `~/serverext-build/linux-x64`.
 
-## Release build
+- The admin channel needs OpenSSL 1.1.1 or 3.x, linked dynamically.
+- The scripts' JavaScript engine, QuickJS-NG, is in `third_party/` and linked statically. It adds no shared library.
+- The module builds against OpenBF2's headers only. It does not link the engine.
 
-`release/build.sh` builds the zip the production game-server images unpack into `bin/amd-64` (bf2-docker
-`images/netsky-openbf2-*`): `openbf2-serverext-<openbf2>-<module>-<bf2hub>.zip` with `bf2` and `libdice_py.so`
-(OpenBF2 with the `IServerExtension` commits), `libserverext.so` (this repo), `libbf2hub.so`
-([OpenBF2-BF2Hub](https://github.com/B2BF/OpenBF2-BF2Hub)) and a `source.txt` with the three commits, the builder and
-per binary its sha256, newest `GLIBC_` version and `NEEDED` libraries. It runs in Git Bash with Docker Desktop or on
-Linux, takes the sources as `git archive` of commits, builds in the docker volume `serverext-release-build`
-(incremental) with the image from `release/Dockerfile`, and runs the module's unit tests:
+### Release build
+
+`release/build.sh` builds the release zip: OpenBF2, this module and OpenBF2-BF2Hub, in one Ubuntu 22.04 builder image
+(`release/Dockerfile`), with the module's unit tests run inside the build. It needs Docker and runs on Linux or in Git
+Bash on Windows.
 
 ```
 release/build.sh                                         # HEAD of ../OpenBF2, this repo and ../_ext/OpenBF2-BF2Hub
-OPENBF2_REV=824d4dc MODULE_REV=c14b561 BF2HUB_REV=7e37854 CLEAN=1 release/build.sh
+OPENBF2_REV=<commit> MODULE_REV=<commit> BF2HUB_REV=<commit> CLEAN=1 release/build.sh
 ```
 
-Output in `release/out/`: the zip, its `.sha512` (the line for bf2-docker's `assets.sha512`), a `-debug.tar.gz` with
-the unstripped binaries, and the build log. The builder is Ubuntu 22.04, the target of OpenBF2's own Linux CI (GCC 11,
-static libstdc++), with glibc 2.35 (Debian trixie has 2.41) and OpenSSL 3.0.2 (the module links `libssl.so.3`).
-`.github/workflows/release.yml` runs the same script on GitHub Actions; it needs this repo and the OpenBF2 fork's
-branch on GitHub.
+It builds commits (`git archive`), never the working tree, and records them in `source.txt`. The same commits give the
+same zip, byte for byte. The output is in `release/out/`. Ubuntu 22.04 is the target of OpenBF2's own Linux CI (GCC 11,
+static libstdc++), and its glibc 2.35 keeps the binaries loadable on current Debian and Ubuntu.
 
-## Related repos
+`.github/workflows/release.yml` runs the same script on GitHub Actions and publishes the result as a release. It is
+started by hand, with the OpenBF2 and OpenBF2-BF2Hub commits as inputs.
 
-How they fit together, and how to build, deploy and test across them: [docs/system.md](docs/system.md)
-(`C:\Data\Projects\openbf2-server-ext\docs\system.md`).
+## Repository layout
 
-| Repo | Local path | Relationship |
-|---|---|---|
-| OpenBF2 | `C:\Data\Projects\OpenBF2` | The server this module loads into. Local commits on branch `serverext/r1` carry the engine changes the module needs (`docs/server-extension.md` there). |
-| bf2-bots | `C:\Data\Projects\bf2-bots` | The bot sidecar, a client of the bot channel. |
-| BF2WebAdmin | `C:\Data\Projects\DotNet\BF2WebAdmin` | The admin channel's client: branch `admin-channel` (not merged into `master`) replaces `mm_webadmin.py` with it. |
-| BF2WebAdmin-localtest | `C:\Data\Projects\DotNet\BF2WebAdmin-localtest` | The local test environment. Its OpenBF2 variant runs this module on `dalian_2_v_2` with WebAdmin and the bots attached. |
-| OpenBF2-BF2Hub | `C:\Data\Projects\_ext\OpenBF2-BF2Hub` | Reference for a module's layout, presets and loading. |
+| Path | Contents |
+|---|---|
+| `src/` | The module. The bot channel: `Protocol`, `Config`, `Channel` and `Session` are engine-free, `Module.cpp` is the engine side, `IoThread_posix.cpp` is the socket thread. The admin channel: `AdminProtocol`, `AdminCrypto`, `AdminLink` and `AdminSession` are engine-free, `AdminIo_posix.cpp` is its dial-out and TLS thread, `Admin.cpp` is its engine side. `Script` is the script host: QuickJS runtimes, the `game` API and the limits. |
+| `tests/` | Unit tests for everything engine-free: framing, parsing, hostile input, configuration, queues; the admin channel including TLS against a local server; the script host against a mock world. `fixtures/admin-v1-golden.txt` holds the admin channel's golden frames, for testing a client codec against the same bytes. |
+| `tools/testclient/` | `serverext_client.py`, a bot channel client with a scenario per feature and a `--fuzz` mode. `tvscan.py` flies scripted TV-missile passes. Python 3, standard library only. |
+| `tools/adminclient/` | `adminclient.py`, a reference admin client: a TLS listener that creates its own certificate and prints its pin, the handshake, every command, scenarios and `--fuzz`. `--scenario runscript --script-file x.js` runs one script on a server and shows its events, errors and CPU time. |
+| `testenv/` | Scripts that turn a BF2 server Docker image into an OpenBF2 test server with the module, in WSL or in a container. |
+| `release/` | The release build. |
+| `third_party/quickjs-ng/` | QuickJS-NG, with one line changed. Its `README.md` has the source, the checksum and how to update. |
+
+## Testing
+
+- **Unit tests** run in every build (`ctest` in the build directory). They cover the engine-free layers.
+- **Against a running server**, `tools/testclient/serverext_client.py --port <bot port>` creates a bot, flies it to a
+  hover and prints its state. `--scenario <name>` runs one feature's checks and `--fuzz` sends hostile input.
+  `tools/adminclient/adminclient.py` does the same for the admin channel: point the server's `adminConnect` at it.
+- A test server must use its own ports. Set `sv.serverPort` and `botListen` explicitly, and never share them with a
+  server people play on.
+
+## Related projects
+
+| Project | Relationship |
+|---|---|
+| [OpenBF2](https://github.com/B2BF/OpenBF2) | The engine: an open-source reconstruction of the Battlefield 2 dedicated server. |
+| [nihlen/OpenBF2, `serverext/r1`](https://github.com/nihlen/OpenBF2/tree/serverext/r1) | OpenBF2 with the engine additions this module needs. Its `docs/server-extension.md` describes the engine side. |
+| [OpenBF2-BF2Hub](https://github.com/B2BF/OpenBF2-BF2Hub) | The BF2Hub module for OpenBF2, shipped in the release zip. |
+| [BF2WebAdmin](https://github.com/nihlen/BF2WebAdmin) | The web admin that uses the admin channel. |
+| [bf2-docker](https://github.com/nihlen/bf2-docker) | Docker images of BF2 servers, including OpenBF2 servers with this module. |
 
 ## License
 
-The module compiles against OpenBF2 headers, so expect GPLv3, as OpenBF2-BF2Hub is. Clients talk to
-it over a socket and are not linked to it. Confirm before publishing.
+GPL-3.0, like OpenBF2, whose headers the module is built against. See [LICENSE](LICENSE). QuickJS-NG in
+`third_party/quickjs-ng/` is under the MIT license (`third_party/quickjs-ng/LICENSE`).
+
+Clients talk to the module over a socket and are not linked to it.

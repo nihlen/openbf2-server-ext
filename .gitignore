@@ -4,3 +4,8 @@ build/
 *.user
 __pycache__/
 *.pyc
+
+# Local, per-machine agent instructions and notes
+CLAUDE.local.md
+.claude/
+*.local.md
