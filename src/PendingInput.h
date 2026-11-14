@@ -1,4 +1,4 @@
-// The SetInput values waiting for a bot's next tick (docs/protocol.md v3 item 1). Engine-free, so
+// The SetInput values waiting for a bot's next tick (docs/protocol.md, SetInput). Engine-free, so
 // the merge rule is unit-tested.
 
 #ifndef SERVEREXT_PENDINGINPUT_H

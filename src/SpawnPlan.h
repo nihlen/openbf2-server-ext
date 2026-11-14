@@ -1,4 +1,4 @@
-// Spawn-group choices for a bot's team (docs/protocol.md v1 "Blocked spawns"). Engine-free so the
+// Spawn-group choices for a bot's team (docs/protocol.md "Spawning"). Engine-free so the
 // unit tests can drive it: G is IServerExtension::SpawnGroupInfo in the module, or any struct with
 // the same fields (id, squad, pointCount, enterOnSpawnPoints, active, onlyForHuman, x, y, z).
 

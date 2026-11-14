@@ -121,7 +121,7 @@ bool AdminIo::start(std::string& error)
             SSL_CTX_free(ctx);
             return false;
         }
-        // No CA store and no host name check: the pinned SPKI is the only trust (B1).
+        // No CA store and no host name check: the pinned SPKI is the only trust.
         SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, verifyCallback);
         SSL_CTX_set_mode(ctx, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
         m_ctx = ctx;

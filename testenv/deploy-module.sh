@@ -8,9 +8,9 @@
 #   BOT_LISTEN      botListen for serverext.cfg (127.0.0.1:16700). Never port 16567.
 #   WATCHDOG_TICKS  watchdogTicks (6)
 #   ENTER_RANGE, SPAWN_FALLBACK_SECONDS, SPAWN_BLOCKED_SECONDS, ALLOW_ROUND_RESTART
-#                   the v1 keys; written only when set (the module's defaults are 30, 5, 15 and 0)
+#                   written only when set (the module's defaults are 30, 5, 15 and 0)
 #   MAX_CONNECTIONS, ALLOW_TELEPORT, PROJECTILE_RANGE
-#                   the v2 keys; written only when set (defaults 4, 0 and 1000)
+#                   written only when set (defaults 4, 0 and 1000)
 #
 # Writes mods/bf2/openbf2.con ("openbf2.addModDll serverext"), copies the module beside bf2 in
 # bin/amd-64 (dlopen searches $ORIGIN, not the working directory) and writes serverext.cfg in the

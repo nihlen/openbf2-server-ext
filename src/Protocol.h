@@ -1,5 +1,5 @@
-// Wire format of the bot channel, docs/protocol.md v3 (layouts in docs/findings/module-v2.md and module-v3.md). Engine-free: the I/O thread, the main thread
-// and the unit tests all use it.
+// Wire format of the bot channel (docs/protocol.md). Engine-free: the I/O thread, the main thread and the unit
+// tests all use it.
 
 #ifndef SERVEREXT_PROTOCOL_H
 #define SERVEREXT_PROTOCOL_H
@@ -13,7 +13,7 @@ namespace serverext {
 namespace proto {
 
 const uint16_t kVersion = 4;
-// The oldest Hello version still accepted: v4 only adds Step (docs/protocol.md "v4: stepped time")
+// The oldest Hello version still accepted: version 4 only adds Step (docs/protocol.md "Stepped time")
 const uint16_t kMinVersion = 3;
 const size_t kHeaderSize = 8;
 const uint32_t kMaxPayload = 64 * 1024;
@@ -32,10 +32,10 @@ enum MsgType : uint16_t
     MsgRestartRound = 0x0108,
     MsgTeleport     = 0x0109,
     MsgSpot         = 0x010A,
-    MsgSay          = 0x010B,   // bot chat (no version change, approved 2026-10-24)
-    MsgStep         = 0x010C,   // v4 stepped time (R3, approved 2026-10-27)
+    MsgSay          = 0x010B,   // bot chat
+    MsgStep         = 0x010C,   // stepped time (R3), version 4
     MsgSetInput     = 0x0201,
-    MsgSetTargetDirection = 0x0202,   // v3 item 3
+    MsgSetTargetDirection = 0x0202,
     MsgTickState    = 0x0301,
     MsgVehicleList  = 0x0302,
     MsgProjectileList = 0x0303,
@@ -68,8 +68,8 @@ enum RemoveReason : uint8_t
 const uint8_t kFlagAlive     = 1;
 const uint8_t kFlagOwnBot    = 2;
 const uint8_t kFlagInVehicle = 4;
-const uint8_t kFlagManDown   = 8;    // v2 item 10
-const uint8_t kFlagSpotted   = 16;   // v2 item 6: spotted by the entry's enemies within the last 12 s
+const uint8_t kFlagManDown   = 8;
+const uint8_t kFlagSpotted   = 16;   // Spotted by the entry's enemies within the last 12 s
 const uint8_t kViewNone      = 255;
 const uint8_t kSeatOnFoot    = 255;
 
@@ -165,9 +165,9 @@ struct CreateBotMsg    { uint32_t requestId; std::string name; uint8_t team; };
 struct EnterVehicleMsg { uint32_t requestId; uint8_t playerId; uint32_t vehicleId; uint8_t seat; };
 struct RemoveBotMsg    { uint32_t requestId; uint8_t playerId; };
 struct RestartRoundMsg { uint32_t requestId; };
-// v2 item 9: moves a bot's root object (its vehicle when seated) to pos with the given yaw, level.
+// Moves a bot's root object (its vehicle when seated) to pos with the given yaw, level.
 struct TeleportMsg     { uint32_t requestId; uint8_t playerId; float pos[3]; float yaw; };
-// v2 item 6: the bot spots the root object with networkable id targetId.
+// The bot spots the root object with networkable id targetId.
 struct SpotMsg         { uint32_t requestId; uint8_t playerId; uint32_t targetId; };
 // The bot sends a chat line as itself on channel 0 (Global) or 1 (Team).
 struct SayMsg          { uint32_t requestId; uint8_t playerId; uint8_t channel; std::string text; };
@@ -187,7 +187,7 @@ struct SetInputMsg
     uint32_t buttons;
 };
 
-// v3 item 3: steer the bot's TV-guided weapon along the ray from start through end (world metres).
+// Steer the bot's TV-guided weapon along the ray from start through end (world metres).
 struct SetTargetDirectionMsg
 {
     uint8_t playerId;
@@ -206,11 +206,11 @@ bool parseRestartRound(const std::vector<uint8_t>& p, RestartRoundMsg& out);
 bool parseTeleport(const std::vector<uint8_t>& p, TeleportMsg& out);
 bool parseSpot(const std::vector<uint8_t>& p, SpotMsg& out);
 bool parseSay(const std::vector<uint8_t>& p, SayMsg& out);
-// v4 Step: the ticks granted (0 releases stepping)
+// Step: the ticks granted (0 releases stepping)
 bool parseStep(const std::vector<uint8_t>& p, uint32_t& ticks);
 bool parseSetTargetDirection(const std::vector<uint8_t>& p, SetTargetDirectionMsg& out);
 
-// Checks a SetTargetDirection's values (v3 item 3): finite, both points inside the world (|x| and
+// Checks a SetTargetDirection's values: finite, both points inside the world (|x| and
 // |z| at most 8192, y in -1000..10000) and at least 0.1 m apart. Returns null when valid, else the
 // reason for the Error 7 message.
 const char* checkTargetDirection(const SetTargetDirectionMsg& m);
@@ -223,10 +223,10 @@ const char* checkSay(const SayMsg& m);
 // True for the message types a sidecar may send.
 bool isClientMessage(uint16_t type);
 
-// Welcome feature bits (v2).
+// Welcome feature bits.
 const uint8_t kFeatureTeleport = 1;
 const uint8_t kFeatureRoundRestart = 2;
-const uint8_t kFeatureStepping = 4;   // v4: serverext.cfg stepMode 1
+const uint8_t kFeatureStepping = 4;   // serverext.cfg stepMode 1
 
 void encodeWelcome(std::vector<uint8_t>& out, uint16_t version, float tickRate, uint32_t tick, const std::string& map,
                    const std::string& mode, float enterRange, float projectileRange, uint8_t features);
@@ -237,7 +237,7 @@ void encodeSpawnBlocked(std::vector<uint8_t>& out, uint8_t playerId, uint16_t se
 // Messages longer than 1024 bytes are truncated.
 void encodeError(std::vector<uint8_t>& out, uint32_t requestId, uint16_t code, const std::string& message);
 
-// TickState weapon flags (v2 item 4).
+// TickState weapon flags.
 const uint8_t kWeaponReloading = 1;
 const uint8_t kWeaponSelected = 2;
 
@@ -266,8 +266,8 @@ struct StateEntry
     float vel[3];
     float angVel[3];
     float health;
-    uint8_t viewMode;        // v2 item 1; kViewNone for other players
-    uint8_t weaponCount;     // v2 item 4; 0..kMaxWeapons, 0 for other players
+    uint8_t viewMode;        // kViewNone for other players
+    uint8_t weaponCount;     // 0..kMaxWeapons, 0 for other players
     WeaponState weapons[kMaxWeapons];
 };
 
@@ -294,7 +294,7 @@ struct VehicleEntry
 // kMaxPayload (or past 65535 entries) are dropped from the end.
 void encodeVehicleList(std::vector<uint8_t>& out, uint32_t tick, const std::vector<VehicleEntry>& entries);
 
-// ProjectileList (v2 item 5).
+// ProjectileList.
 const uint8_t kProjectileGuided = 1;
 const uint8_t kProjectileOwn = 2;
 const uint8_t kProjectileHasOwner = 4;   // player ids count down from 255, so no id value means none
@@ -328,7 +328,7 @@ private:
 // At most kMaxProjectiles entries are written.
 void encodeProjectileList(std::vector<uint8_t>& out, uint32_t tick, const std::vector<ProjectileEntry>& entries);
 
-// Damage flags (v2 item 8).
+// Damage flags.
 const uint8_t kDamageVictimOwn = 1;
 const uint8_t kDamageAttackerOwn = 2;
 const uint8_t kDamageVictimDestroyed = 4;
@@ -355,7 +355,7 @@ struct DamageEvent
 
 void encodeDamage(std::vector<uint8_t>& out, const DamageEvent& e);
 
-// Kill flags (v2 item 8).
+// Kill flags.
 const uint8_t kKillVictimOwn = 1;
 const uint8_t kKillAttackerOwn = 2;
 const uint8_t kKillTeamKill = 4;
@@ -375,12 +375,12 @@ struct KillEvent
 void encodeKill(std::vector<uint8_t>& out, const KillEvent& e);
 
 // Chat text is the engine's Windows-1252, sent as UTF-8 like the admin channel's (control bytes become
-// '?'), cut to at most 255 bytes on a character boundary (v2 item 7). sender is valid with kChatFromPlayer.
+// '?'), cut to at most 255 bytes on a character boundary. sender is valid with kChatFromPlayer.
 const uint8_t kChatFromPlayer = 1;
 void encodeChat(std::vector<uint8_t>& out, uint32_t tick, uint8_t flags, uint8_t sender, uint8_t team, uint8_t channel,
                 const std::string& text);
 
-// RoundState (v2 item 7). 255 = unknown for the two states.
+// RoundState. 255 = unknown for the two states.
 void encodeRoundState(std::vector<uint8_t>& out, uint32_t tick, uint8_t gameStatus, uint8_t beginRoundState,
                       float timeToNextChange);
 

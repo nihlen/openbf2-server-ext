@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""Test client for the openbf2-server-ext bot channel (docs/protocol.md v3; layouts in docs/findings/module-v2.md
-and docs/findings/module-v3.md).
+"""Test client for the openbf2-server-ext bot channel (docs/protocol.md).
 
 Python 3 standard library only, so it runs unchanged on Windows and in WSL with no build step.
 
@@ -12,16 +11,17 @@ bot's TickState lines. Survives deaths (re-enters) and map changes (recreates th
   python serverext_client.py --stop-sending-after 20 --exit-after 30     # watchdog
   python serverext_client.py --fuzz                                      # hostile input
 
-v1 scenarios (--scenario): walk, buttons, blockpad, allblocked. See docs/findings/module-v1.md.
-v2 scenarios: view, weapons, multiconn, projectiles, damage, spot, round, teleport, soak2; the watchdog
-neutral is q5 with --q5-neutral module. See docs/findings/module-v2.md.
-v3 scenarios: burst (item 1, one-tick presses in superseded SetInputs), tv (items 2 and 3, the gunner's TV
-missile launched and steered with SetTargetDirection), soak3 (two bots, the gunner guiding TV missiles
-periodically). See docs/findings/module-v3.md.
-Q12 scenario: q12 (two crews: a TV launch while the other crew's TV missile flies). See
-docs/findings/q12-tv-refusal.md.
-Q5/Q9 scenarios: q5 (watchdog neutral in flight), q9 (what the server's Python sees). See
-docs/findings/q5-q9.md.
+Scenarios (--scenario), each the checks for one part of the protocol:
+  walk, buttons, blockpad, allblocked     on foot, the button table, the spawn fallback, SpawnBlocked
+  view, weapons, multiconn, projectiles, damage, spot, round, teleport, soak2
+                                          TickState and the state and event messages, several connections
+  burst                                   one-tick presses in superseded SetInputs
+  tv                                      the gunner's TV missile, launched and steered with SetTargetDirection
+  soak3                                   two bots, the gunner guiding TV missiles periodically
+  q12                                     two crews: a TV launch while the other crew's TV missile flies
+                                          (protocol.md "Known limitations")
+  q5                                      the watchdog neutral in flight (--q5-neutral module)
+  q9                                      what the server's Python and ModManager see of a bot
 """
 
 import argparse
@@ -52,7 +52,7 @@ F_ALIVE, F_OWN, F_VEHICLE, F_MANDOWN, F_SPOTTED = 1, 2, 4, 8, 16
 ENTRY = struct.Struct("<BBBBI3f3f3f3ff")
 VEHICLE_TAIL = struct.Struct("<BB3fffBI")   # after the u32 id and the template string
 
-# SetInput button bits (docs/findings/module-v1.md, Q11).
+# SetInput button bits (docs/protocol.md "Input").
 BTN_FIRE, BTN_ALT_FIRE, BTN_FLARE, BTN_JUMP, BTN_SPRINT, BTN_CROUCH, BTN_PRONE, BTN_RELOAD = (1 << i for i in range(8))
 BTN_TOGGLE_CAMERA = 1 << 8
 BTN_CAMERA_MODE = [1 << 9, 1 << 10, 1 << 11, 1 << 12]      # PICameraMode1..4
@@ -135,7 +135,7 @@ def parse_error(p):
 
 
 def parse_tickstate(p):
-    """v2: each entry is the v1 60 bytes, then u8 view mode, u8 weapon count and the weapons."""
+    """Each entry is 60 fixed bytes, then u8 view mode, u8 weapon count and the weapons."""
     r = Reader(p)
     tick, t, n = r.take("<I"), r.take("<d"), r.take("<B")
     entries = []
@@ -217,12 +217,12 @@ def spot_frame(rid, pid, target):
 
 
 def set_input(pid, tick, pitch, roll, coll, pedals, buttons=0, look_yaw=0.0, look_pitch=0.0):
-    """v1 SetInput. On foot: coll = walk forward/back, pedals = strafe, look_yaw = turn."""
+    """SetInput. On foot: coll = walk forward/back, pedals = strafe, look_yaw = turn."""
     return frame(SET_INPUT, struct.pack("<BIffffffI", pid, tick, pitch, roll, coll, pedals, look_yaw, look_pitch, buttons))
 
 
 def target_direction(pid, tick, start, end):
-    """v3 SetTargetDirection: steer the bot's TV missile along the ray from start through end."""
+    """SetTargetDirection: steer the bot's TV missile along the ray from start through end."""
     return frame(SET_TARGET_DIRECTION, struct.pack("<BI6f", pid, tick, start[0], start[1], start[2], end[0], end[1], end[2]))
 
 
@@ -308,7 +308,7 @@ class Pilot:
             if phase == "hover" and self.hover_since is None:
                 self.hover_since = now
             # Station keeping: body-frame velocity -> target attitude -> cyclic, plus heading hold.
-            # Signs measured on the Z10 (see docs/findings/module-v0.md): pitch input + = nose down
+            # Signs measured on the Z10: pitch input + = nose down
             # (pitch angle +), roll input + = bank right (roll angle -), pedals + = yaw right.
             if self.a.hold:
                 cyc_p, cyc_r, ped = self.station_keep(e, now)
@@ -509,7 +509,7 @@ def run_bot(args):
     return 0 if (hover_reported or not args.require_hover) else 1
 
 
-# ------------------------------------------------------------------------------------- v1 scenarios
+# ------------------------------------------------------------------------------------- on foot, buttons, spawning
 
 def wrap180(a):
     return (a + 540.0) % 360.0 - 180.0
@@ -525,7 +525,7 @@ def bearing(frm, to):
 
 
 class Client:
-    """A v1 session that keeps the latest TickState and VehicleList, and sends one SetInput per bot
+    """A session that keeps the latest TickState and VehicleList, and sends one SetInput per bot
     per TickState from self.inputs (a bot -> dict of axes). Buttons in self.pulses go out once."""
 
     def __init__(self, args, name):
@@ -550,12 +550,12 @@ class Client:
         self.projectiles = []     # latest ProjectileList entries
         self.pl_count = 0
         self.projectile_seen = {} # launch number -> first entry seen (ids are reused across flights)
-        self.damages = []         # v2 events, in arrival order
+        self.damages = []         # events, in arrival order
         self.kills = []
         self.chats = []
         self.rounds = []
         self.steers = {}          # bot id -> (start, end) sent after its SetInput on every TickState (v3)
-        self.extra = {}           # bot id -> SetInput dicts sent right after the main one, once (v3 burst)
+        self.extra = {}           # bot id -> SetInput dicts sent right after the main one, once (burst)
         self.errors0 = []         # (time, tick, code, message) of Errors without a request id
 
     def next_req(self):
@@ -834,7 +834,7 @@ def run_buttons(args):
     if cl.check(f"an empty vehicle within 40 m to shoot at ({len(empty)})", empty):
         target = min(empty, key=lambda v: flat_dist(v["pos"], me["pos"]))
         log(f"target {target['name']} id {target['id']} hp {target['health']:.3f} at {flat_dist(target['pos'], me['pos']):.1f} m")
-        # Face it. Standing still, look yaw turns the head first (Q10), so creep forward slowly
+        # Face it. Standing still, look yaw turns the head first, so creep forward slowly
         # while turning: then the body turns directly.
         t0 = time.time()
         while time.time() - t0 < 10:
@@ -996,7 +996,7 @@ def run_wreck(args):
     return cl.finish()
 
 
-# ------------------------------------------------------------------------------------- Q9: the Python view
+# ------------------------------------------------------------------------------------- q9: the Python view
 
 class Rcon:
     """ModManager RCON (mm_rcon), the same digest login as testenv/rcon.py."""
@@ -1036,7 +1036,7 @@ def mark(label):
 
 def turn_to(cl, bot, target_bot, timeout=12.0):
     """Points the soldier at target_bot. TickState yaw is the body; standing still, look yaw turns the
-    head first (Q10). So creep forward with a small look gain, then keep creeping with no look input
+    head first. So creep forward with a small look gain, then keep creeping with no look input
     until the body has caught up with the head (yaw steady), and repeat until within 2 degrees."""
     t0 = time.time()
     while time.time() - t0 < timeout:
@@ -1110,7 +1110,7 @@ def log_team_states(cl, bots):
 def run_q9(args):
     """Drives bots through connect, spawn, enter/seat change, a crash, a team kill, an admin team
     switch and an enemy kill, kick and ban, a round restart and a map change, with RCON probes of
-    what ModManager reports. Run it with tools/testclient/wa_recorder.py as mm_webadmin's peer."""
+    what ModManager reports."""
     rc = Rcon(args.host, args.rcon_port, args.rcon_password)
     cl = Client(args, "serverext testclient q9")
     mark("create A, B (team 1) and C (team 2)")
@@ -1218,7 +1218,7 @@ def run_q9(args):
     return cl.finish()
 
 
-# ------------------------------------------------------------------------------------- Q5: watchdog neutral
+# ------------------------------------------------------------------------------------- q5: watchdog neutral
 
 class Autopilot:
     """Altitude, speed, heading and bank hold for the q5 trials. Signs as in Pilot.station_keep: pitch
@@ -1709,8 +1709,8 @@ SCENARIOS = {"wreck": run_wreck, "walk": run_walk, "buttons": run_buttons, "bloc
              "q9": run_q9, "q5": run_q5, "teamswitch": run_teamswitch}
 
 
-# ------------------------------------------------------------------------------------- v2 scenarios
-# docs/findings/module-v2.md. Every shot in these scenarios goes into empty ground or the sea away
+# ------------------------------------------------------------------------------------- state and events
+# Every shot in these scenarios goes into empty ground or the sea away
 # from both bases, or between two bots of this client; nothing else is ever targeted.
 
 MAP_CENTER = (19.0, 0.0, -57.0)     # midway between the dalian_2_v_2 bases
@@ -1802,7 +1802,7 @@ def run_view(args):
     if not cl.check("boarded a heli", ensure_boarded(cl, bot, args.team, "view", spinup=1.0)):
         return cl.finish()
     cl.check(f"in the pilot seat the view mode starts at 1 (inside), got {cl.states[bot]['view']}", cl.states[bot]["view"] == 1)
-    # Expected modes from module-v1.md (Q11): toggle cycles 1 -> 2 -> 3, then mode keys 1/2/3/4 give 1/3/4/5.
+    # Expected modes: toggle cycles 1 -> 2 -> 3, then mode keys 1/2/3/4 give 1/3/4/5.
     steps = [("toggle camera", BTN_TOGGLE_CAMERA, 2), ("toggle camera", BTN_TOGGLE_CAMERA, 3),
              ("camera mode 1", BTN_CAMERA_MODE[0], 1), ("camera mode 2", BTN_CAMERA_MODE[1], 3),
              ("camera mode 3", BTN_CAMERA_MODE[2], 4), ("camera mode 4", BTN_CAMERA_MODE[3], 5),
@@ -1836,7 +1836,7 @@ def run_weapons(args):
     log(f"pilot weapons: {ws}")
     if gunner is not None:
         log(f"gunner weapons: {cl.states[gunner]['weapons'] if gunner in cl.states else None}")
-        # v3 item 2: the TV launcher is not selectable; one tick of alt fire (the seat's toggle) selects it.
+        # The TV launcher is not selectable; one tick of alt fire (the seat's toggle) selects it.
         cl.pulses[gunner] = BTN_ALT_FIRE
         cl.run_for(1.0)
         log(f"gunner weapons after one tick of alt fire: {cl.states[gunner]['weapons'] if gunner in cl.states else None}")
@@ -2212,7 +2212,7 @@ def finish_counts(label, results):
 
 
 def run_soak2(args):
-    """10-minute soak with two bots and all v2 state: A (team 1) and B (team 2) hover over their pads;
+    """10-minute soak with two bots and all the state messages: A (team 1) and B (team 2) hover over their pads;
     every 30 s A spots B (B is within range once both climb), every 45 s both cycle their camera views,
     every 60 s A fires a one-tick rocket seaward. Prints a per-minute summary."""
     cl = Client(args, "serverext testclient soak2")
@@ -2674,7 +2674,7 @@ def run_burst(args):
     if not cl.check("boarded a heli", ensure_boarded(cl, bot, args.team, "burst", spinup=1.0)):
         return cl.finish()
     cl.run_for(1.0)
-    # Camera mode keys 2 and 3 give view modes 3 and 4 (module-v1.md Q11); both are idempotent, so
+    # Camera mode keys 2 and 3 give view modes 3 and 4; both are idempotent, so
     # alternating them changes the view with every press.
     keys = [(BTN_CAMERA_MODE[1], 3), (BTN_CAMERA_MODE[2], 4)]
     cl.pulses[bot] = BTN_CAMERA_MODE[1]
@@ -2714,7 +2714,7 @@ def run_burst(args):
 
 
 def run_soak3(args):
-    """The v3 soak: a pilot and a gunner in one heli hovering seaward of the pad; every --tv-every seconds (75:
+    """The TV soak: a pilot and a gunner in one heli hovering seaward of the pad; every --tv-every seconds (75:
     the 8 missiles a sortie carries last the 10 minutes)
     the gunner fires a TV missile and guides it onto the sea (alternating sides, retargeted in flight on
     every other pair of shots, 0.5 s after launch); every 45 s a burst of camera presses in superseded SetInputs."""
@@ -2789,7 +2789,7 @@ def run_soak3(args):
 
 
 def run_q12(args):
-    """Q12 (docs/findings/q12-tv-refusal.md): is a TV launch refused while another launcher's TV missile flies?
+    """Q12 (docs/protocol.md "Known limitations"): is a TV launch refused while another launcher's TV missile flies?
     Two crews (pilot and gunner bots in each team's heli) hover seaward of their pads and fire unguided TV
     missiles onto the sea: A then B while A's flies, the reverse, B after A's has ended, and both in one tick.
     A refused press is retried once after the other missile has ended."""
@@ -3261,7 +3261,7 @@ def run_fuzz(args):
 
     # maxConnections concurrent connections are served; one more is refused. Per-request errors keep
     # the connection.
-    time.sleep(1.0)    # let the module see the quick closes above (module-v1/q5-q9: a race in the test)
+    time.sleep(1.0)    # let the module see the quick closes above (a race in the test)
     c = Conn(H, P)
     hello(c, "fuzz-main")
     others = []
@@ -3333,7 +3333,7 @@ def run_fuzz(args):
         want_error("Teleport x 1e9", teleport_frame(66, bot, (1e9, 50, 0), 0), 6 if tp_refused else 7)
         want_error("Spot target 0", spot_frame(67, bot, 0), (5, 6))
         want_error("Spot target 70000", spot_frame(68, bot, 70000), (5, 6))
-        # v3 SetTargetDirection: bad values are 7; a bot without an active TV-guided weapon is 6.
+        # SetTargetDirection: bad values are 7; a bot without an active TV-guided weapon is 6.
         want_error("SetTargetDirection NaN start", target_direction(bot, 0, (nan, 50, 0), (10, 0, 10)), 7)
         want_error("SetTargetDirection +inf end", target_direction(bot, 0, (0, 50, 0), (float("inf"), 0, 10)), 7)
         want_error("SetTargetDirection end x 9000", target_direction(bot, 0, (0, 50, 0), (9000, 0, 10)), 7)

@@ -1,5 +1,4 @@
-// The engine side of the admin channel (docs/findings/admin-phase1.md; design in
-// docs/admin-channel-draft.md). It runs on the server's main thread: the bot channel's per-tick
+// The engine side of the admin channel (docs/admin-channel.md). It runs on the server's main thread: the bot channel's per-tick
 // handler calls tick(), and the engine calls its listeners (script events through R4, damage
 // through R5, projectile launches, game status and level unload). The socket work is on the admin
 // I/O thread (AdminIo); the two meet only in AdminLink.
@@ -28,7 +27,7 @@ class AdminHost
 public:
     // True when playerId is a bot created by the bot channel; connection receives its connection.
     virtual bool botChannelBot(int playerId, uint32_t* connection) = 0;
-    // The live vehicle roots of the bot channel's vehicle set (docs/protocol.md v1 "Vehicles").
+    // The live vehicle roots of the bot channel's vehicle set (docs/protocol.md, VehicleList).
     virtual void vehicleRoots(std::vector<dice::hfe::world::IObject*>& out) = 0;
 
 protected:

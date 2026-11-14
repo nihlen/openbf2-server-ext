@@ -115,8 +115,8 @@ bool Session::handleFrame(const Frame& frame, std::vector<uint8_t>& reply)
         break;
     case MsgStep:
     {
-        // v4 stepped time: counted here on the I/O thread, after every frame before it was queued, because
-        // the main thread does not tick while the budget is empty (docs/protocol.md "v4: stepped time")
+        // Stepped time: counted here on the I/O thread, after every frame before it was queued, because
+        // the main thread does not tick while the budget is empty (docs/protocol.md "Stepped time")
         if (m_version < 4)
             return fail(reply, ErrUnknownType, "Step needs protocol version 4");
         uint32_t ticks = 0;

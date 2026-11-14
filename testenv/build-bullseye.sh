@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Builds the OpenBF2 linux-x64 server inside debian:bullseye so the binary runs on the netsky
+# Builds the OpenBF2 linux-x64 server inside debian:bullseye so the binary runs on a Debian 11
 # image's glibc 2.31 (a WSL Ubuntu 22.04 build needs glibc 2.35 and fails to start there), and in
 # the same container libserverext.so from this repo, with its unit tests.
 #
 # Usage (WSL):  testenv/build-bullseye.sh <openbf2-checkout> [build-dir]
-#   build-dir defaults to ~/bf2-linux-serverext-testenv-bullseye (Linux filesystem, agent-owned)
+#   build-dir defaults to ~/bf2-linux-serverext-testenv-bullseye (Linux filesystem)
 #   Output: <build-dir>/build/bin_linux/{bf2,libdice_py.so} and <build-dir>/module/libserverext.so
 #
 # Environment (optional):

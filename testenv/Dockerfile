@@ -1,10 +1,11 @@
-# The production netsky server content with its retail bf2/libdice_py.so replaced by an OpenBF2
-# linux-x64 build, plus the serverext module. Everything must target glibc <= 2.31 (Debian 11, the
-# netsky base): use build-bullseye.sh, not the WSL Ubuntu build. Built and run by run-docker.sh.
+# A retail BF2 server image (BASE, with the layout of the bf2-docker images) with its bf2/libdice_py.so
+# replaced by an OpenBF2 linux-x64 build, plus the serverext module. Everything must target the base's
+# glibc: for a Debian 11 base (glibc 2.31) use build-bullseye.sh, not an Ubuntu build. Built and run by
+# run-docker.sh.
 #
 # Build context (made by run-docker.sh build): bf2, libdice_py.so, libserverext.so, openbf2.con
 # and serverext.cfg.
-ARG BASE=cr.nihlen.net/library/bf2-netsky:2v2-nocheck
+ARG BASE
 FROM ${BASE}
 
 # run.sh moves /home/bf2/tmp/srv/* to /home/bf2/srv (the server's working directory) on the first

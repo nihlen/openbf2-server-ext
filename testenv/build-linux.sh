@@ -2,8 +2,8 @@
 # Builds the OpenBF2 linux-x64 dedicated server (bf2 + libdice_py.so) inside WSL.
 #
 # Usage (from WSL):  testenv/build-linux.sh <openbf2-checkout> [build-dir]
-#   openbf2-checkout  OpenBF2 source tree, e.g. /mnt/c/Data/Projects/OpenBF2 (the default checkout, main)
-#   build-dir         agent-owned dir in the Linux filesystem (default ~/bf2-linux-serverext-testenv)
+#   openbf2-checkout  OpenBF2 source tree (branch serverext/r1), e.g. ../OpenBF2
+#   build-dir         a directory in the Linux filesystem (default ~/bf2-linux-serverext-testenv)
 #
 # Needs cmake >= 3.21, ninja, g++ and ncurses headers. Without root, run tools-linux.sh first: it
 # puts cmake/ninja in ~/tools and unpacks libncurses-dev into ~/tools/sysroot. With root, simply

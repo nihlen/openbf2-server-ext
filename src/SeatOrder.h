@@ -1,4 +1,4 @@
-// Seat preferences for enter-on-spawn points (docs/admin-channel-draft.md "Seat preferences"). Engine-free so
+// Seat preferences for enter-on-spawn points (docs/admin-channel.md "Seat preferences"). Engine-free so
 // the unit tests can drive it: the admin channel fills one Entry per player each tick, plan() says whose
 // spawnAtTick to move, and the module writes them back with IPlayer::setSpawnAtTick.
 //

@@ -1,4 +1,4 @@
-// The script host of the admin channel (docs/admin-channel-draft.md "Scripts"): WebAdmin pushes
+// The script host of the admin channel (docs/admin-channel.md "Scripts"): WebAdmin pushes
 // JavaScript source, and the module runs it on the main thread in an embedded QuickJS-NG
 // (third_party/quickjs-ng), one runtime per script. Engine-free: a script reaches the game only
 // through World, which Admin.cpp implements with the engine and the unit tests with a mock.

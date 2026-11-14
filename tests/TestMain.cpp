@@ -273,7 +273,7 @@ void testParsers()
     CHECK(kSetInputSize == 33);
     CHECK(!parseSetInput(std::vector<uint8_t>(kSetInputSize - 1, 0), s));
     CHECK(!parseSetInput(std::vector<uint8_t>(kSetInputSize + 1, 0), s));
-    CHECK(!parseSetInput(std::vector<uint8_t>(25, 0), s));   // a v0 SetInput is malformed in v1
+    CHECK(!parseSetInput(std::vector<uint8_t>(25, 0), s));   // a SetInput without the look axes is malformed
     CHECK(!parseSetInput(std::vector<uint8_t>(), s));
 
     RestartRoundMsg rr;
@@ -285,7 +285,7 @@ void testParsers()
     CHECK(isClientMessage(MsgRestartRound));
     CHECK(!isClientMessage(MsgSpawnBlocked) && !isClientMessage(MsgVehicleList));
 
-    // v2: Teleport (21 bytes) and Spot (9 bytes), exact length only.
+    // Teleport (21 bytes) and Spot (9 bytes), exact length only.
     TeleportMsg tp;
     CHECK(parseTeleport(teleportPayload(3, 254, -214.5f, 180.0f, 172.0f, 90.0f), tp) && tp.requestId == 3 &&
           tp.playerId == 254 && tp.pos[0] == -214.5f && tp.pos[1] == 180.0f && tp.pos[2] == 172.0f && tp.yaw == 90.0f);
@@ -343,7 +343,7 @@ void testParsers()
     CHECK(checkSay(sy) != 0);
     CHECK(isClientMessage(MsgSay));
 
-    // v3: SetTargetDirection (29 bytes), exact length only; values are checked separately.
+    // SetTargetDirection (29 bytes), exact length only; values are checked separately.
     SetTargetDirectionMsg td;
     CHECK(directionPayload(0, 0, 0, 0, 0, 0, 0, 0).size() == 29);
     CHECK(parseSetTargetDirection(directionPayload(254, 4321, -10.5f, 120.0f, 30.0f, 200.0f, 0.0f, -75.25f), td) &&
@@ -366,7 +366,7 @@ void testParsers()
         CHECK(!isClientMessage(moduleOnly[i]));
 }
 
-// v3 item 3: SetTargetDirection value checks.
+// SetTargetDirection value checks.
 void testTargetDirection()
 {
     const float nan = std::numeric_limits<float>::quiet_NaN();
@@ -401,7 +401,7 @@ void testTargetDirection()
     CHECK(parseSetTargetDirection(directionPayload(1, 0, 5, 5, 5, 5.2f, 5, 5), m) && !checkTargetDirection(m));
 }
 
-// v3 item 1: the buttons of superseded SetInputs are ORed, the axes are latest wins.
+// The buttons of superseded SetInputs are ORed, the axes are latest wins.
 void testPendingInput()
 {
     PendingInput pi;
@@ -435,7 +435,7 @@ void testPendingInput()
     CHECK(pi.buttons == all && pi.buttons == 0xFFFFFFFFu);
 }
 
-// The v2 module-to-sidecar events, field by field.
+// The module-to-sidecar events, field by field.
 void testV2Encoders()
 {
     // ProjectileList
@@ -637,7 +637,7 @@ void testEncoders()
     Frame f;
     CHECK(d.next(f) == FrameDecoder::GotFrame && f.type == MsgWelcome);
     Reader r(f.payload.data(), f.payload.size());
-    CHECK(r.u16() == 3);   // the client's version (v4 accepts v3 clients)
+    CHECK(r.u16() == 3);   // the client's version (version 3 clients are accepted)
     CHECK(r.f32() == 30.0f);
     CHECK(r.u32() == 123);
     std::string map, mode;
@@ -646,7 +646,7 @@ void testEncoders()
     CHECK(map == "dalian_2_v_2" && mode == "gpm_cq");
     CHECK(r.f32() == 30.0f && r.f32() == 1000.0f && r.u8() == kFeatureTeleport && r.done());
 
-    // TickState: other players' entries are the v1 60 bytes plus view mode and weapon count.
+    // TickState: other players' entries are the 60 fixed bytes plus view mode and weapon count.
     std::vector<StateEntry> entries(300);
     b.clear();
     encodeTickState(b, 1, 2.0, entries);
@@ -898,7 +898,7 @@ std::vector<uint8_t> stepPayload(uint32_t ticks)
     return p;
 }
 
-// v4 stepped time (docs/protocol.md "v4: stepped time"): Step on the I/O thread, the budget, real time
+// Stepped time (docs/protocol.md "Stepped time"): Step on the I/O thread, the budget, real time
 void testStepping()
 {
     // Off (stepMode 0): Step is refused and closes
@@ -911,7 +911,7 @@ void testStepping()
         CHECK(s.onBytes(h.data(), h.size(), reply) && reply.empty());
         CHECK(!s.onBytes(st.data(), st.size(), reply) && errorCode(reply) == ErrRefused);
     }
-    // A v3 client: Hello accepted, Step is unknown
+    // A version 3 client: Hello accepted, Step is unknown
     {
         Channel ch;
         ch.enableStepping();
@@ -1014,7 +1014,7 @@ void testSession()
         Channel ch;
         Session s(&ch, 1);
         std::vector<uint8_t> reply;
-        std::vector<uint8_t> f = frame(MsgHello, helloPayload(1, "x"));   // v1 is no longer accepted
+        std::vector<uint8_t> f = frame(MsgHello, helloPayload(1, "x"));   // version 1 is not accepted
         CHECK(!s.onBytes(f.data(), f.size(), reply));
         CHECK(errorCode(reply) == ErrVersion);
     }
@@ -1022,7 +1022,7 @@ void testSession()
         Channel ch;
         Session s(&ch, 1);
         std::vector<uint8_t> reply;
-        std::vector<uint8_t> f = frame(MsgHello, helloPayload(2, "x"));   // nor v2
+        std::vector<uint8_t> f = frame(MsgHello, helloPayload(2, "x"));   // nor version 2
         CHECK(!s.onBytes(f.data(), f.size(), reply));
         CHECK(errorCode(reply) == ErrVersion);
     }
@@ -1034,7 +1034,7 @@ void testSession()
         CHECK(!s.onBytes(f.data(), f.size(), reply));
         CHECK(errorCode(reply) == ErrVersion);
     }
-    // RestartRound is a client message; module-only v1 types are unknown when a client sends them.
+    // RestartRound is a client message; module-only types are unknown when a client sends them.
     {
         Channel ch;
         Session s(&ch, 4);
@@ -1046,7 +1046,7 @@ void testSession()
         ch.drainCommands(q);
         CHECK(q.size() == 2 && q[1].kind == Command::RestartRound && q[1].restartRound.requestId == 99 && q[1].conn == 4);
     }
-    // v3 SetTargetDirection becomes a command; before Hello it closes with code 2.
+    // SetTargetDirection becomes a command; before Hello it closes with code 2.
     {
         Channel ch;
         Session s(&ch, 6);
@@ -1072,7 +1072,7 @@ void testSession()
         std::vector<uint8_t> d = frame(MsgSetTargetDirection, directionPayload(253, 77, 1, 2, 3, 4, 5, 6));
         CHECK(!s.onBytes(d.data(), d.size(), reply) && errorCode(reply) == ErrMalformed);
     }
-    // v2 Teleport and Spot become commands; before Hello they close with code 2.
+    // Teleport and Spot become commands; before Hello they close with code 2.
     {
         Channel ch;
         Session s(&ch, 5);
@@ -1397,7 +1397,7 @@ void testSpawnPlan()
     CHECK(findGroup(many, 7, 9) == &many[6] && findGroup(many, 7, 42) == 0);
 }
 
-// The level-and-hold neutral (v2 item 11) against the gains and signs of docs/findings/q5-q9.md.
+// The level-and-hold neutral: gains and signs.
 void testNeutral()
 {
     const float dt = 1.0f / 30.0f;

@@ -1,5 +1,5 @@
 // The script host (Script.h): QuickJS-NG runtimes, the host API and the life cycle of
-// docs/admin-channel-draft.md "Scripts".
+// docs/admin-channel.md "Scripts".
 
 #include "Script.h"
 
@@ -800,7 +800,7 @@ private:
         {
             if (!argVec3(ctx, argv[1], "the position", 10000.0f, pos))
                 return JS_EXCEPTION;
-            // The Teleport command's world bounds (docs/protocol.md v2 Teleport).
+            // The Teleport command's world bounds (docs/protocol.md, Teleport).
             if (std::fabs(pos[0]) > 8192.0f || std::fabs(pos[2]) > 8192.0f || pos[1] < -1000.0f)
                 return JS_ThrowRangeError(ctx, "the position is outside the world");
         }

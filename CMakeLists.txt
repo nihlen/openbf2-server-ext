@@ -1,9 +1,9 @@
 cmake_minimum_required(VERSION 3.21)
 
 # libserverext: the OpenBF2 dedicated-server module behind the bot channel (docs/protocol.md) and the
-# admin channel (docs/findings/admin-phase1.md).
+# admin channel (docs/admin-channel.md).
 #
-#   cmake --preset linux-x64 [-DOPENBF2_SRC=/path/to/OpenBF2]
+#   cmake --preset linux-x64 [-DOPENBF2_SRC=/path/to/OpenBF2]   (default: ../OpenBF2)
 #   cmake --build --preset linux-x64
 #   ctest --preset linux-x64
 #
@@ -27,12 +27,8 @@ cmake_minimum_required(VERSION 3.21)
 
 project(serverext LANGUAGES C CXX)
 
-if(WIN32)
-    set(_openbf2_default "C:/Data/Projects/OpenBF2")
-else()
-    set(_openbf2_default "/mnt/c/Data/Projects/OpenBF2")
-endif()
-set(OPENBF2_SRC "${_openbf2_default}" CACHE PATH "OpenBF2 checkout carrying the IServerExtension engine changes (branch main of the default checkout)")
+# The OpenBF2 checkout to build against: by default a sibling directory of this repo.
+set(OPENBF2_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../OpenBF2" CACHE PATH "OpenBF2 checkout carrying the IServerExtension engine changes (branch serverext/r1 of github.com/nihlen/OpenBF2)")
 option(SERVEREXT_BUILD_TESTS "Build the engine-free unit tests" ON)
 
 if(WIN32)

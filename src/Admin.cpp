@@ -2108,7 +2108,7 @@ private:
         }
     }
 
-    // ---------------------------------------------------------------- scripts (docs/admin-channel-draft.md "Scripts")
+    // ---------------------------------------------------------------- scripts (docs/admin-channel.md "Scripts")
 
     void onStartScript(const Command& c)
     {
@@ -2169,7 +2169,7 @@ private:
     }
 
     // ---------------------------------------------------------------- seat preferences
-    // (docs/admin-channel-draft.md "Seat preferences"; the rule is seat::plan in SeatOrder.h)
+    // (docs/admin-channel.md "Seat preferences"; the rule is seat::plan in SeatOrder.h)
 
     static const char* seatName(uint8_t v)
     {
@@ -2990,7 +2990,7 @@ private:
         ok(c.requestId);
     }
 
-    // Kick and Ban refuse bots (docs/admin-channel-draft.md: a bot is never banned on address N/A).
+    // Kick and Ban refuse bots (docs/admin-channel.md: a bot is never banned on address N/A).
     world::IPlayer* kickable(const Command& c)
     {
         world::IPlayer* p = player(c.player);
@@ -3148,7 +3148,7 @@ private:
         ok(c.requestId);
     }
 
-    // SetCollision (docs/admin-channel-draft.md "Command semantics"): the root object and every descendant, walked as
+    // SetCollision (docs/admin-channel.md "Command semantics"): the root object and every descendant, walked as
     // the engine's world::updateFlagsRecursive does (OpenBF2 Scene/Object/ObjectUtil.cpp:172-177), with
     // IObject::updateFlags on OFHasCollision; Object::updateFlags then adds the object to or removes it from the
     // response physics (Scene/Object/Object.cpp:858-867). Off clears the bit where it is set and remembers those

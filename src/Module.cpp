@@ -1,10 +1,9 @@
-// libserverext: the engine side of the bot channel, docs/protocol.md v3 (byte layouts in
-// docs/findings/module-v2.md and module-v3.md). It also hosts the admin channel (Admin.cpp), whose per-tick work
-// runs from this module's tick handler.
+// libserverext: the engine side of the bot channel (docs/protocol.md). It also hosts the admin channel
+// (Admin.cpp), whose per-tick work runs from this module's tick handler.
 //
 // Everything in this file runs on the server's main thread: inside the EventManager category-7
-// event that the module re-posts every tick (Q1), the ECHud unload notification, the ECNetwork chat
-// event, and the engine's damage, projectile and spot observers (IServerExtension v2). Socket work
+// event that the module re-posts every tick, the ECHud unload notification, the ECNetwork chat
+// event, and the engine's damage, projectile and spot observers (IServerExtension). Socket work
 // is on the I/O thread (IoThread_posix.cpp); the two meet only in Channel.
 //
 // Engine access is limited to typed virtual calls and inline header code, because bf2 exports no
@@ -62,7 +61,7 @@ using namespace serverext::engine;
 
 namespace {
 
-const EventCategory kTickCategory = static_cast<EventCategory>(7);   // [CHOSEN] Q1/Q8
+const EventCategory kTickCategory = static_cast<EventCategory>(7);   // [CHOSEN], protocol.md "The per-tick hook"
 const unsigned int kTickEventId = 1;
 const unsigned int kUnloadHudEventId = 3;   // GameServer::unload posts (ECHud, 3) first
 const unsigned int kChatEventId = 11;       // StringReceivedEvent on ECNetwork (StringManager.h)
@@ -71,9 +70,9 @@ const int kDefaultKit = 0;
 const unsigned int kStatsPeriodTicks = 1800;   // one stats line per minute
 const unsigned int kGroupRetryTicks = 10;      // re-set a cleared target spawn group this often
 const unsigned int kResolveRetryTicks = 30;    // retry a team without a usable spawn group once a second
-const unsigned int kVehicleListPeriod = 30;     // protocol.md v1: once a second
+const unsigned int kVehicleListPeriod = 30;     // once a second
 const size_t kVehicleScanPerTick = 500;         // registered objects examined per tick
-const unsigned int kRestartMinTicks = 60 * 30;  // protocol.md v1: at most one RestartRound per 60 s
+const unsigned int kRestartMinTicks = 60 * 30;  // at most one RestartRound per 60 s
 const unsigned int kSpawnBlockedRepeatTicks = 10 * 30;
 const int kMaxSpawnGroups = 64;
 const int kGameStatusPlaying = 1;               // the only status in which dead players respawn
@@ -87,8 +86,8 @@ const int kCategoryHelicopter = 3;              // VCHelicopter (ModuleWorldObjT
 const uint32_t kNoNetIdBase = 0x10000;          // ProjectileList id without a networkable id
 const int kTargetSystemTV = 4;                  // TSTVGuided (Game/Objects/CompTemplateBases.h)
 
-// protocol.md v1 "Buttons": SetInput bit n presses PlayerInput slot kButtonSlots[n] for one tick.
-// The table and its evidence are in docs/findings/module-v1.md (Q11). PIUse is deliberately absent.
+// The button table of protocol.md "Input": SetInput bit n presses PlayerInput slot kButtonSlots[n] for one tick.
+// PIUse is deliberately absent.
 const int kButtonSlots[32] = {
     io::PIFire, io::PIAltFire, io::PIFlareFire, io::PIAction, io::PISprint, io::PICrouch, io::PILie,
     io::PIReload, io::PIToggleCameraMode, io::PICameraMode1, io::PICameraMode2, io::PICameraMode3,
@@ -218,20 +217,20 @@ struct Bot
     uint32_t conn;
     int team;                         // the team the spawn groups below belong to; follows getTeam()
     float axes[proto::AxisCount];      // what is written every tick
-    PendingInput pending;              // SetInputs since the last tick (v3 item 1: buttons ORed)
+    PendingInput pending;              // SetInputs since the last tick (buttons ORed)
     uint32_t buttons;                  // pressed for this tick only
-    bool hasDirection;                 // a SetTargetDirection waits for this tick (v3 item 3)
+    bool hasDirection;                 // a SetTargetDirection waits for this tick
     proto::SetTargetDirectionMsg direction;
     unsigned int idleTicks;
     bool watchdogTripped;
-    bool levelAndHold;                 // v2 item 11: the watchdog flies the heli neutral
+    bool levelAndHold;                 // The watchdog flies the heli neutral
     LevelAndHold neutral;
     bool wasAlive;
     int removeCountdown;       // > 0 after the sidecar disconnected
     int missingTicks;
     unsigned long lastGroupTry;
 
-    // Spawn fallback (protocol.md v1 "Blocked spawns").
+    // Spawn fallback (protocol.md "Spawning").
     int home;                     // the pad group; -1 if the team has no on-foot group
     int target;                   // the group the module wants the bot to spawn at
     unsigned long readySince;     // tick the bot became ready to spawn, 0 while not ready
@@ -291,7 +290,7 @@ static_assert(offsetof(BotChatEvent, m_messageLength) == offsetof(StringReceived
 static_assert(offsetof(BotChatEvent, m_message) == offsetof(StringReceivedEvent, m_message), "m_message");
 #pragma GCC diagnostic pop
 
-// One sidecar connection (protocol.md v2 item 3).
+// One sidecar connection.
 struct Conn
 {
     bool ready;                     // Hello answered
@@ -302,7 +301,7 @@ struct Conn
     Conn() : ready(false), vehicleListDue(0), lastStatus(-2), lastBeginRound(-2), projectilesShown(false) {}
 };
 
-// A missile or rocket in flight (v2 item 5), validated every tick through the engine's own lookup.
+// A missile or rocket in flight, validated every tick through the engine's own lookup.
 struct Tracked
 {
     IObject* object;        // borrowed; used only after getRegisteredObject(objectId) returns it
@@ -384,7 +383,7 @@ public:
         const bool tickOk = m_em->registerEventHandler(kTickCategory, this, 0);
         const bool hudOk = m_em->registerEventHandler(ECHud, this, 0);
         // Registered after GameServer at the same priority, so the module sees the raw sender id
-        // before GameServer blanks it for server messages (docs/findings/module-v2.md, Chat).
+        // before GameServer blanks it for server messages.
         const bool chatOk = m_em->registerEventHandler(ECNetwork, this, 0);
         const bool damageOk = m_ext->addDamageObserver(this);
         const bool projectileOk = m_ext->addProjectileObserver(this);
@@ -482,10 +481,10 @@ public:
         }
     }
 
-    // ---------------------------------------------------------------- engine observers (v2)
+    // ---------------------------------------------------------------- engine observers
 
     // R5 (IServerExtension::IDamageObserver). Kills go to every connection (the kill feed); damage
-    // only to connections whose bots are the victim or the attacker (docs/findings/module-v2.md).
+    // only to connections whose bots are the victim or the attacker.
     virtual void onDamage(const IServerExtension::DamageInfo& d)
     {
         if (!anyReady())
@@ -525,7 +524,7 @@ public:
         }
     }
 
-    // v2 item 5 (IServerExtension::IProjectileObserver): keep missiles and rockets, the projectiles
+    // Keep missiles and rockets, the projectiles
     // with a networkable id or a seek component. Bullets have neither on the dedicated server.
     virtual void onProjectileLaunched(IObject* projectile, world::IPlayer*)
     {
@@ -558,7 +557,7 @@ public:
                  t.templateName.c_str(), net, guided ? 1 : 0, t.launch, m_projectileLogs);
     }
 
-    // v2 item 6 (IServerExtension::ISpotObserver): a target stays spotted for its spotting team for
+    // A target stays spotted for its spotting team for
     // the client's marker lifetime.
     virtual void onSpotted(const IServerExtension::SpotInfo& s)
     {
@@ -832,7 +831,7 @@ private:
             error(conn, m.requestId, proto::ErrInvalidValue, "name is empty");
             return;
         }
-        // protocol.md v1: CreateBot succeeds whenever the team has a spawn group a bot can use,
+        // CreateBot succeeds whenever the team has a spawn group a bot can use,
         // active or not; a blocked one is handled by the spawn fallback.
         const int groupCount = listGroups(m.team);
         const spawn::Choice choice = spawn::choose(m_groups, groupCount);
@@ -852,7 +851,7 @@ private:
             return;
         }
         // Python's PlayerConnect handlers ran inside createInputPlayer, and mm_autobalance may have
-        // put the bot on a team already (docs/findings/q5-q9.md, 4). The requested team wins.
+        // put the bot on a team already. The requested team wins.
         const int connectTeam = p->getTeam();
         p->setTeam(m.team, false);
         p->setKit(kDefaultKit);
@@ -956,7 +955,7 @@ private:
         // The live team, not the cached one: an admin may have switched it since the last tick.
         const int team = p->getTeam();
 
-        // protocol.md v1: both forms skip destroyed vehicles and require the bot within enterRange.
+        // Both forms skip destroyed vehicles and require the bot within enterRange.
         const Vec3& myPos = me->getAbsolutePosition();
         const char* why = "no undestroyed vehicle with that seat free within enterRange";
         IObject* seat = 0;
@@ -1078,7 +1077,7 @@ private:
         }
         // Every one of the 32 bits is in the button table (kButtonSlots), so there is no unknown
         // bit to ignore and log.
-        // v3 item 1: the axes are latest wins within a tick; the buttons of a superseded SetInput
+        // The axes are latest wins within a tick; the buttons of a superseded SetInput
         // are ORed into the one applied, so a one-tick press is never lost.
         uint32_t kept = 0;
         if (b->pending.add(axes, m.buttons, kept))
@@ -1089,7 +1088,7 @@ private:
         }
     }
 
-    // v3 item 3: checked here, applied in the tick handler (latest wins per bot per tick).
+    // Checked here, applied in the tick handler (latest wins per bot per tick).
     void onSetTargetDirection(uint32_t conn, const proto::SetTargetDirectionMsg& m)
     {
         Bot* b = ownBot(m.playerId, conn);
@@ -1111,7 +1110,7 @@ private:
         b->hasDirection = true;
     }
 
-    // The bot's active TV-guided weapon (protocol.md v3 item 3), or null. Wire-guided weapons are
+    // The bot's active TV-guided weapon (protocol.md, SetTargetDirection), or null. Wire-guided weapons are
     // not returned: the server re-aims them from the player's camera every tick.
     IWeaponObject* tvWeapon(world::IPlayer* p)
     {
@@ -1194,7 +1193,7 @@ private:
         ack(conn, m.requestId);
     }
 
-    // v2 item 9. Moves the bot's root object to a level attitude at the given yaw and stops it.
+    // Moves the bot's root object to a level attitude at the given yaw and stops it.
     void onTeleport(uint32_t conn, const proto::TeleportMsg& m)
     {
         if (!m_config.allowTeleport)
@@ -1250,7 +1249,7 @@ private:
         ack(conn, m.requestId);
     }
 
-    // v2 item 6. What a human's Q + click sends: the spotted message and the "spotted" radio line.
+    // What a human's Q + click sends: the spotted message and the "spotted" radio line.
     void onSpot(uint32_t conn, const proto::SpotMsg& m)
     {
         Bot* b = ownBot(m.playerId, conn);
@@ -1328,7 +1327,7 @@ private:
         ack(conn, m.requestId);
     }
 
-    // v2 item 7. Chat as GameServer relays it: channels 0 (Global) and 12 (ServerMessage) to every
+    // Chat as GameServer relays it: channels 0 (Global) and 12 (ServerMessage) to every
     // connection; 1 (Team) to connections with a bot on the sender's team; 13 (ServerTeamMessage) to
     // connections with a bot on the team in the event's flags (GameServer::sayTeam); others not at all.
     void onChat(StringReceivedEvent* e)
@@ -1359,7 +1358,7 @@ private:
             logLine("tick %lu: chat channel %d from %d: %s", m_tick, channel, e->m_senderId, sanitizeName(text, 120).c_str());
     }
 
-    // ---------------------------------------------------------------- damage and kills (v2 item 8)
+    // ---------------------------------------------------------------- damage and kills
 
     void fillDamage(const IServerExtension::DamageInfo& d, IObject* victimRoot, proto::DamageEvent& e)
     {
@@ -1417,9 +1416,9 @@ private:
 
     // ---------------------------------------------------------------- per-tick bot work
 
-    // Watchdog neutral. In a heli's pilot seat (v2 item 11) the level-and-hold law takes over from
+    // Watchdog neutral. In a heli's pilot seat the level-and-hold law takes over from
     // the last collective; in other vehicle seats cyclic, pedals and look are 0 and collective is
-    // held (v1). On foot every axis is 0. No buttons.
+    // held. On foot every axis is 0. No buttons.
     void neutralise(Bot& b, world::IPlayer* p)
     {
         IObject* root = 0;
@@ -1478,7 +1477,7 @@ private:
         in->inputs[io::PIPitch] = b.axes[proto::AxisPitch];
         in->inputs[io::PIRoll] = b.axes[proto::AxisRoll];
         in->inputs[io::PIThrottle] = b.axes[proto::AxisCollective];
-        in->inputs[io::PIYaw] = b.axes[proto::AxisPedals];          // strafe on foot (Q10)
+        in->inputs[io::PIYaw] = b.axes[proto::AxisPedals];          // strafe on foot
         in->inputs[io::PIMouseLookX] = b.axes[proto::AxisLookYaw];  // turn on foot
         in->inputs[io::PIMouseLookY] = b.axes[proto::AxisLookPitch];
         for (int bit = 0; bit < 32; ++bit)
@@ -1590,7 +1589,7 @@ private:
         }
     }
 
-    // ---------------------------------------------------------------- spawn fallback (v1)
+    // ---------------------------------------------------------------- spawn fallback
 
     typedef IServerExtension::SpawnGroupInfo GroupInfo;
 
@@ -1768,14 +1767,14 @@ private:
         logLine("tick %lu: bot %d spawned at group %d (%s) after %lu ticks ready; %s%s seat %d; pos %.1f %.1f %.1f", m_tick,
              b.id, group, group == b.home ? "home" : "fallback", waited, seat ? "in " : "on foot",
              seat ? templateName(root).c_str() : "", seat ? seat->getPcoId() : -1, pos.x, pos.y, pos.z);
-        // protocol.md v1: after a successful spawn the target goes back to the home group.
+        // After a successful spawn the target goes back to the home group.
         if (b.home >= 0 && group != b.home)
             p->setSpawnGroup(b.home);
         resetFallback(b);
     }
 
-    // Tracks a bot's camera view mode (TickState, v2 item 1) and logs its changes and the firing
-    // state changes (docs/findings/module-v1.md, Q11).
+    // Tracks a bot's camera view mode (TickState) and logs its changes and the firing
+    // state changes.
     void observe(Bot& b, world::IPlayer* p)
     {
         world::ICameraObject* cam = p->getCamera();
@@ -1802,7 +1801,7 @@ private:
         }
     }
 
-    // ---------------------------------------------------------------- vehicle set (v1)
+    // ---------------------------------------------------------------- vehicle set
 
     // The vehicle behind (id, stored), or null if the id no longer names that object. Only the
     // engine's own lookup result is dereferenced, never the stored pointer.
@@ -1911,7 +1910,7 @@ private:
         }
     }
 
-    // ---------------------------------------------------------------- projectiles (v2 item 5)
+    // ---------------------------------------------------------------- projectiles
 
     void sendProjectiles()
     {
@@ -1989,7 +1988,7 @@ private:
         }
     }
 
-    // ---------------------------------------------------------------- round state (v2 item 7)
+    // ---------------------------------------------------------------- round state
 
     void sendRoundState()
     {
@@ -2101,7 +2100,7 @@ private:
         }
     }
 
-    // v2 items 1 and 4: the own bot's camera view mode and the weapons in its active slots.
+    // The own bot's camera view mode and the weapons in its active slots.
     void fillOwnExtras(const Bot& b, world::IPlayer* p, proto::StateEntry& e)
     {
         if (!p->getIsAlive())
@@ -2174,7 +2173,7 @@ private:
                 if (!isOwnBot(m_vehicleOccupants[i].first, c->first))
                     m_entries.push_back(m_vehicleOccupants[i].second);
             m_stateBuf.clear();
-            // The snapshot is the end of the previous simulation tick (Q1).
+            // The snapshot is the end of the previous simulation tick.
             proto::encodeTickState(m_stateBuf, static_cast<uint32_t>(m_tick - 1), time, m_entries);
             g_channel->sendState(c->first, m_stateBuf);
         }
@@ -2205,11 +2204,11 @@ private:
     unsigned long m_skippedLogs = 0;
     unsigned long m_launches = 0;
     proto::LaunchCounter m_launchNumbers;  // never reset, so a number is never reused while loaded
-    unsigned long m_superseded = 0;        // v3 item 1: SetInputs replaced before their tick
+    unsigned long m_superseded = 0;        // SetInputs replaced before their tick
     unsigned long m_supersededMark = 0;
     unsigned long m_keptPresses = 0;       // ... of which kept a button the later one did not press
     unsigned long m_keptMark = 0;
-    unsigned long m_steers = 0;            // v3 item 3: SetTargetDirections applied
+    unsigned long m_steers = 0;            // SetTargetDirections applied
     unsigned long m_steersMark = 0;
     unsigned long m_steersSuperseded = 0;
     unsigned long m_steersRefused = 0;

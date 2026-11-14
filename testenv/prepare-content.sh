@@ -1,19 +1,21 @@
 #!/usr/bin/env bash
-# Extracts the netsky server content and turns it into a private OpenBF2 test run directory.
+# Extracts the server content from a BF2 server image and turns it into a private OpenBF2 test run directory.
+# The image must have the layout of the bf2-docker images (github.com/nihlen/bf2-docker): the server under
+# /home/bf2/tmp/srv, with ModManager.
 #
 # Usage (WSL):  testenv/prepare-content.sh <run-dir> <openbf2-build-dir>
-#   run-dir            agent-owned target, e.g. ~/serverext-testenv/srv (recreated from scratch)
+#   run-dir            your own target, e.g. ~/serverext-testenv/srv (recreated from scratch)
 #   openbf2-build-dir  the linux-x64 build dir; bin_linux/{bf2,libdice_py.so} replace the retail pair
 #
 # Environment (all optional):
-#   IMAGE        content image            (cr.nihlen.net/library/bf2-netsky:2v2-nocheck)
-#   GAME_PORT    sv.serverPort            (16571)   never 16567 / 16569
-#   GAMESPY_PORT sv.gameSpyPort           (29903)   never 29900 / 29901
-#   RCON_PORT    mm_rcon.rconPort         (4723)    never 4711 / 4721
+#   IMAGE        content image            (required: a BF2 server image you may use)
+#   GAME_PORT    sv.serverPort            (16571)   the default ports 16567, 29900 and 4711 are refused,
+#   GAMESPY_PORT sv.gameSpyPort           (29903)   so a test server never collides with a real one
+#   RCON_PORT    mm_rcon.rconPort         (4723)
 #   RCON_IP      mm_rcon.rconIp           (127.0.0.1; use 0.0.0.0 inside Docker)
 #   RCON_PASSWORD                         (random, printed once)
-#   WEBADMIN_HOST/WEBADMIN_PORT  where mm_webadmin connects (127.0.0.1:4303). Keep it away from the
-#                BF2WebAdmin local test's 4300 so this server never shows up in that admin.
+#   WEBADMIN_HOST/WEBADMIN_PORT  where mm_webadmin connects (127.0.0.1:4303). Keep it away from a real
+#                BF2WebAdmin's port so this server never shows up in that admin.
 #   SERVER_NAME  sv.serverName            (serverext test)
 #
 # Deviations from production, all in mods/bf2/settings: sv.internet 0 (no master-server
@@ -23,7 +25,7 @@ set -euo pipefail
 
 RUN=${1:?usage: prepare-content.sh <run-dir> <openbf2-build-dir>}
 BUILD=${2:?usage: prepare-content.sh <run-dir> <openbf2-build-dir>}
-IMAGE=${IMAGE:-cr.nihlen.net/library/bf2-netsky:2v2-nocheck}
+IMAGE=${IMAGE:?set IMAGE to a BF2 server content image}
 GAME_PORT=${GAME_PORT:-16571}
 GAMESPY_PORT=${GAMESPY_PORT:-29903}
 RCON_PORT=${RCON_PORT:-4723}

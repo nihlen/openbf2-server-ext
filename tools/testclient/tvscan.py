@@ -1,4 +1,4 @@
-"""TV-missile hitbox scan: scripted bots for the hit/miss replay tests (docs/findings/tv-hitbox.md).
+"""TV-missile hitbox scan: scripted bots for the hit/miss replay tests (docs/admin-channel.md "Hit/miss replay").
 
 One stepping bot-channel connection (protocol v4; the server needs serverext.cfg stepMode 1 and allowTeleport 1)
 flies a Z-10 crew hovering at G and an AH-1Z target that makes repeatable passes past C on dalian_2_v_2: a nose-on

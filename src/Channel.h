@@ -82,7 +82,7 @@ public:
     // Moves pending log lines into out; returns the number dropped since the last call.
     size_t drainLogs(std::deque<std::string>& out);
 
-    // --- stepped time (docs/protocol.md "v4: stepped time", R3) ---
+    // --- stepped time (docs/protocol.md "Stepped time", R3) ---
     static const uint32_t kMaxStepBudget = 300;
     // How long takeTicks waits for a grant or the next real-time tick (us), in place of the engine's 1 ms frame sleep
     static const int kStepWaitMicros = 2000;
@@ -95,7 +95,7 @@ public:
     // Main thread, once per frame (the engine's tick source): the ticks this frame runs, 0..maxTicks.
     // From the stepping connection's budget; without one, 30 Hz of a steady clock (a backlog beyond
     // maxTicks is dropped, as TickCalculator does). With none due it waits up to kStepWaitMicros: for a
-    // grant (step wakes it) or for the next real-time tick (docs/protocol.md v4, "Waiting for a grant").
+    // grant (step wakes it) or for the next real-time tick (docs/protocol.md "Stepped time").
     int takeTicks(int maxTicks);
     // The stepping connection, 0 if none.
     uint32_t steppingConnection() const;

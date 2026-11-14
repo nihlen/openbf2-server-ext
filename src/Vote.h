@@ -1,4 +1,4 @@
-// Server votes (docs/admin-channel-draft.md "Server votes"). Engine-free so the unit tests can drive
+// Server votes (docs/admin-channel.md "Server votes"). Engine-free so the unit tests can drive
 // it: the admin channel tells it which players may vote, which rows reach each player's
 // server-message box and which ballots arrive; it answers which players need the vote line
 // (again) and when the vote ends.

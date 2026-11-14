@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
-# Builds and runs the OpenBF2-on-netsky test container.
+# Builds and runs the test container: a retail BF2 server image with OpenBF2 and the module in it.
 #
 # Usage (WSL or Git Bash):  testenv/run-docker.sh build|start|stop|status|logs|rm
 #
-# Environment (optional):
+# Environment (optional, except BASE for build):
+#   BASE          build: the BF2 server image to build on (see Dockerfile)
 #   BIN_DIR       dir with bf2 + libdice_py.so (~/bf2-linux-serverext-testenv-bullseye/build/bin_linux)
 #   MODULE_DIR    dir with libserverext.so    (~/bf2-linux-serverext-testenv-bullseye/module)
 #   BOT_PORT      16702   bot channel: baked into serverext.cfg as botListen 0.0.0.0:$BOT_PORT and
-#                 published on 127.0.0.1 only (docs/protocol.md "Loading"). Never 16567.
+#                 published on 127.0.0.1 only (docs/configuration.md). Never 16567.
 #   WATCHDOG_TICKS 6      baked into serverext.cfg
 #   SERVEREXT_CFG_EXTRA   start: ';'-separated serverext.cfg lines appended in the container,
 #                 e.g. "allowRoundRestart 1" or "allowRoundRestart 1;spawnFallbackSeconds 5"
@@ -16,8 +17,8 @@
 #   GAMESPY_PORT  29903   published udp
 #   RCON_PORT     4723    published on 127.0.0.1, container side is ModManager's 4711
 #   RCON_PASSWORD         random if unset; read it back with `status`
-#   PUBLISH_IP    host address for the game/gamespy ports (all interfaces, like the BF2WebAdmin
-#                 local test). 127.0.0.1 keeps them off the LAN; a client on this PC still joins.
+#   PUBLISH_IP    host address for the game/gamespy ports (default: all interfaces). 127.0.0.1 keeps
+#                 them off the LAN; a client on the same machine still joins.
 #   EXTRA_ARGS    more `docker run` arguments
 # Only containers/images named $TESTENV_NAME are touched.
 set -euo pipefail
@@ -48,7 +49,7 @@ build)
     printf '# openbf2-server-ext bot channel (docs/protocol.md)\nbotListen 0.0.0.0:%s\nwatchdogTicks %s\n' \
         "$BOT_PORT" "$WATCHDOG_TICKS" > "$ctx/serverext.cfg"
     md5sum "$ctx/bf2" "$ctx/libdice_py.so" "$ctx/libserverext.so"
-    docker build -t "$TESTENV_NAME:latest" "$ctx"
+    docker build --build-arg BASE="${BASE:?set BASE to a BF2 server image}" -t "$TESTENV_NAME:latest" "$ctx"
     ;;
 start)
     docker run -d --name "$TESTENV_NAME" \

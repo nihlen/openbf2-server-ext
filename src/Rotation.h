@@ -1,6 +1,6 @@
 // Yaw, pitch and roll in docs/protocol.md's convention, to and from the rotation rows of an engine
 // matrix (row-major, rows right/up/forward/position). The same convention as Python's
-// getRotation/setRotation (docs/findings/admin-phase1.md, Framing and conventions). Engine-free.
+// getRotation/setRotation. Engine-free.
 
 #ifndef SERVEREXT_ROTATION_H
 #define SERVEREXT_ROTATION_H

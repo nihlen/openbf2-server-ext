@@ -1,4 +1,4 @@
-// serverext.cfg, docs/protocol.md "Loading". Engine-free.
+// serverext.cfg (docs/configuration.md). Engine-free.
 
 #ifndef SERVEREXT_CONFIG_H
 #define SERVEREXT_CONFIG_H
@@ -14,16 +14,16 @@ struct Config
     std::string listenHost;   // IPv4 dotted quad
     int listenPort;
     int watchdogTicks;
-    float enterRange;            // metres, v1
-    int spawnFallbackSeconds;    // v1
-    int spawnBlockedSeconds;     // v1
-    bool allowRoundRestart;      // v1
-    int maxConnections;          // v2: sidecar connections open at once
-    bool allowTeleport;          // v2: Teleport is refused unless set
-    float projectileRange;       // v2: metres around an own bot within which projectiles are reported
-    bool stepMode;               // v4: the module decides each frame's ticks (R3; test servers only)
+    float enterRange;            // metres
+    int spawnFallbackSeconds;
+    int spawnBlockedSeconds;
+    bool allowRoundRestart;
+    int maxConnections;          // sidecar connections open at once
+    bool allowTeleport;          // Teleport is refused unless set
+    float projectileRange;       // metres around an own bot within which projectiles are reported
+    bool stepMode;               // the module decides each frame's ticks (R3; test servers only)
 
-    // Admin channel (docs/findings/admin-phase1.md, Configuration). Off unless adminConnect is set.
+    // Admin channel (docs/configuration.md). Off unless adminConnect is set.
     bool adminEnabled;
     std::string adminHost;           // host name or address WebAdmin listens on
     int adminPort;

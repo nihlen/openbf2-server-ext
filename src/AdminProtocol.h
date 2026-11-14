@@ -1,5 +1,4 @@
-// Wire format of the admin channel, protocol version 1 (docs/findings/admin-phase1.md; design in
-// docs/admin-channel-draft.md). Engine-free: the admin I/O thread, the main thread and the unit
+// Wire format of the admin channel, protocol version 1 (docs/admin-channel.md). Engine-free: the admin I/O thread, the main thread and the unit
 // tests all use it. Framing, Writer and Reader are the bot channel's (Protocol.h).
 
 #ifndef SERVEREXT_ADMINPROTOCOL_H
@@ -79,9 +78,9 @@ enum ErrorCode : uint16_t
 const uint8_t kCapConsole = 1;
 const uint8_t kCapObjects = 2;
 const uint8_t kCapIdentity = 4;
-const uint8_t kCapScripts = 8;   // the script commands (docs/admin-channel-draft.md "Scripts")
-const uint8_t kCapSeatPreference = 16;   // SeatPreference (docs/admin-channel-draft.md "Seat preferences")
-const uint8_t kCapSetCollision = 32;     // SetCollision (docs/admin-channel-draft.md "Command semantics")
+const uint8_t kCapScripts = 8;   // the script commands (docs/admin-channel.md "Scripts")
+const uint8_t kCapSeatPreference = 16;   // SeatPreference (docs/admin-channel.md "Seat preferences")
+const uint8_t kCapSetCollision = 32;     // SetCollision (docs/admin-channel.md "Command semantics")
 
 // Subscribe streams.
 enum Stream : uint8_t
@@ -284,7 +283,7 @@ void readVec3(proto::Reader& r, float v[3]);
 
 // ---------------------------------------------------------------- session
 
-// The HMAC input for a proof (docs/findings/admin-phase1.md, Session).
+// The HMAC input for a proof (docs/admin-channel.md "Session").
 std::vector<uint8_t> proofTranscript(const char* label, const std::string& serverId, const uint8_t moduleNonce[kNonceSize],
                                      const uint8_t webAdminNonce[kNonceSize]);
 extern const char* const kWebAdminProofLabel;   // "OBF2-ADMIN-1 webadmin"

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Builds the release zip for the production game-server images (bf2-docker images/netsky-openbf2-*): OpenBF2
+# Builds the release zip, the binaries that replace a BF2 server's own in bin/amd-64: OpenBF2
 # (bf2, libdice_py.so) with the IServerExtension commits, this module (libserverext.so) and OpenBF2-BF2Hub
 # (libbf2hub.so), all in one zip that is unpacked into the server's bin/amd-64:
 #
@@ -16,9 +16,9 @@
 #   release/build.sh
 #
 # Environment (optional):
-#   OPENBF2_REPO, OPENBF2_REV   default ../OpenBF2 (C:\Data\Projects\OpenBF2), HEAD (branch serverext/r1)
+#   OPENBF2_REPO, OPENBF2_REV   default ../OpenBF2, HEAD (branch serverext/r1 of github.com/nihlen/OpenBF2)
 #   MODULE_REPO, MODULE_REV     default this repo, HEAD
-#   BF2HUB_REPO, BF2HUB_REV     default ../_ext/OpenBF2-BF2Hub (C:\Data\Projects\_ext\OpenBF2-BF2Hub), HEAD
+#   BF2HUB_REPO, BF2HUB_REV     default ../_ext/OpenBF2-BF2Hub, HEAD (github.com/B2BF/OpenBF2-BF2Hub)
 #   OUT                         output directory (release/out)
 #   JOBS                        parallel jobs (nproc)
 #   CLEAN=1                     delete the build directories first (a full build, as in CI)
@@ -29,8 +29,7 @@
 # Sources are commits, taken with `git archive` (uncommitted changes are reported and left out) and synced into the
 # docker volume serverext-release-build by content (rsync -c), so an unchanged file keeps its timestamp and the
 # OpenBF2 build stays incremental; the builder container is serverext-release-build and the image
-# serverext-release-builder:jammy (release/Dockerfile). None of them are shared with the BF2WebAdmin localtest
-# (bf2wa-openbf2-build). Run one build at a time.
+# serverext-release-builder:jammy (release/Dockerfile). Run one build at a time.
 set -euo pipefail
 export MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*'
 

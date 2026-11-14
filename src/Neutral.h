@@ -1,7 +1,7 @@
-// The watchdog neutral for a bot in a helicopter, docs/protocol.md v2 item 11 ("level and hold"):
+// The watchdog neutral for a bot in a helicopter, docs/protocol.md "Watchdog" ("level and hold"):
 // cyclic levels pitch and roll (P-D on the attitude), pedals damp the yaw rate, and collective is a
 // PI on vertical speed starting from the last collective, so it needs no per-vehicle hover value.
-// Gains and signs are the ones flown in docs/findings/q5-q9.md (NeutralEmulator "hover").
+// The gains and signs were tuned in flight on the stock attack helicopters.
 // Engine-free, so it is unit-tested.
 
 #ifndef SERVEREXT_NEUTRAL_H

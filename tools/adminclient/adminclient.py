@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Reference WebAdmin for the openbf2-server-ext admin channel, protocol version 1
-(docs/findings/admin-phase1.md; design in docs/admin-channel-draft.md).
+(docs/admin-channel.md).
 
 The module dials out, so this is a listener. It does TLS 1.3 with a self-signed certificate it
 creates on first use (and prints the SPKI pin for serverext.cfg's adminCertSha256), the HMAC
@@ -153,7 +153,7 @@ def frame(t, payload=b"", reserved=0):
     return struct.pack("<IHH", len(payload), t, reserved) + bytes(payload)
 
 
-# Structures (docs/findings/admin-phase1.md, State).
+# Structures (docs/admin-channel.md "State").
 
 def w_game(w, g):
     w.u8(g["status"]).u8(g["begin_round"]).f32(g["time_to_next"]).i32(g["tickets"][0]).i32(g["tickets"][1])
@@ -1056,7 +1056,7 @@ def scenario_r7(lst, args):
 
 
 def scenario_seat(lst, args):
-    """SeatPreference (docs/admin-channel-draft.md "Seat preferences"): Welcome capability bit 4, Error 4 for no
+    """SeatPreference (docs/admin-channel.md "Seat preferences"): Welcome capability bit 4, Error 4 for no
     such player, Error 7 for a seat that is not 0, 1 or 255, and Ok for a player on the server (--seat-player, else
     the snapshot's first). With --seat-keep the preference is left set and the link held for --seconds, so a live
     spawn can be watched in the server log ("seat order: ..."); without it the preference is cleared again."""
@@ -1159,7 +1159,7 @@ def seat_pair(link, c, args):
 
 
 def scenario_collision(lst, args):
-    """SetCollision (docs/admin-channel-draft.md "Command semantics"): Welcome capability bit 5, Error 4, 5 and 7, and
+    """SetCollision (docs/admin-channel.md "Command semantics"): Welcome capability bit 5, Error 4, 5 and 7, and
     with a bot-channel bot seated in a vehicle (serverext_client.py --scenario wreck: it climbs, then its pilot is
     removed and the heli falls): collision off on the bot's root object (sent twice: the second changes nothing, see
     the server log's "collision off ... N of M objects changed"), the vehicle's height and health logged for --seconds
@@ -1314,7 +1314,7 @@ def wait_finished(link, instance, timeout=5.0):
 
 
 def scenario_script(lst, args):
-    """Scripts (docs/admin-channel-draft.md "Scripts"): the commands, the life cycle and every end reason against a
+    """Scripts (docs/admin-channel.md "Scripts"): the commands, the life cycle and every end reason against a
     running server; with a bot-channel bot in the snapshot (serverext_client.py) also the host API against the player
     stream: game.player, teleport, setVelocity (a soft ceiling) and setAngularVelocity (axis and sign)."""
     c = Checks()

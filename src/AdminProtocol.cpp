@@ -26,7 +26,7 @@ const size_t kMaxFilters = 64;
 
 bool finite3(const float v[3]) { return std::isfinite(v[0]) && std::isfinite(v[1]) && std::isfinite(v[2]); }
 
-// The bot channel's world bounds (docs/protocol.md v2 Teleport).
+// The bot channel's world bounds (docs/protocol.md, Teleport).
 bool inWorld(const float p[3])
 {
     return std::fabs(p[0]) <= 8192.0f && std::fabs(p[2]) <= 8192.0f && p[1] >= -1000.0f && p[1] <= 10000.0f;
