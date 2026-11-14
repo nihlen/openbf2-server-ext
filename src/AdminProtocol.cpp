@@ -153,7 +153,7 @@ ProjectileHitEvent::ProjectileHitEvent() : id(0), owner(-1), flags(0), firstVict
 
 Command::Command()
     : type(0), session(0), requestId(0), player(0), target(0), flags(0), value8(0), seconds(0), index(0), size(0),
-      maxResults(0), clock(0), value(0.0f), target16(-1), netId(0)
+      maxResults(0), clock(0), value(0.0f), instance(0), target16(-1), netId(0)
 {
     for (int i = 0; i < 5; ++i)
         ints[i] = 0;
@@ -616,6 +616,22 @@ void encodeObjectSpawned(std::vector<uint8_t>& out, uint32_t requestId, uint32_t
     w.finish();
 }
 
+void encodeScriptList(std::vector<uint8_t>& out, uint32_t requestId,
+                      const std::vector<std::pair<uint32_t, std::string> >& scripts)
+{
+    Writer w(out);
+    w.begin(MsgScriptList);
+    w.u32(requestId);
+    const size_t n = scripts.size() > 255 ? 255 : scripts.size();
+    w.u8(static_cast<uint8_t>(n));
+    for (size_t i = 0; i < n; ++i)
+    {
+        w.u32(scripts[i].first);
+        w.str(scripts[i].second);
+    }
+    w.finish();
+}
+
 void encodePing(std::vector<uint8_t>& out, uint16_t type, uint32_t requestId, uint64_t clock)
 {
     Writer w(out);
@@ -938,6 +954,33 @@ void encodeVoteResult(std::vector<uint8_t>& out, uint32_t seq, uint32_t tick, ui
     w.finish();
 }
 
+void encodeScriptFinished(std::vector<uint8_t>& out, uint32_t seq, uint32_t tick, uint32_t instance,
+                          const std::string& name, uint8_t reason, const std::string& result, uint32_t calls,
+                          uint32_t totalUs, uint32_t maxUs)
+{
+    Writer w(out);
+    beginEvent(w, EvScriptFinished, seq, tick);
+    w.u32(instance);
+    w.str(name);
+    w.u8(reason);
+    w.str(result);
+    w.u32(calls);
+    w.u32(totalUs);
+    w.u32(maxUs);
+    w.finish();
+}
+
+void encodeScriptEvent(std::vector<uint8_t>& out, uint32_t seq, uint32_t tick, uint32_t instance, uint8_t kind,
+                       const std::string& payload)
+{
+    Writer w(out);
+    beginEvent(w, EvScriptEvent, seq, tick);
+    w.u32(instance);
+    w.u8(kind);
+    w.str(payload.size() > kMaxScriptPayload ? payload.substr(0, kMaxScriptPayload) : payload);
+    w.finish();
+}
+
 void encodeProjectileCollision(std::vector<uint8_t>& out, uint32_t seq, uint32_t tick, const ProjectileCollisionEvent& e)
 {
     Writer w(out);
@@ -1013,6 +1056,7 @@ bool isWebAdminMessage(uint16_t type)
     case CmdSetScore: case CmdRank: case CmdMedal: case CmdGameEvent: case CmdHudEvent: case CmdKick: case CmdBan:
     case CmdMap: case CmdListObjects: case CmdSetObjectActive: case CmdSpawnObject: case CmdDeleteObject:
     case CmdStartVote: case CmdCancelVote: case CmdHudEventRaw: case CmdRoundClock: case CmdSquadOrder:
+    case CmdStartScript: case CmdStopScript: case CmdScriptMessage: case CmdListScripts:
     case MsgPing: case MsgPong: case MsgError:
         return true;
     default:
@@ -1307,8 +1351,61 @@ bool parseCommand(uint16_t type, const uint8_t* p, size_t n, Command& out, std::
                           "the question must be 1..96 bytes of UTF-8 without control characters");
 
     case CmdCancelVote:
+    case CmdListScripts:
         out.requestId = r.u32();
         return r.done();
+
+    case CmdStartScript:
+    {
+        out.requestId = r.u32();
+        out.instance = r.u32();
+        out.value8 = r.u8();
+        out.flags = r.u8();
+        r.str(out.text);
+        r.str(out.text2);
+        r.str(out.source);
+        if (!r.done())
+            return false;
+        std::string unused;
+        if (out.instance == 0)
+            return bad(badValue, "the instance must not be 0");
+        if (out.value8 == 0)
+            return bad(badValue, "the script API version must be 1 or more");
+        if (out.flags != 0)
+            return bad(badValue, "flags must be 0");
+        if (out.text.empty() || out.text.size() > kMaxScriptName)
+            return bad(badValue, "the name must be 1..64 printable ASCII bytes");
+        for (size_t i = 0; i < out.text.size(); ++i)
+            if (static_cast<unsigned char>(out.text[i]) < 0x20 || static_cast<unsigned char>(out.text[i]) > 0x7E)
+                return bad(badValue, "the name must be 1..64 printable ASCII bytes");
+        if (!utf8ToCp1252(out.text2, unused))
+            return bad(badValue, "the arguments are not UTF-8");
+        if (out.source.empty() || out.source.size() > kMaxScriptSource)
+            return bad(badValue, "the source must be 1..60000 bytes");
+        if (!utf8ToCp1252(out.source, unused))
+            return bad(badValue, "the source is not UTF-8");
+        return true;
+    }
+
+    case CmdStopScript:
+        out.requestId = r.u32();
+        out.instance = r.u32();
+        return r.done();
+
+    case CmdScriptMessage:
+    {
+        out.requestId = r.u32();
+        out.instance = r.u32();
+        r.str(out.text2);
+        if (!r.done())
+            return false;
+        std::string unused;
+        if (out.text2.size() > kMaxScriptPayload)
+            return bad(badValue, "the message is at most 8192 bytes");
+        if (!utf8ToCp1252(out.text2, unused))
+            return bad(badValue, "the message is not UTF-8");
+        return true;
+    }
 
     case CmdHudEventRaw:
     {

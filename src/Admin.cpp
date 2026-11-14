@@ -41,6 +41,7 @@
 #include "Config.h"
 #include "EngineUtil.h"
 #include "Rotation.h"
+#include "Script.h"
 #include "Vote.h"
 
 using namespace dice::hfe;
@@ -183,7 +184,8 @@ class Admin : public AdminChannel,
               public IServerExtension::IScriptEventListener,
               public IServerExtension::IDamageObserver,
               public IServerExtension::IProjectileObserver,
-              public IServerExtension::IProjectileCollisionObserver
+              public IServerExtension::IProjectileCollisionObserver,
+              public script::World
 {
 public:
     Admin(const Config& config, AdminHost* host, AdminLogFn log)
@@ -193,7 +195,7 @@ public:
           m_projectileEvents(false), m_fireEvents(false), m_weaponEvents(false), m_firesDropped(0), m_replay(false),
           m_collisionsThisTick(0), m_collisionsDropped(0), m_tracesSent(0), m_tracesSkipped(0), m_r4(false),
           m_voteHook(false), m_voteRequest(0), m_voteReposts(0), m_selfPost(-1), m_selfSeen(false),
-          m_eventsSent(0), m_eventsDropped(0), m_commands(0)
+          m_scripts(this), m_scriptEventsDropped(0), m_eventsSent(0), m_eventsDropped(0), m_commands(0)
     {
         for (int i = 0; i < kCategories; ++i)
             m_bytes[i] = 0;
@@ -250,13 +252,14 @@ public:
         char buf[512];
         std::snprintf(buf, sizeof(buf),
                       "admin channel: protocol v%u, dial %s:%d, server id '%s', TLS %s, identity %d, console %d, objects %d, "
-                      "queue %d bytes; R4 1, status hook %d, unload hook %d, damage %d, projectile %d, collision %d, "
-                      "vote hook %d",
+                      "scripts %d (API %u), queue %d bytes; R4 1, status hook %d, unload hook %d, damage %d, projectile %d, "
+                      "collision %d, vote hook %d",
                       static_cast<unsigned>(kVersion), m_config.adminHost.c_str(), m_config.adminPort,
                       m_config.adminServerId.c_str(), m_config.adminTls ? "1.3 (pinned)" : "off (loopback test)",
                       m_config.adminIdentity() ? 1 : 0, m_config.adminAllowConsole ? 1 : 0,
-                      m_config.adminAllowObjects ? 1 : 0, m_config.adminQueueBytes, statusOk ? 1 : 0, hudOk ? 1 : 0,
-                      damageOk ? 1 : 0, projectileOk ? 1 : 0, collisionOk ? 1 : 0, m_voteHook ? 1 : 0);
+                      m_config.adminAllowObjects ? 1 : 0, m_config.adminAllowScripts ? 1 : 0,
+                      static_cast<unsigned>(script::kApiVersion), m_config.adminQueueBytes, statusOk ? 1 : 0,
+                      hudOk ? 1 : 0, damageOk ? 1 : 0, projectileOk ? 1 : 0, collisionOk ? 1 : 0, m_voteHook ? 1 : 0);
         m_describe = buf;
         return true;
     }
@@ -274,6 +277,10 @@ public:
         updateVote();
         if (m_session)
         {
+            // After this tick's commands, and before the state below is read, so events and streams
+            // of this tick already show what the scripts did.
+            if (m_scripts.count())
+                m_scripts.tick();
             sampleTraces();
             pollGameState();
             if (!m_cpsScanned || (m_cps.empty() && m_tick - m_lastCpScan >= kCpRescanTicks))
@@ -319,6 +326,9 @@ public:
         {
             if (m_vote.running())
                 endVote(vote::OutcomeUnloaded, false);
+            // GameServer::unload posts this first, so the scripts' stop handlers still see the players.
+            if (m_scripts.count())
+                m_scripts.levelUnload();
             m_cps.clear();
             m_cpEvents.clear();
             m_cpsScanned = false;
@@ -648,14 +658,20 @@ private:
     void reportStats()
     {
         const double seconds = kStatsPeriodTicks / 30.0;
-        logf("tick %lu: admin: session %u, events %llu sent %llu dropped, commands %llu; B/s events %.0f (fire %.0f) replies %.0f players %.0f vehicles %.0f projectiles %.0f game %.0f aim %.0f; fires dropped %llu; collisions dropped %llu, traces %llu sent %llu not traced; admin cost (us) p50 %.0f p99 %.0f max %.0f",
+        const script::Stats scripts = m_scripts.takeStats();
+        logf("tick %lu: admin: session %u, events %llu sent %llu dropped, commands %llu; B/s events %.0f (fire %.0f) replies %.0f players %.0f vehicles %.0f projectiles %.0f game %.0f aim %.0f; fires dropped %llu; collisions dropped %llu, traces %llu sent %llu not traced; scripts %u running, %llu calls, CPU (us) %.1f per call, %llu worst tick, %llu log lines and %llu events dropped; admin cost (us) p50 %.0f p99 %.0f max %.0f",
              m_tick, m_session, static_cast<unsigned long long>(m_eventsSent), static_cast<unsigned long long>(m_eventsDropped),
              static_cast<unsigned long long>(m_commands), m_bytes[CatEvents] / seconds, m_bytes[CatFire] / seconds,
              m_bytes[CatReplies] / seconds, m_bytes[CatPlayers] / seconds, m_bytes[CatVehicles] / seconds,
              m_bytes[CatProjectiles] / seconds, m_bytes[CatGame] / seconds, m_bytes[CatAim] / seconds,
              static_cast<unsigned long long>(m_firesDropped), static_cast<unsigned long long>(m_collisionsDropped),
              static_cast<unsigned long long>(m_tracesSent), static_cast<unsigned long long>(m_tracesSkipped),
+             static_cast<unsigned>(m_scripts.count()), static_cast<unsigned long long>(scripts.calls),
+             scripts.calls ? static_cast<double>(scripts.totalUs) / scripts.calls : 0.0,
+             static_cast<unsigned long long>(scripts.maxTickUs), static_cast<unsigned long long>(scripts.logsDropped),
+             static_cast<unsigned long long>(m_scriptEventsDropped),
              m_cost.pct(0.5), m_cost.pct(0.99), m_cost.max());
+        m_scriptEventsDropped = 0;
         m_firesDropped = 0;
         m_collisionsDropped = m_tracesSent = m_tracesSkipped = 0;
         for (int i = 0; i < kCategories; ++i)
@@ -995,6 +1011,9 @@ private:
 
     void onLinkUp(uint32_t session)
     {
+        // Scripts do not outlive their link; a link that was replaced without a LinkDown ends them here.
+        if (m_scripts.count())
+            m_scripts.linkClosed();
         m_session = session;
         m_seq = 0;
         m_pending.clear();
@@ -1038,7 +1057,7 @@ private:
             w.maxPlayers = clampU8(server.maxPlayers);
         }
         w.capabilities = (m_config.adminAllowConsole ? kCapConsole : 0) | (m_config.adminAllowObjects ? kCapObjects : 0) |
-                         (m_config.adminIdentity() ? kCapIdentity : 0);
+                         (m_config.adminIdentity() ? kCapIdentity : 0) | (m_config.adminAllowScripts ? kCapScripts : 0);
         w.map = cp1252ToUtf8(m_game->getCurrentMapName());
         w.mode = cp1252ToUtf8(m_game->getCurrentMapGameMode());
         const int size = m_game->getCurrentMapSize();
@@ -1071,6 +1090,11 @@ private:
     void onLinkDown()
     {
         logf("tick %lu: admin: link session %u closed after %u events", m_tick, m_session, m_seq);
+        if (m_scripts.count())
+        {
+            logf("tick %lu: admin: ending %u scripts with the link", m_tick, static_cast<unsigned>(m_scripts.count()));
+            m_scripts.linkClosed();
+        }
         m_session = 0;
         m_pending.clear();
         m_projectiles.clear();
@@ -2046,10 +2070,221 @@ private:
         case CmdHudEventRaw: onHudEventRaw(c); return;
         case CmdRoundClock: onRoundClock(c); return;
         case CmdSquadOrder: onSquadOrder(c); return;
+        case CmdStartScript: onStartScript(c); return;
+        case CmdStopScript: onStopScript(c); return;
+        case CmdScriptMessage: onScriptMessage(c); return;
+        case CmdListScripts: onListScripts(c); return;
         default:
             error(c.requestId, ErrUnknownType, "unexpected message type");
             return;
         }
+    }
+
+    // ---------------------------------------------------------------- scripts (docs/admin-channel-draft.md "Scripts")
+
+    void onStartScript(const Command& c)
+    {
+        if (!m_config.adminAllowScripts)
+        {
+            error(c.requestId, ErrDisabled, "scripts are disabled (adminAllowScripts 0)");
+            return;
+        }
+        std::string why;
+        const uint16_t code = m_scripts.start(c.instance, c.value8, c.text, c.text2, c.source, why);
+        if (code != script::Ok)
+        {
+            std::string line = why.substr(0, 400);
+            for (size_t i = 0; i < line.size(); ++i)
+                if (line[i] == '\n')
+                    line[i] = '|';
+            logf("tick %lu: admin: script '%s' (%u) not started: %s", m_tick, c.text.c_str(), c.instance, line.c_str());
+            error(c.requestId, code, why);
+            return;
+        }
+        logf("tick %lu: admin: script '%s' (%u) started, %u bytes of source, %u running", m_tick, c.text.c_str(),
+             c.instance, static_cast<unsigned>(c.source.size()), static_cast<unsigned>(m_scripts.count()));
+        ok(c.requestId);
+        m_scripts.settle();   // a script that finished in its top-level code is reported after the Ok
+    }
+
+    void onStopScript(const Command& c)
+    {
+        std::string why;
+        const uint16_t code = m_scripts.stop(c.instance, why);
+        if (code != script::Ok)
+        {
+            error(c.requestId, code, why);
+            return;
+        }
+        ok(c.requestId);
+        m_scripts.settle();
+    }
+
+    void onScriptMessage(const Command& c)
+    {
+        std::string why;
+        const uint16_t code = m_scripts.message(c.instance, c.text2, why);
+        if (code != script::Ok)
+            error(c.requestId, code, why);
+        else
+            ok(c.requestId);
+        m_scripts.settle();
+    }
+
+    void onListScripts(const Command& c)
+    {
+        std::vector<std::pair<uint32_t, std::string> > scripts;
+        m_scripts.list(scripts);
+        std::vector<uint8_t> f;
+        encodeScriptList(f, c.requestId, scripts);
+        reply(f);
+    }
+
+    // script::World: the game as a script sees it. Called from inside m_scripts' entry points, on the
+    // main thread.
+
+    virtual void players(std::vector<int>& ids)
+    {
+        const std::list<world::IPlayer*>& players = m_players->getPlayers();
+        for (std::list<world::IPlayer*>::const_iterator it = players.begin(); it != players.end(); ++it)
+            if (*it && (*it)->getId() >= 0 && (*it)->getId() <= 255)
+                ids.push_back((*it)->getId());
+    }
+
+    virtual bool player(int id, script::PlayerView& out)
+    {
+        world::IPlayer* p = id >= 0 && id <= 255 ? player(static_cast<uint8_t>(id)) : 0;
+        if (!p)
+            return false;
+        out.id = id;
+        out.name = cp1252ToUtf8(p->getName());
+        out.team = p->getTeam();
+        out.alive = p->getIsAlive();
+        out.bot = p->getIsAIPlayer();
+        IPlayerControlObject* seat = seatOf(p, 0);
+        out.seated = seat != 0;
+        out.seat = seat ? seat->getPcoId() : -1;
+        IObject* root = rootOfPlayer(p);
+        out.hasRoot = root != 0;
+        if (root)
+        {
+            out.rootId = netIdOf(root);
+            out.vehicle = cp1252ToUtf8(templateName(root));
+            placeOf(root, out.pos, out.rot);
+            velocityOf(root, out.vel);
+        }
+        return true;
+    }
+
+    // The player's root object for a script's command, or null.
+    IObject* scriptRoot(int id)
+    {
+        world::IPlayer* p = id >= 0 && id <= 255 ? player(static_cast<uint8_t>(id)) : 0;
+        return rootOfPlayer(p);
+    }
+
+    // The body of the Teleport command, without its log line: a script may call it every tick.
+    virtual bool teleport(int id, const float* pos, const float* rot)
+    {
+        IObject* root = scriptRoot(id);
+        if (!root)
+            return false;
+        Mat4 t = root->getAbsoluteTransformation();
+        if (rot)
+            matrixFromAttitude(rot, t.m);
+        if (pos)
+        {
+            t.m[12] = pos[0];
+            t.m[13] = pos[1];
+            t.m[14] = pos[2];
+        }
+        root->setAbsoluteTransformation(t);
+        if (pos)
+        {
+            IPhysicsNode* node = static_cast<IPhysicsNode*>(root->queryComponent(IID_IPhysicsNode, IID_IPhysicsNode));
+            if (node)
+            {
+                node->reset(true);
+                node->setIsAwake();
+            }
+        }
+        return true;
+    }
+
+    bool setSpeed(int id, const float v[3], bool angular)
+    {
+        IObject* root = scriptRoot(id);
+        IPhysicsNode* node = root ? static_cast<IPhysicsNode*>(root->queryComponent(IID_IPhysicsNode, IID_IPhysicsNode)) : 0;
+        if (!node)
+            return false;
+        Vec3 speed;
+        speed.x = v[0];
+        speed.y = v[1];
+        speed.z = v[2];
+        if (angular)
+            node->setRotationalSpeed(speed);
+        else
+            node->setPositionalSpeed(speed);
+        node->setIsAwake();
+        return true;
+    }
+
+    virtual bool setVelocity(int id, const float v[3]) { return setSpeed(id, v, false); }
+    virtual bool setAngularVelocity(int id, const float v[3]) { return setSpeed(id, v, true); }
+
+    virtual void say(const std::string& text, int playerId)
+    {
+        std::string line;
+        if (!utf8ToCp1252(text, line) || line.empty())
+            return;
+        if (playerId < 0)
+            m_server->sayAll(line);
+        else if (player(static_cast<uint8_t>(playerId)))
+            m_server->say(line, static_cast<TargetChannel>(14), static_cast<ChannelMessageType>(1), 0,
+                          static_cast<unsigned int>(playerId));
+    }
+
+    virtual std::string map() { return cp1252ToUtf8(m_game->getCurrentMapName()); }
+    virtual uint32_t tick() { return tickNumber(); }
+    virtual double time() { return now(); }
+    virtual uint64_t cpuMicros() { return script::threadCpuMicros(); }
+
+    virtual void log(uint32_t instance, const std::string& name, const std::string& line)
+    {
+        std::string text = line.substr(0, 500);
+        for (size_t i = 0; i < text.size(); ++i)
+            if (static_cast<unsigned char>(text[i]) < 0x20)
+                text[i] = '|';   // one log line per call
+        logf("tick %lu: admin: script '%s' (%u): %s", m_tick, name.c_str(), instance, text.c_str());
+    }
+
+    virtual void scriptEvent(uint32_t instance, uint8_t kind, const std::string& payload)
+    {
+        if (!m_session)
+            return;
+        // Like every event, it uses up a sequence number even when the queue is full, so WebAdmin sees the gap.
+        const uint64_t dropped = m_eventsDropped;
+        std::vector<uint8_t> f;
+        encodeScriptEvent(f, ++m_seq, tickNumber(), instance, kind, payload);
+        event(f);
+        m_scriptEventsDropped += m_eventsDropped - dropped;
+    }
+
+    virtual void scriptFinished(uint32_t instance, const std::string& name, uint8_t reason, const std::string& result,
+                                uint32_t calls, uint32_t totalUs, uint32_t maxUs)
+    {
+        const bool failed = reason == script::ReasonError || reason == script::ReasonBudget;
+        std::string why = failed ? result.substr(0, 400) : std::string();
+        for (size_t i = 0; i < why.size(); ++i)
+            if (why[i] == '\n')
+                why[i] = '|';   // the stack, on the one log line
+        logf("tick %lu: admin: script '%s' (%u) ended, reason %u, %u calls, CPU %u us in all, %u us the longest%s%s",
+             m_tick, name.c_str(), instance, reason, calls, totalUs, maxUs, failed ? ": " : "", why.c_str());
+        if (!m_session)
+            return;
+        std::vector<uint8_t> f;
+        encodeScriptFinished(f, ++m_seq, tickNumber(), instance, name, reason, result, calls, totalUs, maxUs);
+        event(f);
     }
 
     // ---------------------------------------------------------------- R7 client presentation hooks
@@ -2894,6 +3129,9 @@ private:
     std::vector<uint8_t> m_ids;
     std::vector<PlayerState> m_states;
     std::vector<uint8_t> m_frame;
+
+    script::Host m_scripts;
+    uint64_t m_scriptEventsDropped;
 
     uint64_t m_eventsSent, m_eventsDropped, m_commands;
     double m_bytes[kCategories];

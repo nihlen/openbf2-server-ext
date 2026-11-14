@@ -16,12 +16,17 @@ Python 3 standard library plus the openssl command-line tool (certificate creati
   python3 adminclient.py --key <hex> --fuzz
   python3 adminclient.py --write-golden ../../tests/fixtures/admin-v1-golden.txt
 
-Scenarios: listen, commands, resync, stall, soak, wrongkey, mapchange. Port 16567 is refused.
+  python3 adminclient.py --key <hex> --scenario script                  # scripts; with a bot also the host API
+  python3 adminclient.py --key <hex> --scenario runscript --script-file x.js --script-args '{"a":1}' --seconds 20
+  python3 adminclient.py --key <hex> --scenario scriptends              # a map change and a closed link end scripts
+
+Scenarios: listen, commands, resync, stall, soak, wrongkey, mapchange, script and more. Port 16567 is refused.
 """
 
 import argparse
 import hashlib
 import hmac
+import json
 import math
 import os
 import random
@@ -46,19 +51,21 @@ EV_SCORE_CHANGE, EV_KILL, EV_DAMAGE, EV_ENTER_VEHICLE, EV_EXIT_VEHICLE = 0x120A,
 EV_VEHICLE_DESTROYED, EV_CONTROL_POINT, EV_CHAT, EV_PROJECTILE_FIRED = 0x120F, 0x1210, 0x1211, 0x1212
 EV_PROJECTILE_HIT, EV_KICK, EV_BAN, EV_BOT = 0x1213, 0x1214, 0x1215, 0x1216
 EV_WEAPON_FIRE, EV_WEAPONS, EV_PROJECTILE_COLLISION, EV_PROJECTILE_TRACE = 0x1217, 0x1218, 0x1219, 0x121A
-EV_VOTE_RESULT = 0x121B
+EV_VOTE_RESULT, EV_SCRIPT_FINISHED, EV_SCRIPT_EVENT = 0x121B, 0x121C, 0x121D
 CMD_CONSOLE, CMD_SAY, CMD_TELEPORT, CMD_SET_HEALTH, CMD_KILL_PLAYER = 0x1301, 0x1302, 0x1303, 0x1304, 0x1305
 CMD_SET_TEAM, CMD_SET_SCORE, CMD_RANK, CMD_MEDAL, CMD_GAME_EVENT = 0x1306, 0x1307, 0x1308, 0x1309, 0x130A
 CMD_HUD_EVENT, CMD_KICK, CMD_BAN, CMD_MAP, CMD_LIST_OBJECTS = 0x130B, 0x130C, 0x130D, 0x130E, 0x130F
 CMD_SET_OBJECT_ACTIVE, CMD_SPAWN_OBJECT, CMD_DELETE_OBJECT = 0x1310, 0x1311, 0x1312
 CMD_START_VOTE, CMD_CANCEL_VOTE = 0x1313, 0x1314
 CMD_HUD_EVENT_RAW, CMD_ROUND_CLOCK, CMD_SQUAD_ORDER = 0x1315, 0x1316, 0x1317
-OK, CONSOLE_RESULT, OBJECT_LIST, OBJECT_SPAWNED = 0x1401, 0x1402, 0x1403, 0x1404
+CMD_START_SCRIPT, CMD_STOP_SCRIPT, CMD_SCRIPT_MESSAGE, CMD_LIST_SCRIPTS = 0x1318, 0x1319, 0x131A, 0x131B
+OK, CONSOLE_RESULT, OBJECT_LIST, OBJECT_SPAWNED, SCRIPT_LIST = 0x1401, 0x1402, 0x1403, 0x1404, 0x1405
 PING, PONG, ERROR = 0x1501, 0x1502, 0xFFFF
 
 NAMES = {v: k for k, v in list(globals().items()) if isinstance(v, int) and k.isupper() and 0x1000 <= v <= 0xFFFF
          and k not in ("VERSION",)}
-EVENT_TYPES = range(0x1201, 0x121C)
+EVENT_TYPES = range(0x1201, 0x121E)
+CAP_CONSOLE, CAP_OBJECTS, CAP_IDENTITY, CAP_SCRIPTS = 1, 2, 4, 8
 VOTE_OUTCOMES = {1: "passed", 2: "failed", 3: "cancelled", 4: "level unload"}
 
 STREAMS = {"players": 1, "vehicles": 2, "projectiles": 3, "game": 4, "aim": 5, "damage": 16, "projectile-events": 17,
@@ -334,6 +341,11 @@ def decode(t, payload):
             m["samples"] = samples
         elif t == EV_VOTE_RESULT:
             m.update(request=r.u32(), text=r.s(), outcome=r.u8(), yes=r.u16(), no=r.u16(), eligible=r.u16())
+        elif t == EV_SCRIPT_FINISHED:
+            m.update(instance=r.u32(), script=r.s(), reason=r.u8(), result=r.s(), calls=r.u32(), total_us=r.u32(),
+                     max_us=r.u32())
+        elif t == EV_SCRIPT_EVENT:
+            m.update(instance=r.u32(), kind=r.u8(), payload=r.s())
     elif t == OK:
         m.update(request=r.u32())
     elif t == CONSOLE_RESULT:
@@ -345,6 +357,9 @@ def decode(t, payload):
                          "health": r.f32(), "flags": r.u8()} for _ in range(r.u16())]
     elif t == OBJECT_SPAWNED:
         m.update(request=r.u32(), obj=r.u32(), net=r.u32())
+    elif t == SCRIPT_LIST:
+        m.update(request=r.u32())
+        m["scripts"] = [(r.u32(), r.s()) for _ in range(r.u8())]
     elif t in (PING, PONG):
         m.update(request=r.u32(), clock=r.u64())
     elif t == ERROR:
@@ -424,6 +439,14 @@ def p_hud_event_raw(req, player, event, payload=b""):
 
 
 def p_round_clock(req, player, seconds): return W().u32(req).i16(player).f32(seconds).b
+
+
+def p_start_script(req, instance, name, source, args="", api=1, flags=0):
+    """args is JSON text, or empty for none; source is JavaScript."""
+    return W().u32(req).u32(instance).u8(api).u8(flags).s(name).s(args).s(source).b
+
+
+def p_script_message(req, instance, message): return W().u32(req).u32(instance).s(message).b
 
 
 def p_squad_order(req, team, squad, order, commander=False, target_net=0, points=((0, 0, 0),) * 3):
@@ -605,6 +628,15 @@ def golden_samples():
     s["cmd_round_clock"] = (CMD_ROUND_CLOCK, p_round_clock(30, 3, 90.5))
     s["cmd_squad_order"] = (CMD_SQUAD_ORDER, p_squad_order(31, 2, 1, 8, True, 1819,
                                                            ((10.0, 0, 0), (0, 20.0, 0), (0, 0, 30.0))))
+    s["cmd_start_script"] = (CMD_START_SCRIPT, p_start_script(30, 7, "nasa", "script.onTick(() => {});",
+                                                              '{"altitude":300}'))
+    s["cmd_stop_script"] = (CMD_STOP_SCRIPT, W().u32(31).u32(7).b)
+    s["cmd_script_message"] = (CMD_SCRIPT_MESSAGE, p_script_message(32, 7, '{"altitude":250}'))
+    s["cmd_list_scripts"] = (CMD_LIST_SCRIPTS, W().u32(33).b)
+    s["script_list"] = (SCRIPT_LIST, W().u32(33).u8(2).u32(7).s("nasa").u32(9).s("dance").b)
+    s["ev_script_finished"] = (EV_SCRIPT_FINISHED, ev(28).u32(7).s("nasa").u8(1).s('{"ticks":90}').u32(90).u32(1234)
+                               .u32(56).b)
+    s["ev_script_event"] = (EV_SCRIPT_EVENT, ev(29).u32(7).u8(1).s('{"player":3,"y":301.5}').b)
     return s
 
 
@@ -773,7 +805,7 @@ class Link:
             if not f:
                 continue
             m = self.handle(*f)
-            if m["type"] in (OK, CONSOLE_RESULT, OBJECT_LIST, OBJECT_SPAWNED, ERROR, PONG, SNAPSHOT) and \
+            if m["type"] in (OK, CONSOLE_RESULT, OBJECT_LIST, OBJECT_SPAWNED, SCRIPT_LIST, ERROR, PONG, SNAPSHOT) and \
                     m.get("request") == req:
                 return m
         raise TimeoutError("no reply to request %d (%s)" % (req, NAMES.get(t, t)))
@@ -1060,6 +1092,439 @@ def scenario_vote(lst, args):
         VOTE_OUTCOMES.get(result["outcome"], result["outcome"]), result["yes"], result["no"], result["eligible"], lines,
         result["text"]))
     return 0
+
+SCRIPT_REASONS = {1: "finished", 2: "stopped", 3: "error", 4: "over budget", 5: "level unload"}
+
+
+def script_events(link, instance, start=0):
+    return [m for m in link.events[start:] if m["type"] == EV_SCRIPT_EVENT and m["instance"] == instance]
+
+
+def wait_finished(link, instance, timeout=5.0):
+    """Waits for a script's ScriptFinished, looking at every event received so far too."""
+    end = time.time() + timeout
+    while True:
+        for m in link.events:
+            if m["type"] == EV_SCRIPT_FINISHED and m["instance"] == instance:
+                return m
+        if time.time() >= end:
+            return None
+        link.pump(0.1)
+
+
+def scenario_script(lst, args):
+    """Scripts (docs/admin-channel-draft.md "Scripts"): the commands, the life cycle and every end reason against a
+    running server; with a bot-channel bot in the snapshot (serverext_client.py) also the host API against the player
+    stream: game.player, teleport, setVelocity (a soft ceiling) and setAngularVelocity (axis and sign)."""
+    c = Checks()
+    link = lst.accept(args.accept_timeout)
+    rq = link.next_request
+    if args.vote_delay > 0:
+        link.pump(args.vote_delay)
+    c.check(link.welcome["caps"] & CAP_SCRIPTS, "Welcome capability bit 3 (scripts) is set: caps %d" % link.welcome["caps"])
+
+    def start(instance, name, source, script_args="", api=1, flags=0):
+        return link.request(CMD_START_SCRIPT, p_start_script(rq(), instance, name, source, script_args, api, flags))
+
+    # A script that counts ticks, emits each one and finishes itself.
+    r = start(1, "count", "let n = 0;\n"
+                          "script.onStop(reason => script.emit({ stop: reason }));\n"
+                          "script.onTick(tick => {\n"
+                          "  n++;\n"
+                          "  script.emit({ n, tick, gameTick: game.tick });\n"
+                          "  if (n === script.args.ticks) script.finish({ ticks: n });\n"
+                          "});\n", '{"ticks":5}')
+    c.check(r["name"] == "OK", "StartScript -> Ok (%s)" % r.get("message", ""))
+    fin = wait_finished(link, 1)
+    evs = [json.loads(m["payload"]) for m in script_events(link, 1) if m["kind"] == 1]
+    c.check(fin is not None and fin["reason"] == 1 and fin["result"] == '{"ticks":5}' and fin["script"] == "count",
+            "ScriptFinished reason 1 with the result: %s" % (fin and {k: fin[k] for k in ("reason", "result", "calls", "total_us", "max_us")},))
+    c.check(len(evs) == 6 and [e.get("n") for e in evs[:5]] == [1, 2, 3, 4, 5] and evs[5] == {"stop": "finished"},
+            "five ScriptEvents, one per tick, then the stop handler's: %s" % (evs,))
+    ticks = [e["tick"] for e in evs[:5]]
+    c.check(all(b - a == 1 for a, b in zip(ticks, ticks[1:])) and all(e["tick"] == e["gameTick"] for e in evs[:5]),
+            "consecutive ticks, and the handler's tick is game.tick: %s" % (ticks,))
+    c.check(fin is not None and fin["calls"] == 7, "7 calls: the top level, 5 ticks and the stop handler (%s)" % (fin and fin["calls"],))
+
+    # The world as the script sees it, against Welcome and the snapshot.
+    snap = link.request(REQUEST_SNAPSHOT, W().u32(rq()).b)
+    r = start(2, "world", "script.emit({ api: script.api, name: script.name, args: script.args, map: game.map,\n"
+                          "  rate: game.tickRate, tick: game.tick, time: game.time, players: game.players() });\n"
+                          "script.log('hello', 1, true);\n"
+                          "game.say('§C1001script say é');\n"
+                          "script.finish();\n")
+    fin = wait_finished(link, 2)
+    evs = script_events(link, 2)
+    world = json.loads(evs[0]["payload"]) if evs else {}
+    ids = sorted(p["id"] for p in snap["players"])
+    c.check(r["name"] == "OK" and fin is not None and fin["reason"] == 1 and fin["result"] == "",
+            "a script that finishes in its top-level code: Ok, then ScriptFinished reason 1 with no result")
+    c.check(world.get("api") == 1 and world.get("name") == "world" and world.get("args") is None and
+            world.get("map") == link.welcome["map"] and world.get("rate") == 30 and sorted(world.get("players", [])) == ids,
+            "script.api/name/args, game.map/tickRate/players(): %s (snapshot players %s)" % (world, ids))
+    c.check(len(evs) == 2 and evs[1]["kind"] == 2 and evs[1]["payload"] == "hello 1 true", "script.log -> ScriptEvent kind 2 %r" % (evs[1:],))
+    chat = link.wait_event(lambda m: m["type"] == EV_CHAT and "script say" in m["text"], 3)
+    c.check(chat is not None and chat["text"] == "§C1001script say é" and chat["sender"] == -1,
+            "game.say -> Chat event from the server: %r" % (chat and chat["text"],))
+
+    # A long-running script: ListScripts, ScriptMessage, StopScript.
+    r = start(3, "echo", "script.onMessage(m => script.emit({ got: m }));\n"
+                         "script.onStop(reason => script.emit({ stop: reason }));\n"
+                         "script.onTick(() => {});\n")
+    c.check(r["name"] == "OK", "StartScript of a script that keeps running -> Ok")
+    r = link.request(CMD_LIST_SCRIPTS, W().u32(rq()).b)
+    c.check(r["name"] == "SCRIPT_LIST" and r["scripts"] == [(3, "echo")], "ListScripts -> %s" % (r.get("scripts"),))
+    r = start(3, "again", "1;")
+    c.check(r["name"] == "ERROR" and r["code"] == ERR_REFUSED, "StartScript with a running script's instance -> Error 6")
+    r = link.request(CMD_SCRIPT_MESSAGE, p_script_message(rq(), 3, '{"altitude":250}'))
+    ev = link.wait_event(lambda m: m["type"] == EV_SCRIPT_EVENT and m["instance"] == 3, 3)
+    c.check(r["name"] == "OK" and ev is not None and json.loads(ev["payload"]) == {"got": {"altitude": 250}},
+            "ScriptMessage -> Ok and the handler's ScriptEvent %r" % (ev and ev["payload"],))
+    r = link.request(CMD_SCRIPT_MESSAGE, p_script_message(rq(), 3, "{altitude:250}"))
+    c.check(r["name"] == "ERROR" and r["code"] == ERR_INVALID, "ScriptMessage that is not JSON -> Error 7 (%s)" % r.get("message"))
+    r = link.request(CMD_SCRIPT_MESSAGE, p_script_message(rq(), 99, "1"))
+    c.check(r["name"] == "ERROR" and r["code"] == ERR_UNAVAILABLE, "ScriptMessage to no script -> Error 5")
+    link.pump(1.0)
+    seen = len(link.events)
+    r = link.request(CMD_STOP_SCRIPT, W().u32(rq()).u32(3).b)
+    fin = wait_finished(link, 3)
+    stop_ev = script_events(link, 3, seen)
+    c.check(r["name"] == "OK" and fin is not None and fin["reason"] == 2 and fin["result"] == "" and
+            len(stop_ev) == 1 and json.loads(stop_ev[0]["payload"]) == {"stop": "stopped"},
+            "StopScript -> Ok, the stop handler's event, ScriptFinished reason 2 after %s calls" % (fin and fin["calls"],))
+    if fin:
+        log("  the idle script: %d calls, CPU %d us in all (%.2f us per call), longest %d us" % (
+            fin["calls"], fin["total_us"], fin["total_us"] / max(fin["calls"], 1), fin["max_us"]))
+    r = link.request(CMD_STOP_SCRIPT, W().u32(rq()).u32(3).b)
+    c.check(r["name"] == "ERROR" and r["code"] == ERR_UNAVAILABLE, "StopScript of no script -> Error 5")
+    r = link.request(CMD_LIST_SCRIPTS, W().u32(rq()).b)
+    c.check(r["name"] == "SCRIPT_LIST" and r["scripts"] == [], "ListScripts -> none")
+
+    # Errors.
+    r = start(4, "throws", "function boom() {\n  throw new Error('boom');\n}\nscript.onTick(() => boom());\n")
+    fin = wait_finished(link, 4)
+    c.check(r["name"] == "OK" and fin is not None and fin["reason"] == 3 and "Error: boom" in fin["result"] and
+            "throws:2:" in fin["result"], "a handler that throws -> ScriptFinished reason 3: %r" % (fin and fin["result"],))
+    r = start(5, "loops", "script.onTick(() => { for (;;) {} });\n")
+    fin = wait_finished(link, 5)
+    c.check(r["name"] == "OK" and fin is not None and fin["reason"] == 4 and "over the time budget" in fin["result"],
+            "an endless loop -> ScriptFinished reason 4: %r, longest call %s us" % (
+                fin and fin["result"].split("\n")[0], fin and fin["max_us"]))
+    r = link.request(PING, p_ping(rq(), 77))
+    c.check(r["name"] == "PONG" and r["clock"] == 77, "the server still ticks (Ping -> Pong)")
+    r = start(6, "syntax", "let a = 1;\nlet b = ;\n")
+    c.check(r["name"] == "ERROR" and r["code"] == ERR_INVALID and "SyntaxError" in r["message"] and "syntax:2:" in r["message"],
+            "a syntax error -> Error 7 with its line: %r" % (r.get("message"),))
+    r = start(6, "toplevel", "null.x;\n")
+    c.check(r["name"] == "ERROR" and r["code"] == ERR_INVALID and "TypeError" in r["message"],
+            "top-level code that throws -> Error 7: %r" % (r.get("message", "").split("\n")[0],))
+    r = start(6, "args", "1;", "{nope}")
+    c.check(r["name"] == "ERROR" and r["code"] == ERR_INVALID, "arguments that are not JSON -> Error 7 (%s)" % r.get("message", "").split("\n")[0])
+    r = start(6, "newer", "1;", "", 2)
+    c.check(r["name"] == "ERROR" and r["code"] == ERR_UNAVAILABLE, "script API 2 -> Error 5 (%s)" % r.get("message"))
+    r = start(6, "flags", "1;", "", 1, 1)
+    c.check(r["name"] == "ERROR" and r["code"] == ERR_INVALID, "flags 1 -> Error 7")
+    r = start(0, "zero", "1;")
+    c.check(r["name"] == "ERROR" and r["code"] == ERR_INVALID, "instance 0 -> Error 7")
+    r = start(6, "bad\tname", "1;")
+    c.check(r["name"] == "ERROR" and r["code"] == ERR_INVALID, "a name with a control character -> Error 7")
+    r = start(6, "absent", "script.emit(['Date', 'RegExp', 'Proxy', 'setTimeout', 'console', 'std', 'os']\n"
+                            "  .filter(n => typeof globalThis[n] !== 'undefined'));\n"
+                            "let e1 = ''; try { eval('1'); } catch (e) { e1 = e.name; }\n"
+                            "let e2 = ''; try { new Function('return 1'); } catch (e) { e2 = e.name; }\n"
+                            "script.emit([e1, e2]); script.finish();\n")
+    fin = wait_finished(link, 6)
+    evs = [m["payload"] for m in script_events(link, 6)]
+    c.check(r["name"] == "OK" and evs == ['[]', '["TypeError","TypeError"]'],
+            "no Date, RegExp, Proxy, timers, console, std or os; eval and Function throw: %s" % (evs,))
+
+    # Eight scripts at most; then all end with the ninth refused.
+    ok = 0
+    for i in range(8):
+        r = start(10 + i, "slot%d" % i, "script.onTick(() => {});\n")
+        ok += r["name"] == "OK"
+    r = start(18, "ninth", "1;")
+    c.check(ok == 8 and r["name"] == "ERROR" and r["code"] == ERR_REFUSED, "8 scripts run, the ninth -> Error 6")
+    link.pump(2.0)
+    for i in range(8):
+        link.request(CMD_STOP_SCRIPT, W().u32(rq()).u32(10 + i).b)
+    link.pump(0.3)
+    fins = [m for m in link.events if m["type"] == EV_SCRIPT_FINISHED and 10 <= m["instance"] < 18]
+    c.check(len(fins) == 8 and all(m["reason"] == 2 for m in fins), "all eight stopped")
+    if fins:
+        calls = sum(m["calls"] for m in fins)
+        log("  eight idle scripts for 2 s: %d calls, CPU %.2f us per call, longest call %d us" % (
+            calls, sum(m["total_us"] for m in fins) / max(calls, 1), max(m["max_us"] for m in fins)))
+
+    bots = bots_in(link.snapshot if not snap else snap)
+    if not bots:
+        log("no bot-channel bot in the snapshot: the host API checks against a player are skipped "
+            "(start serverext_client.py first)")
+        return c.summary("script")
+    bid = bots[0]["id"]
+    log("using bot %d '%s'" % (bid, bots[0]["name"]))
+    link.request(SUBSCRIBE, p_subscribe(rq(), 1, 30))
+    link.pump(0.5)
+
+    def stream_state():
+        return dict(link.last_player_stream["players"]).get(bid) if link.last_player_stream else None
+
+    # game.player against the player stream of the same tick.
+    states = {}
+    link.on_frame = lambda m: states.__setitem__(m["tick"], dict(m["players"]).get(bid)) if m["type"] == PLAYER_STREAM else None
+    r = start(20, "player", "let n = 0;\n"
+                            "script.onTick(tick => { script.emit({ tick, p: game.player(script.args.id) }); if (++n === 10) script.finish(); });\n",
+              '{"id":%d}' % bid)
+    fin = wait_finished(link, 20)
+    link.pump(0.2)
+    link.on_frame = None
+    samples = [json.loads(m["payload"]) for m in script_events(link, 20)]
+    compared = 0
+    worst = 0.0
+    same = True
+    for smp in samples:
+        st = states.get(smp["tick"])
+        p = smp["p"]
+        if not st or not p or not p["position"]:
+            continue
+        compared += 1
+        worst = max(worst, max(abs(a - b) for a, b in zip(p["position"], st["pos"])),
+                    max(abs(a - b) for a, b in zip(p["velocity"], st["vel"])))
+        rot = max(abs((a - b + 180.0) % 360.0 - 180.0) for a, b in zip(p["rotation"], st["rot"]))
+        same = same and rot < 0.01 and p["team"] == st["team"] and p["rootId"] == st["root_net"] and \
+            p["alive"] == (st["life"] != 0) and p["seated"] == bool(st["flags"] & 1) and \
+            p["seat"] == (-1 if st["seat"] == 255 else st["seat"]) and p["bot"] is True and p["id"] == bid
+    first = samples[0]["p"] if samples else None
+    c.check(r["name"] == "OK" and compared >= 5 and same,
+            "game.player(%d) in %d ticks equals the player stream of the same tick (team, alive, seat, rootId, rotation): %s" % (
+                bid, compared, first and {k: first[k] for k in ("name", "team", "alive", "bot", "seated", "seat", "rootId", "vehicle")}))
+    # The script runs before this tick's streams are built, so both read the same state.
+    c.check(compared >= 5 and worst < 0.01, "its position and velocity equal the stream's of the same tick (largest difference %.4f)" % worst)
+    r = start(21, "nobody", "script.emit([game.player(250), game.teleport(250, [0, 100, 0], null), game.setVelocity(250, [0, 0, 0])]); script.finish();")
+    wait_finished(link, 21)
+    evs = [m["payload"] for m in script_events(link, 21)]
+    c.check(evs == ["[null,false,false]"], "an unknown player: game.player null, teleport and setVelocity false (%s)" % (evs,))
+
+    st = stream_state()
+    if not st or not st["life"]:
+        c.check(False, "the bot is not alive: teleport and speed checks skipped")
+        return c.summary("script")
+    in_vehicle = bool(st["flags"] & 1)
+    what = "helicopter" if in_vehicle else "soldier"
+    log("the bot is %s at %.1f %.1f %.1f, speed %.1f %.1f %.1f" % (("in a vehicle" if in_vehicle else "on foot",) + tuple(st["pos"]) + tuple(st["vel"])))
+    track = []
+    link.on_frame = lambda m: track.append((m["tick"], dict(m["players"]).get(bid))) if m["type"] == PLAYER_STREAM else None
+
+    if in_vehicle:
+        # A soft ceiling 15 m below a hovering helicopter whose pilot keeps pulling up to its own height:
+        # setVelocity every tick it is above, as the .nasa script will do it.
+        ceiling = st["pos"][1] - 15.0
+        r = start(24, "ceiling",
+                  "const { id, ceiling } = script.args;\n"
+                  "let pushes = 0, highest = -1e9;\n"
+                  "script.onTick(() => {\n"
+                  "  const p = game.player(id);\n"
+                  "  if (!p || !p.position) return;\n"
+                  "  const over = p.position[1] - ceiling;\n"
+                  "  if (pushes > 0 && over > highest) highest = over;\n"
+                  "  if (over <= 0) return;\n"
+                  "  const down = -Math.min(30, over * 2);\n"
+                  "  if (p.velocity[1] > down) { game.setVelocity(id, [p.velocity[0], down, p.velocity[2]]); pushes++; }\n"
+                  "});\n"
+                  "script.onStop(() => script.emit({ pushes, highest }));\n", json.dumps({"id": bid, "ceiling": ceiling}))
+        link.pump(8.0)
+        seen = len(track)
+        link.pump(4.0)
+        link.request(CMD_STOP_SCRIPT, W().u32(rq()).u32(24).b)
+        fin = wait_finished(link, 24)
+        evs = [json.loads(m["payload"]) for m in script_events(link, 24)]
+        ys = [s["pos"][1] for _, s in track if s]
+        late = [s["pos"][1] for _, s in track[seen:] if s]
+        c.check(r["name"] == "OK" and ys and late and ys[0] > ceiling + 10 and max(late) < ceiling + 3.0 and
+                evs and evs[0]["pushes"] > 30,
+                "a soft ceiling 15 m below a hovering %s: y %.1f at the start; in seconds 8-12 between %.1f and %.1f "
+                "(ceiling %.1f); %s pushes, highest %.2f m over after the first" % (
+                    what, ys[0] if ys else float("nan"), min(late) if late else float("nan"),
+                    max(late) if late else float("nan"), ceiling, evs[0]["pushes"] if evs else "?",
+                    evs[0]["highest"] if evs else float("nan")))
+        if fin:
+            log("  the ceiling script: %d calls, CPU %.2f us per call, longest %d us" % (
+                fin["calls"], fin["total_us"] / max(fin["calls"], 1), fin["max_us"]))
+        link.pump(8.0)   # the pilot climbs back to its height
+
+    # game.setVelocity once: the speed the stream shows in the next ticks.
+    del track[:]
+    push = [0, 15, 0] if in_vehicle else [0, 8, 0]
+    r = start(23, "push", "script.emit({ tick: game.tick, ok: game.setVelocity(script.args.id, script.args.v) }); script.finish();",
+              json.dumps({"id": bid, "v": push}))
+    wait_finished(link, 23)
+    link.pump(0.6)
+    evs = [json.loads(m["payload"]) for m in script_events(link, 23)]
+    set_tick = evs[0]["tick"] if evs else 0
+    after_set = [(t, s["vel"][1], s["pos"][1]) for t, s in track if s and t >= set_tick][:10]
+    c.check(r["name"] == "OK" and evs and evs[0]["ok"] and after_set and after_set[0][1] > push[1] * 0.4,
+            "game.setVelocity %s once on a %s: vertical speed in the following ticks %s, height %+.2f m after %d ticks" % (
+                push, what, ["%d: %.1f" % (t, v) for t, v, _ in after_set],
+                (after_set[-1][2] - after_set[0][2]) if after_set else float("nan"), len(after_set)))
+    link.pump(3.0)
+
+    # game.setVelocity every tick for a second: a held speed.
+    del track[:]
+    hold = [0, 0, 6] if in_vehicle else [0, 0, 3]
+    r = start(25, "hold", "const { id, v } = script.args; let n = 0;\n"
+                          "const from = game.player(id).position;\n"
+                          "script.onTick(() => { game.setVelocity(id, v); if (++n === 30) { const to = game.player(id).position;\n"
+                          "  script.finish({ moved: [to[0] - from[0], to[1] - from[1], to[2] - from[2]] }); } });\n",
+              json.dumps({"id": bid, "v": hold}))
+    fin = wait_finished(link, 25)
+    moved = json.loads(fin["result"])["moved"] if fin and fin["reason"] == 1 else None
+    c.check(r["name"] == "OK" and moved is not None and abs(moved[2] - hold[2]) < hold[2] * 0.5,
+            "game.setVelocity %s every tick for 30 ticks on a %s: moved %s m (the speed times one second is %s)" % (
+                hold, what, moved and [round(x, 2) for x in moved], hold))
+    link.pump(4.0)
+
+    # game.teleport: 40 m up, the rotation kept.
+    st = stream_state()
+    target = [st["pos"][0], st["pos"][1] + 40.0, st["pos"][2]]
+    r = start(22, "teleport", "script.emit(game.teleport(script.args.id, script.args.pos, null)); script.finish();",
+              json.dumps({"id": bid, "pos": target}))
+    wait_finished(link, 22)
+    link.pump(0.15)
+    after = stream_state()
+    c.check(r["name"] == "OK" and after and abs(after["pos"][1] - target[1]) < 5.0 and
+            abs((after["rot"][0] - st["rot"][0] + 180.0) % 360.0 - 180.0) < 5.0,
+            "game.teleport of a %s 40 m up: y %.1f -> %.1f (target %.1f), yaw %.1f -> %.1f" % (
+                what, st["pos"][1], after["pos"][1] if after else float("nan"), target[1], st["rot"][0],
+                after["rot"][0] if after else float("nan")))
+    link.pump(8.0 if in_vehicle else 4.0)
+
+    # game.setAngularVelocity about each world axis, from a level attitude with the nose north (yaw 0), set every
+    # tick for half a second: which angle turns, and which way. The script reads the rotation itself.
+    for axis, name in ((1, "y"), (0, "x"), (2, "z")):
+        v = [0.0, 0.0, 0.0]
+        v[axis] = 1.0
+        r = start(30 + axis, "spin-" + name,
+                  "const { id, v } = script.args;\nlet n = 0;\nconst rot = [];\n"
+                  "const yaw = game.player(id).rotation[0];\n"
+                  "game.teleport(id, null, [0, 0, 0]);\n"
+                  "script.onTick(() => {\n"
+                  "  rot.push(game.player(id).rotation);\n"
+                  "  if (++n === 16) { game.setAngularVelocity(id, [0, 0, 0]); game.teleport(id, null, [yaw, 0, 0]); script.finish({ rot }); return; }\n"
+                  "  game.setAngularVelocity(id, v);\n"
+                  "});\n", json.dumps({"id": bid, "v": v}))
+        fin = wait_finished(link, 30 + axis)
+        rots = json.loads(fin["result"])["rot"] if fin and fin["reason"] == 1 else []
+        if len(rots) == 16:
+            turned = [sum(((b[k] - a[k] + 180.0) % 360.0) - 180.0 for a, b in zip(rots, rots[1:])) for k in range(3)]
+            text = "game.setAngularVelocity 1 rad/s about world %s on a level %s facing north, 15 ticks (28.6 degrees): yaw %+.1f, pitch %+.1f, roll %+.1f degrees (from %s)" % (
+                (name,) + (what,) + tuple(turned) + ([round(x, 1) for x in rots[0]],))
+            if in_vehicle:
+                c.check(r["name"] == "OK" and max(abs(t) for t in turned) > 15.0, text)
+            else:
+                log("NOTE " + text)
+        else:
+            c.check(False, "setAngularVelocity about %s: %s" % (name, fin and fin["result"]))
+        link.pump(5.0 if in_vehicle else 1.0)
+    link.on_frame = None
+    r = link.request(PING, p_ping(rq(), 78))
+    c.check(r["name"] == "PONG", "the server still ticks (Ping -> Pong)")
+    return c.summary("script")
+
+
+def scenario_runscript(lst, args):
+    """Runs one script file (--script-file, JavaScript) with --script-args for --seconds, printing its ScriptEvents
+    (log lines and emitted data), then stops it and prints its ScriptFinished with the call count and CPU time.
+    For trying a script on a test server without WebAdmin."""
+    with open(args.script_file, encoding="utf-8") as f:
+        source = f.read()
+    link = lst.accept(args.accept_timeout)
+    rq = link.next_request
+    if args.vote_delay > 0:
+        link.pump(args.vote_delay)
+    name = args.script_name or os.path.splitext(os.path.basename(args.script_file))[0]
+    r = link.request(CMD_START_SCRIPT, p_start_script(rq(), 1, name, source, args.script_args))
+    if r["name"] != "OK":
+        log("StartScript -> %s %s: %s" % (r["name"], r.get("code"), r.get("message")))
+        return 1
+    fin = None
+    seen = 0
+    end = time.time() + args.seconds
+    stopped = False
+    try:
+        while fin is None and time.time() < end + 3:
+            link.pump(0.2)
+            for m in link.events[seen:]:
+                if m["type"] == EV_SCRIPT_EVENT:
+                    log("%s tick %d: %s" % ("log " if m["kind"] == 2 else "emit", m["tick"], m["payload"]))
+                elif m["type"] == EV_SCRIPT_FINISHED:
+                    fin = m
+            seen = len(link.events)
+            if not stopped and time.time() >= end:
+                stopped = True
+                link.request(CMD_STOP_SCRIPT, W().u32(rq()).u32(1).b)
+    except Closed as e:
+        log("link closed:", e)
+        return 1
+    if fin is None:
+        log("no ScriptFinished")
+        return 1
+    log("ScriptFinished: %s after %d calls, CPU %d us in all (%.2f us per call), longest call %d us%s" % (
+        SCRIPT_REASONS.get(fin["reason"], fin["reason"]), fin["calls"], fin["total_us"],
+        fin["total_us"] / max(fin["calls"], 1), fin["max_us"], (": " + fin["result"]) if fin["result"] else ""))
+    return 0 if fin["reason"] in (1, 2) else 1
+
+
+def scenario_scriptends(lst, args):
+    """Scripts and the two ends that come from outside: a level unload (Map action 2, the next map) ends every script
+    with reason 5 after its stop handlers, and a closing link ends them without a report (the stop handler's chat
+    line "script stop: link closed" shows in a bot-channel client's Chat messages and in the module's log)."""
+    c = Checks()
+    link = lst.accept(args.accept_timeout)
+    rq = link.next_request
+    if args.vote_delay > 0:
+        link.pump(args.vote_delay)
+    source = ("script.onTick(() => {});\n"
+              "script.onStop(reason => { script.emit({ stop: reason, players: game.players().length, map: game.map });\n"
+              "  game.say('script stop: ' + reason); });\n")
+    r1 = link.request(CMD_START_SCRIPT, p_start_script(rq(), 1, "first", source))
+    r2 = link.request(CMD_START_SCRIPT, p_start_script(rq(), 2, "second", "script.onTick(() => {});\n"))
+    c.check(r1["name"] == "OK" and r2["name"] == "OK", "two scripts started")
+    link.pump(1.0)
+    before = link.welcome["map"]
+    r = link.request(CMD_MAP, p_map(rq(), 2))
+    c.check(r["name"] == "OK", "Map next (action 2) -> Ok")
+    f1 = wait_finished(link, 1, 30)
+    f2 = wait_finished(link, 2, 5)
+    evs = [json.loads(m["payload"]) for m in script_events(link, 1)]
+    c.check(f1 is not None and f2 is not None and f1["reason"] == 5 and f2["reason"] == 5 and f1["result"] == "",
+            "both scripts ended with reason 5 (level unload): %s" % ([f and f["reason"] for f in (f1, f2)],))
+    c.check(len(evs) == 1 and evs[0].get("stop") == "level unload" and evs[0].get("map") == before,
+            "the stop handler ran first and still saw the game: %s" % (evs,))
+    try:
+        ev = link.wait_event(lambda m: m["type"] == EV_ROUND_START, 60)
+    except Closed as e:
+        ev = None
+        c.check(False, "the link closed during the map change: %s" % e)
+    r = link.request(CMD_LIST_SCRIPTS, W().u32(rq()).b, timeout=10)
+    c.check(r["name"] == "SCRIPT_LIST" and r["scripts"] == [], "after the map change (RoundStart %s): ListScripts -> none" % (
+        ev and ev.get("map"),))
+    r = link.request(CMD_START_SCRIPT, p_start_script(rq(), 3, "after", source))
+    c.check(r["name"] == "OK", "a script starts on the new map")
+    link.pump(1.0)
+    session = link.welcome["session"]
+    link.sock.close()
+    log("closed the link with script 3 running")
+    link2 = lst.accept(args.accept_timeout)
+    rq2 = link2.next_request
+    r = link2.request(CMD_LIST_SCRIPTS, W().u32(rq2()).b)
+    c.check(link2.welcome["session"] == session + 1 and r["name"] == "SCRIPT_LIST" and r["scripts"] == [],
+            "the next link (session %d -> %d): ListScripts -> none" % (session, link2.welcome["session"]))
+    r = link2.request(CMD_START_SCRIPT, p_start_script(rq2(), 3, "again", "script.emit(game.map); script.finish();"))
+    fin = wait_finished(link2, 3)
+    c.check(r["name"] == "OK" and fin is not None and fin["reason"] == 1, "instance 3 is free again and a script runs")
+    r = link2.request(PING, p_ping(rq2(), 79))
+    c.check(r["name"] == "PONG", "the server still ticks (Ping -> Pong)")
+    return c.summary("scriptends")
 
 
 def scenario_commands(lst, args):
@@ -1819,7 +2284,7 @@ def main():
     ap.add_argument("--write-golden", default="", help="write the golden fixtures to this file and exit")
     ap.add_argument("--scenario", default="listen",
                     choices=["listen", "commands", "resync", "stall", "soak", "wrongkey", "wrongpin", "mapchange", "extras",
-                             "viewer", "replay", "vote", "r7"])
+                             "viewer", "replay", "vote", "r7", "script", "runscript", "scriptends"])
     ap.add_argument("--fuzz", action="store_true")
     ap.add_argument("--fuzz-rounds", type=int, default=24)
     ap.add_argument("--seed", type=int, default=1)
@@ -1842,7 +2307,10 @@ def main():
     ap.add_argument("--vote-percent", type=int, default=50, help="vote: yes share of the ballots needed to pass")
     ap.add_argument("--vote-min", type=int, default=1, help="vote: ballots needed to pass")
     ap.add_argument("--vote-rows", type=int, default=0, help="vote: server messages to send from 3 s on (rows)")
-    ap.add_argument("--vote-delay", type=float, default=0.0, help="vote, r7: seconds to wait after the link first")
+    ap.add_argument("--vote-delay", type=float, default=0.0, help="vote, r7, script: seconds to wait after the link first")
+    ap.add_argument("--script-file", default="", help="runscript: the JavaScript file to run")
+    ap.add_argument("--script-args", default="", help="runscript: the script's arguments, JSON text")
+    ap.add_argument("--script-name", default="", help="runscript: the script's name (default: the file's)")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
     if args.write_golden:
@@ -1861,7 +2329,8 @@ def main():
                 "stall": scenario_stall, "soak": scenario_soak, "wrongkey": scenario_wrongkey,
                 "wrongpin": scenario_wrongpin, "mapchange": scenario_mapchange,
                 "extras": scenario_extras, "viewer": scenario_viewer, "replay": scenario_replay,
-                "vote": scenario_vote, "r7": scenario_r7}[args.scenario](lst, args)
+                "vote": scenario_vote, "r7": scenario_r7, "script": scenario_script,
+                "runscript": scenario_runscript, "scriptends": scenario_scriptends}[args.scenario](lst, args)
     except KeyboardInterrupt:
         return 130
 

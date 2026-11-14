@@ -313,7 +313,7 @@ bool parseConfig(const std::string& text, Config& out, std::vector<std::string>&
             }
         }
         else if (key == "adminTls" || key == "adminSendIdentity" || key == "adminAllowConsole" ||
-                 key == "adminAllowObjects")
+                 key == "adminAllowObjects" || key == "adminAllowScripts")
         {
             if (value != "0" && value != "1")
             {
@@ -326,8 +326,10 @@ bool parseConfig(const std::string& text, Config& out, std::vector<std::string>&
                 out.adminSendIdentity = value == "1" ? 1 : 0;
             else if (key == "adminAllowConsole")
                 out.adminAllowConsole = value == "1";
-            else
+            else if (key == "adminAllowObjects")
                 out.adminAllowObjects = value == "1";
+            else
+                out.adminAllowScripts = value == "1";
         }
         else if (key == "adminQueueBytes")
         {

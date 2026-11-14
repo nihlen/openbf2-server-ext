@@ -61,7 +61,7 @@ All builds use agent-owned output directories. Nothing builds on a Windows bind 
 
 | Piece | Where | Command | Output | Notes |
 |---|---|---|---|---|
-| Module (dev loop) | WSL Ubuntu | `cd /mnt/c/Data/Projects/openbf2-server-ext && ./build-module.sh [openbf2-checkout] [build-dir]` | `<build-dir>/libserverext.so`, ctest run (`serverext_tests`, `serverext_admin_tests`) | Default OpenBF2 `/mnt/c/Data/Projects/OpenBF2`, build dir `~/serverext-build/linux-x64`; use your own build dir, e.g. `~/serverext-build/<task>`. Needs `testenv/tools-linux.sh` once. Builds the working tree. Output needs glibc 2.35 and OpenSSL 3: runs in WSL (the localtest image builds its own) |
+| Module (dev loop) | WSL Ubuntu | `cd /mnt/c/Data/Projects/openbf2-server-ext && ./build-module.sh [openbf2-checkout] [build-dir]` | `<build-dir>/libserverext.so`, ctest run (`serverext_tests`, `serverext_admin_tests`, `serverext_script_tests`) | Default OpenBF2 `/mnt/c/Data/Projects/OpenBF2`, build dir `~/serverext-build/linux-x64`; use your own build dir, e.g. `~/serverext-build/<task>`. Needs `testenv/tools-linux.sh` once. Builds the working tree. Output needs glibc 2.35 and OpenSSL 3: runs in WSL (the localtest image builds its own) |
 | Engine (dev loop) | WSL Ubuntu | `testenv/build-linux.sh /mnt/c/Data/Projects/OpenBF2 ~/bf2-linux-<task>` | `bf2`, `libdice_py.so` | For a WSL test server (`testenv/`). OpenBF2's own gates (MSVC syntax checks etc.) are in its `AGENTS.md` "Validation" |
 | Engine + module for the localtest | Git Bash on Windows, Docker Desktop | `bash C:/Data/Projects/DotNet/BF2WebAdmin-localtest/openbf2/build.sh` | image `bf2wa-localtest-openbf2:latest` | Builds both in the release build's builder (Ubuntu 22.04, glibc 2.35, OpenSSL 3; since 2026-11-09) from **commits**, `git archive` of `HEAD` of both default checkouts. Uncommitted changes are left out (it says so): commit first. `OPENBF2_REV=`/`MODULE_REV=` pin other commits, `IMAGE=` another tag. Prints the commits and records them (below). OpenBF2 builds incrementally in the docker volume `bf2wa-openbf2-build-jammy` (`bf2wa-openbf2-build` is the old Debian 11 one, unused); first build takes long |
 | Release zip for the production images | Git Bash on Windows, Docker Desktop (or Linux; `.github/workflows/release.yml`) | `release/build.sh` (`OPENBF2_REV=`, `MODULE_REV=`, `BF2HUB_REV=`, `CLEAN=1`; README "Release build") | `release/out/openbf2-serverext-<openbf2>-<module>-<bf2hub>.zip` (bf2, libdice_py.so, libserverext.so, libbf2hub.so, source.txt) | Ubuntu 22.04 builder (glibc 2.35, OpenSSL 3), from commits; its own volume and container `serverext-release-build`. Used by bf2-docker `images/netsky-openbf2-*` (Debian trixie), which render `serverext.cfg` from `ENV_ADMIN_*` on every start |
@@ -201,15 +201,16 @@ protocol.md "Testing". Their run dirs are agent-owned (`~/serverext-<task>/srv`)
 | 16571/udp, 29903/udp, 127.0.0.1:16706, 4312, 5052 | test instance defaults | `test-instance.ps1` |
 | 16571, 29903, 4723, bot 16701 (WSL) / 16702 (Docker) | `testenv/` servers | 16700 is held by a stale `wslrelay`: leave it |
 | 16703, 16710, 16573, 29905, 4725 | used by the admin-channel phase-1 WSL runs | |
+| 16585/udp, 29909/udp, 4729, 16735, 16736 | used by the scripts WSL runs (findings/scripts.md) | run dir `~/serverext-scripts`, stopped |
 | 55124, 55126/udp | VoIP inside each server | two WSL servers at once collide; containers do not |
 
 ## Which test proves what
 
 | Test | Proves | Does not prove |
 |---|---|---|
-| Module unit tests (`ctest` in the build dir: `serverext_tests`, `serverext_admin_tests`) | framing, parsing, hostile input, config, queues, admin codec against the golden fixtures, TLS against a local OpenSSL server | anything engine-side |
+| Module unit tests (`ctest` in the build dir: `serverext_tests`, `serverext_admin_tests`, `serverext_script_tests`) | framing, parsing, hostile input, config, queues, admin codec against the golden fixtures, TLS against a local OpenSSL server; the script host against a mock world (life cycle, limits, what the language has, the host API's arguments) | anything engine-side |
 | `tools/testclient/serverext_client.py --port <bot port> [--scenario ...]` (Python 3, stdlib) | the bot channel against a running server: hover (default), walk, buttons, blockpad, wreck, view, weapons, damage, spot, round, teleport, multiconn, soak2/3, burst, tv, q12, `--fuzz`. Must pass before a C# repo depends on a module change (protocol.md "Checks") | bot behaviour |
-| `tools/adminclient/adminclient.py` | the admin channel without WebAdmin: a reference TLS listener (own certificate, `--print-pin`), handshake, snapshot, every command, scenarios (`viewer` with `serverext_client.py --scenario viewer`: aim, gunfire, weapons; `replay` with `tools/testclient/tvscan.py`: the hit/miss replay), `--fuzz`; `--write-golden` writes the fixtures shared with C#. Point a WSL server's `adminConnect` at it (findings/admin-phase1.md "Results") | WebAdmin's behaviour |
+| `tools/adminclient/adminclient.py` | the admin channel without WebAdmin: a reference TLS listener (own certificate, `--print-pin`), handshake, snapshot, every command, scenarios (`viewer` with `serverext_client.py --scenario viewer`: aim, gunfire, weapons; `replay` with `tools/testclient/tvscan.py`: the hit/miss replay; `script` and `scriptends`: scripts, with a `serverext_client.py` bot also their host API against the player stream; `runscript --script-file`: one script, its events and CPU time), `--fuzz`; `--write-golden` writes the fixtures shared with C#. Point a WSL server's `adminConnect` at it (findings/admin-phase1.md "Results") | WebAdmin's behaviour |
 | bf2-bots `dotnet test Bf2Bots.sln` (313 tests on 2026-10-26) | sidecar codec against golden bytes from the module, controller, missions, round flow logic | a live server |
 | Sidecar against a server (`bf2bots serverext ...`) | bots spawn, board, fly, fight, type rdy/go; logs `round flow:`, `SAY` lines | a human in the loop |
 | Sidecar `--test-stand-in <s>` with `--human-seat 0|1` | a mixed crew without a human: a bot sits in the human's seat and leaves it once after s seconds, and types for its crew | how a real human plays |
@@ -296,6 +297,9 @@ Collected from the findings and per-repo docs on 2026-10-26; the source of each 
 - **A changed admin key takes up to 60 s** (the module's reconnect backoff). admin-channel.md item 3.
 - **Teleport rotation is not held** by a hovering bot's heading hold. admin-channel.md item 4.
 - **The bot channel has no authentication:** keep it on loopback. findings/docker-v1.md.
+- **Scripts** (the admin channel's `StartScript`, module side implemented 2026-11-14): the time budget ends a
+  script's mistakes (an endless loop costs one 5 ms tick), not a script written to stall, and what a client sees of a
+  vehicle a script moves is untested. findings/scripts.md.
 - **Production deployment** (done 2026-11-08: the four live servers run `bf2-netsky:openbf2-*` with this module,
   WebAdmin 0.1.0; earlier notes: the release zip (`release/`, Ubuntu 22.04, OpenSSL 3) and the bf2-docker
   images `netsky-openbf2-*` (branch `combined`, trixie) are built and tested locally; bf2hub and serverext load

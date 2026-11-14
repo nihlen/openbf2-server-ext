@@ -11,15 +11,20 @@ the contract in [docs/protocol.md](docs/protocol.md). The admin channel (phase 1
 results are in [docs/findings/admin-phase1.md](docs/findings/admin-phase1.md); the viewer additions (view mode, aim, gunfire,
 weapons) in [docs/findings/admin-viewer.md](docs/findings/admin-viewer.md). What a TV missile can hit on a helicopter, and
 which parts the server tests at a lag-compensated (rewound) pose: [docs/findings/tv-hitbox.md](docs/findings/tv-hitbox.md).
+Scripts: WebAdmin pushes JavaScript over the admin channel and the module runs it every tick in an embedded
+QuickJS-NG, with a small `game` API and memory and CPU-time limits (the contract's "Scripts" section; how it was built,
+tested and what it costs: [docs/findings/scripts.md](docs/findings/scripts.md)). `adminAllowScripts 0` in
+`serverext.cfg` turns them off.
 
 ## Layout and build
 
 | Path | Contents |
 |---|---|
-| `src/` | The module. `Protocol`, `Config`, `Channel` and `Session` are engine-free; `Module.cpp` is the engine side; `IoThread_posix.cpp` is the socket thread. The admin channel: `AdminProtocol`, `AdminCrypto`, `AdminLink` and `AdminSession` (engine-free), `AdminIo_posix.cpp` (its dial-out and TLS thread) and `Admin.cpp` (its engine side). |
-| `tests/` | Unit tests for the engine-free layer (framing, parsing, hostile input, config, queues); `AdminTests.cpp` for the admin channel, TLS included; `fixtures/admin-v1-golden.txt`, the golden frames shared with the C# codec. |
+| `src/` | The module. `Protocol`, `Config`, `Channel` and `Session` are engine-free; `Module.cpp` is the engine side; `IoThread_posix.cpp` is the socket thread. The admin channel: `AdminProtocol`, `AdminCrypto`, `AdminLink` and `AdminSession` (engine-free), `AdminIo_posix.cpp` (its dial-out and TLS thread) and `Admin.cpp` (its engine side). `Script` is the admin channel's script host (engine-free: QuickJS runtimes, the `script` and `game` objects, the limits); `Admin.cpp` gives it the game. |
+| `third_party/quickjs-ng/` | QuickJS-NG v0.18.0, the scripts' JavaScript engine: the library's files unmodified, built as a static library and linked into `libserverext.so`. Its `README.md` has the source, the checksum and how to update. |
+| `tests/` | Unit tests for the engine-free layer (framing, parsing, hostile input, config, queues); `AdminTests.cpp` for the admin channel, TLS included; `ScriptTests.cpp` for the script host against a mock world; `fixtures/admin-v1-golden.txt`, the golden frames shared with the C# codec. |
 | `tools/testclient/` | `serverext_client.py`, a Python 3 stdlib test client: hover flight, `--fuzz`, the v1 scenarios (`--scenario` walk, buttons, blockpad, allblocked, wreck) and the v2 scenarios (view, weapons, damage, spot, round, teleport, multiconn, soak2; the watchdog neutral is q5) and the v3 scenarios (burst, tv, soak3). `tvscan.py`: scripted TV-missile passes for the hit/miss replay tests (docs/findings/tv-hitbox.md). |
-| `tools/adminclient/` | `adminclient.py`, the reference WebAdmin for the admin channel: a TLS listener (it creates the certificate and prints its pin), the HMAC handshake, snapshot, subscriptions, every command, scenarios and `--fuzz`; `--write-golden` writes the fixtures. |
+| `tools/adminclient/` | `adminclient.py`, the reference WebAdmin for the admin channel: a TLS listener (it creates the certificate and prints its pin), the HMAC handshake, snapshot, subscriptions, every command, scenarios and `--fuzz`; `--write-golden` writes the fixtures. For scripts: `--scenario script` and `scriptends` (the checks), and `--scenario runscript --script-file x.js` to run one script on a test server and see its events, errors and CPU time. |
 | `testenv/` | WSL and Docker test-server scripts; `deploy-module.sh` installs the module into a run directory. |
 | `probe/` | The superseded `[TEMP]` R1 smoke probe, kept as the evidence behind `docs/findings/r1-smoke.md`. |
 
@@ -33,7 +38,8 @@ the first argument or `OPENBF2_SRC`:
 
 That configures the `linux-x64` preset, builds `libserverext.so` and runs the unit tests. The admin
 channel needs OpenSSL 1.1.1 or 3.x (`libssl-dev` to build; `libssl3` or `libssl1.1` at run time, linked
-dynamically). A Windows build (`serverext.dll`) is not implemented yet.
+dynamically). QuickJS-NG is C, so the build needs a C compiler beside the C++ one (`gcc` comes with `g++`); it adds
+no shared library. A Windows build (`serverext.dll`) is not implemented yet.
 
 ## Release build
 

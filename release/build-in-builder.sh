@@ -3,7 +3,8 @@
 #
 # Expects the sources in /w/src/{openbf2,module,bf2hub} (git archive of the given commits) and builds into /w/build:
 #   OpenBF2   linux-x64 preset, targets bf2 and dice_py_check_run (as OpenBF2's CI "Linux x64" job)
-#   module    linux-x64 preset against /w/src/openbf2, then ctest (serverext_tests, serverext_admin_tests)
+#   module    linux-x64 preset against /w/src/openbf2, then ctest (serverext_tests, serverext_admin_tests,
+#             serverext_script_tests)
 #   bf2hub    linux-x64 preset, target bf2hub
 # Then writes /w/out/<NAME>.zip (bf2, libbf2hub.so, libdice_py.so, libserverext.so, source.txt: the contents of
 # bin/amd-64), its .sha512, and <NAME>-debug.tar.gz with the unstripped binaries (for gdb; not deployed).

@@ -34,13 +34,15 @@ struct Config
     int adminSendIdentity;           // -1 until set: then 1 with TLS, 0 without
     bool adminAllowConsole;
     bool adminAllowObjects;
+    bool adminAllowScripts;
     int adminQueueBytes;
 
     Config()
         : listenHost("127.0.0.1"), listenPort(16700), watchdogTicks(6), enterRange(30.0f),
           spawnFallbackSeconds(5), spawnBlockedSeconds(15), allowRoundRestart(false), maxConnections(4),
           allowTeleport(false), projectileRange(1000.0f), stepMode(false), adminEnabled(false), adminPort(0), adminTls(true),
-          adminSendIdentity(-1), adminAllowConsole(true), adminAllowObjects(true), adminQueueBytes(4 * 1024 * 1024) {}
+          adminSendIdentity(-1), adminAllowConsole(true), adminAllowObjects(true), adminAllowScripts(true),
+          adminQueueBytes(4 * 1024 * 1024) {}
 
     // Whether players' IPs and CD-key hashes go to WebAdmin.
     bool adminIdentity() const { return adminSendIdentity < 0 ? adminTls : adminSendIdentity != 0; }

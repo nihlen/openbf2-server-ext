@@ -16,6 +16,11 @@ with a firing bot crew: `docs/findings/admin-viewer.md`.
 `ProjectileCollision` and `ProjectileTrace` events on stream 20 (the section under `WeaponFire` below). Engine getter
 `IServerExtension::getLagCompensation` and the projectile-collision observer (OpenBF2 `serverext/r1` `0a58ec0`,
 `1ca26b8`). Version stays 1. Implemented and tested on a WSL server with scripted bots: `docs/findings/tv-hitbox.md`.
+**Scripts approved by the author on 2026-11-14** (TypeScript game scripts that WebAdmin pushes and the module runs
+every tick in an embedded QuickJS-NG): capability bit 3, the commands `StartScript`, `StopScript`, `ScriptMessage` and
+`ListScripts`, the reply `ScriptList` and the events `ScriptFinished` and `ScriptEvent` (the section "Scripts" at the
+end). No engine change; the version stays 1. **Module side implemented 2026-11-14** and tested on a WSL server:
+`docs/findings/scripts.md`.
 The author has decided that the BF2WebAdmin C# side may change as much as needed, and that the
 author keeps deployments from running `mm_webadmin.py` and the native channel at the same time.
 Evidence for the engine side: `docs/findings/admin-channel-a1-a4.md`. Inventory of today's
@@ -329,7 +334,7 @@ Pm = HMAC-SHA256(K, T("OBF2-ADMIN-1 server"))
 | `u16` | game port (`sv.serverPort`) |
 | `u16` | GameSpy query port (`sv.gameSpyPort`) |
 | `u8` | maximum players (`sv.maxPlayers`) |
-| `u8` | capabilities: bit 0 `Console` allowed, bit 1 `SpawnObject`/`DeleteObject` allowed, bit 2 IPs and CD-key hashes are sent |
+| `u8` | capabilities: bit 0 `Console` allowed, bit 1 `SpawnObject`/`DeleteObject` allowed, bit 2 IPs and CD-key hashes are sent, bit 3 scripts can be run ("Scripts" below) |
 | string | current map name |
 | string | current game mode |
 | `u16` | current map size (`IGame::getCurrentMapSize`) |
@@ -555,6 +560,8 @@ reads the objects during the callback, before Python's handlers run.
 | `0x1219` | ProjectileCollision | see "Hit/miss replay" B below; only while subscribed (stream 20) | the projectile-collision observer |
 | `0x121A` | ProjectileTrace | see "Hit/miss replay" C below; only while subscribed (stream 20) | the module's tick hook and the projectile observer |
 | `0x121B` | VoteResult | `u32` request id of the `StartVote`, string question, `u8` outcome (1 passed, 2 failed, 3 cancelled by `CancelVote`, 4 cancelled by a level unload), `u16` yes, `u16` no, `u16` voters | the module's server vote ("Server votes" below) |
+| `0x121C` | ScriptFinished | `u32` instance, string name, `u8` reason (1 the script called `finish`, 2 `StopScript`, 3 error, 4 over its time budget, 5 level unload), string result, `u32` handler calls, `u32` CPU time of all calls in microseconds, `u32` CPU time of the longest call in microseconds | a script ended ("Scripts" below) |
+| `0x121D` | ScriptEvent | `u32` instance, `u8` kind (1 data: JSON text, 2 a log line), string payload (at most 8192 bytes) | a running script's `emit` or `log` ("Scripts" below) |
 
 **`WeaponFire`** (one per shooter and weapon per tick in which it launched; added 2026-10-28):
 
@@ -752,6 +759,10 @@ request id) unless a typed result is listed. Failure is `Error` with the request
 | `0x1315` | HudEventRaw | `i16` player (-1 every playing client), `u8` HUD event (40, 41, 42, 43, 44, 51, 64, 65, 66, 70, 71, 74 or 83), `u8` length N (0-52), N bytes payload | `Ok`; `Error` 4 no such player; `Error` 6 refused by the engine (R7a) |
 | `0x1316` | RoundClock | `i16` player (-1 every connected client), `f32` seconds from now (0-86400) | `Ok`; `Error` 4; `Error` 6 (R7b) |
 | `0x1317` | SquadOrder | `u8` team (1 or 2), `u8` squad (1-255), `u8` order id, `u8` flags (bit 0 a commander order), `u32` target networkable id (0 none, at most 65535), 3 × `Vec3` points | `Ok`; `Error` 6 when the squad has no members (R7c) |
+| `0x1318` | StartScript | `u32` instance (WebAdmin's choice, not 0, not a running script's), `u8` script API version the script needs (1), `u8` flags (0), string name (1-64 printable ASCII bytes), string arguments (JSON text, or empty for none), string source (JavaScript, 1-60000 bytes) | `Ok` once the script's top-level code has run; `Error` 9 with `adminAllowScripts 0`; `Error` 5 when the module's script API is older than the version asked for; `Error` 6 when 8 scripts run or the instance is in use; `Error` 7 for a bad name, flags, arguments that are not JSON, or source that does not compile or whose top-level code throws (the message is the script error with its line) |
+| `0x1319` | StopScript | `u32` instance | `Ok`, then `ScriptFinished` with reason 2; `Error` 5 no such script |
+| `0x131A` | ScriptMessage | `u32` instance, string message (JSON text, at most 8192 bytes) | `Ok` once the script's message handlers have run; `Error` 5 no such script; `Error` 7 not JSON |
+| `0x131B` | ListScripts | nothing after the request id | `ScriptList` |
 
 **`0x1402 ConsoleResult`**: `u32` request id, `u8` flags (bit 0 output truncated at 256 KiB), `u16`
 line count L, L × string. The output of `Console::executeLine` split at `\n`, without the final
@@ -775,6 +786,9 @@ The walk is `object.listObjectsOfTemplate`'s: every grid object whose template i
 
 **`0x1404 ObjectSpawned`**: `u32` request id, `u32` console id, `u32` networkable id (0: the object
 has no networkable and exists on the server only).
+
+**`0x1405 ScriptList`**: `u32` request id, `u8` N, N × (`u32` instance, string name): the scripts that run now, in
+start order.
 
 **Keepalive** (either direction):
 
@@ -848,6 +862,7 @@ server's `serverext.cfg`.
 | `adminSendIdentity` | 1 with TLS, 0 without | send players' IPs and CD-key hashes |
 | `adminAllowConsole` | 1 (B5) | allow `Console` |
 | `adminAllowObjects` | 1 | allow `SpawnObject` and `DeleteObject` |
+| `adminAllowScripts` | 1 | allow `StartScript` (capability bit 3); 0 answers it with `Error` 9 |
 | `adminQueueBytes` | 4194304 | outbound queue size beyond which events are dropped (64 KiB to 64 MiB) |
 
 Reconnect backoff: 1 s after a failure, doubled up to 60 s, with ±20% jitter; back to 1 s after a link
@@ -1030,3 +1045,150 @@ re-posted at exactly the fifth row (its own line is not counted), re-posted 20.3
 and not within the following 19 s, and the vote ends at its time with the result line and `VoteResult`. With no human
 player, `StartVote` and `CancelVote` are refused (`Error` 6). Not tested: ballots, which need a retail client pressing
 PgUp/PgDn, and how the lines look on a retail client.
+
+## Scripts (approved 2026-11-14; the module side implemented 2026-11-14)
+
+Game logic that must run inside a tick, written in TypeScript in the BF2WebAdmin repo and changed without restarting
+the game server. WebAdmin compiles each script to JavaScript (types removed, nothing else changed), pushes the source
+over the admin channel, and the module runs it on the main thread in an embedded JavaScript engine. A script sees the
+world through a small host API and never touches the engine or the network itself. No engine change: everything the
+host API does, the module already does for the typed commands, plus the two speed setters of `IPhysicsNode`
+(`Physics/IPhysicsNode.h:50-51`, `setPositionalSpeed` and `setRotationalSpeed`), reached with
+`queryComponent(IID_IPhysicsNode)` as for the velocities.
+
+**Engine.** QuickJS-NG (MIT), vendored at a pinned release under `third_party/quickjs-ng` (v0.18.0) and linked
+statically into `libserverext.so`. Each script gets its own runtime and context with these parts of the language only:
+the base objects, JSON, `Map`/`Set`, typed arrays and promises. There is no `eval` or `Function` constructor, no
+`Date`, no regular expressions, no `Proxy`, no module loader, and none of QuickJS's `std`/`os` library. Code runs in
+strict mode as one global script. Precompiled bytecode is never accepted: QuickJS does not verify it.
+
+As implemented: the names `eval` and `Function` exist (they are base objects) and throw a `TypeError` when called,
+as do the constructors of async and generator functions. The parser is in a second context that is freed before the
+script's own code runs; the compiled code moves between the two as bytecode inside the process. A regular expression
+literal is a `SyntaxError` when the script is started, and the string methods that need one (`match`, `matchAll`,
+`search`) throw a `TypeError`; `split`, `replace`, `replaceAll` and `includes` with strings work. There is no
+`console`, `setTimeout`, `performance` or `WeakRef`; `queueMicrotask` and `BigInt` are part of the base objects.
+
+**Availability.** `Welcome` capability bit 3 is set when the module has the engine and `adminAllowScripts` is 1.
+WebAdmin sends the script commands only then, so a module without scripts is never sent a type it does not know
+(which would close the link, `Error` 3), and WebAdmin keeps its own slower path for such servers. `StartScript`
+names the script API version the script needs; this document describes version 1. A later version only adds to the
+API.
+
+**Life cycle.**
+
+1. `StartScript` creates the runtime, sets `script.args` and runs the source's top-level code, which registers its
+   handlers. `Ok` means that code ran without an error. A compile error or an exception is `Error` 7 with the message
+   and nothing is left running.
+2. Every module tick, after WebAdmin's commands of that tick have run, each script's tick handlers are called, scripts
+   in start order. `ScriptMessage` calls the message handlers at once, in order with the other commands.
+3. A script ends when
+   - it calls `script.finish(result)` (reason 1; it ends when the handler that called it returns),
+   - WebAdmin sends `StopScript` (reason 2),
+   - a handler throws, a promise is rejected and not handled, or the script runs out of memory (reason 3),
+   - it goes over its time budget (reason 4),
+   - the level unloads (reason 5), or
+   - the link to WebAdmin closes, or the module shuts down (no event; WebAdmin ends its own record of the script when
+     its session closes).
+
+   For reasons 1, 2 and 5 and a closing link the script's stop handlers run first, with the reason as text
+   (`finished`, `stopped`, `level unload`, `link closed`), so it can undo what it did; an error in a stop handler is
+   logged and ignored. For reasons 3 and 4 they do not run. Then the runtime is freed and `ScriptFinished` is sent
+   with the reason; its result is the JSON text of `finish`'s argument (empty without one) for reason 1, the error
+   message with its stack for reasons 3 and 4, and empty otherwise.
+4. Scripts do not outlive their link. After every `Welcome` WebAdmin starts the scripts it wants again. After an
+   event gap (a lost `ScriptFinished`) WebAdmin sends `ListScripts` with its `RequestSnapshot` and ends its record of
+   every script that is not listed.
+
+As implemented:
+
+- **Order.** What a script emits in its top-level code or in a message handler is sent after the reply (`Ok`) to that
+  `StartScript` or `ScriptMessage`. A script's `ScriptFinished` comes after its last `ScriptEvent`, the stop handlers'
+  included. A failed `StartScript` sends nothing the script emitted. `StartScript` is also `Error` 7 when the
+  top-level code runs over its time budget.
+- **Ticks.** The scripts run after the tick's commands and before the module reads the state for that tick's events
+  and stream frames, so a stream frame shows what the scripts of the same tick did. The handler's `tick` argument is
+  `game.tick`, the tick number that tick's events and stream frames carry.
+- **Handlers.** A handler set during a tick runs from that tick on. At most 64 handlers of a kind; more are ignored.
+  After `finish` the handlers that have not run yet in that call are skipped, and an error thrown after it does not
+  change the reason. In a stop handler `finish` and new handlers are ignored, `emit`, `log` and `game` work, and it has
+  the same 5 ms; one that runs over is cut off and logged.
+- **Out of memory** cannot be caught by the script: it always ends it (reason 3).
+- **Text.** Every string the module sends for a script is valid UTF-8: a lone surrogate becomes `?`. The error text
+  of reasons 3 and 4 is cut at 8192 bytes.
+- **Level unload and a closing link** were tested with a soldier on the server: the stop handlers still see the
+  players, and their chat line reaches the clients.
+
+**Limits.** At most 8 scripts at once. Per script: 4 MiB of memory (`JS_SetMemoryLimit`), 256 KiB of stack, and CPU
+time of the main thread (`CLOCK_THREAD_CPUTIME_ID`, so a descheduled server thread is not counted): 50 ms for the
+top-level code, 5 ms for any other call into the script, and 30 ms summed over any 30 consecutive ticks (1 ms per tick
+on average). The engine's interrupt handler ends a call that runs over, so a loop that never ends costs one long tick
+and then the script is gone. `emit` beyond 16 `ScriptEvent`s in one tick throws a `RangeError`; `log` lines beyond
+that are dropped and counted. `ScriptFinished` carries the script's call count and CPU time, and the module's stats
+line the scripts' cost.
+
+As implemented:
+
+- A *call* is one entry into the script: its top-level code, all tick handlers of one tick, all message handlers of
+  one `ScriptMessage`, or all stop handlers, each with the promise jobs they leave. `ScriptFinished` counts these. The
+  top-level code is not part of the 30-tick sum.
+- **The budget is a guard against mistakes, not against a hostile author.** QuickJS checks for an interruption at
+  loop back-edges and calls of script code, once per 10000 of them, and in some loops of its built-ins. An endless
+  `for (;;) {}` ends after 5.0 ms and an endless `indexOf` over a 2^32-element sparse array after 5.1 ms, but a loop
+  whose every round spends its time inside one built-in call ends after about 10000 rounds: 23 ms around a
+  `JSON.stringify` of 40 numbers (measured), and longer the slower the built-in is. A call that came back by itself
+  after more than its budget ends the script too (reason 4). Whoever can start a script holds the admin key.
+- `finish`'s result is at most 60000 bytes of JSON; more throws a `RangeError`.
+- The memory a script uses before it has allocated anything of its own is about 175 KiB.
+
+**Host API, version 1.** Two frozen global objects. Player ids are the wire's (0-255). A player's *root object* is
+its vehicle when seated, else its soldier, as `ObjectRef` kind 1; a dead player has none. `Vec3` is `[x, y, z]` in
+metres (m/s for velocities), `Rot` is `[yaw, pitch, roll]` in degrees: the wire's conventions. A wrong argument type
+throws a `TypeError`.
+
+| Member | Meaning |
+|---|---|
+| `script.api` | 1 |
+| `script.name`, `script.args` | the name and the parsed arguments of `StartScript` (`null` without arguments) |
+| `script.onTick(fn)` | `fn(tick)` every module tick |
+| `script.onMessage(fn)` | `fn(message)` for every `ScriptMessage`, with the parsed JSON |
+| `script.onStop(fn)` | `fn(reason)` before the script ends (see the life cycle) |
+| `script.finish(result?)` | ends the script; `result` must be JSON-serialisable |
+| `script.emit(data)` | sends `ScriptEvent` kind 1 with `JSON.stringify(data)`; more than 8192 bytes throws a `RangeError` |
+| `script.log(...parts)` | writes the parts, joined with spaces, to the module's log and sends `ScriptEvent` kind 2 (cut at 8192 bytes) |
+| `game.tick`, `game.tickRate`, `game.time` | the module's tick number, 30, and the engine's time in seconds |
+| `game.map` | the current map's name |
+| `game.players()` | the ids of all players, as an array |
+| `game.player(id)` | `null` for no such player, else `{ id, name, team, alive, bot, seated, seat, rootId, vehicle, position, rotation, velocity }`: `bot` is the AI flag, `seat` the PCO id or -1, `rootId` the root object's networkable id (0 without one; the players of one vehicle share it), `vehicle` the root object's template (empty when dead), and `position`, `rotation` and `velocity` the root object's (`null` when dead) |
+| `game.teleport(id, position, rotation)` | the `Teleport` command on the player's root object; either argument may be `null` to keep it; a position resets the speeds. Returns `false` when the player has no root object |
+| `game.setVelocity(id, velocity)` | sets the root object's speed (`IPhysicsNode::setPositionalSpeed`, world axes) and wakes the body. Returns `false` without a root object or a physics node |
+| `game.setAngularVelocity(id, velocity)` | sets the root object's rotational speed in rad/s about the world axes (`IPhysicsNode::setRotationalSpeed`; the bot channel's convention, `docs/protocol.md`). Returns as `setVelocity` |
+| `game.say(text, player?)` | the `Say` command: to everyone, or to one player |
+
+Non-finite numbers in a position, rotation or speed throw a `RangeError`. Promises work (their jobs run after each
+handler, inside its time budget), but the API has no timers: a script counts ticks.
+
+As implemented:
+
+- A player id must be an integer number (else a `TypeError`); one outside 0-255 is no player (`null`, `false`,
+  nothing said). A `Vec3` or `Rot` is anything with numbers at `[0]`, `[1]` and `[2]`: an array or a typed array.
+- `game.teleport` with neither a position nor a rotation throws a `TypeError`. A position outside the `Teleport`
+  command's world bounds (|x| and |z| at most 8192, y from -1000 to 10000) throws a `RangeError`, as does a speed
+  beyond 1000 m/s or a rotational speed beyond 100 rad/s on an axis.
+- `game.say` removes control characters and cuts the text at 1024 bytes; an empty text says nothing.
+- `game.setVelocity` on a helicopter and on a soldier sets the speed the next stream frame shows; the game's own
+  forces act on it from the next tick (gravity, the rotor, the ground's friction), so a speed that is to be held is
+  set every tick.
+- `game.setAngularVelocity` on a level helicopter facing north (measured, 1 rad/s for 15 ticks): about world y the
+  yaw grows (the nose turns east), about world x the pitch grows (nose down), about world z the roll grows (bank
+  left); 28.2 to 28.8 degrees for the expected 28.6. It does not turn a soldier, and neither does a `game.teleport`
+  rotation (a soldier's facing is its own look direction).
+
+**Tested (2026-11-14)** on a WSL server (OpenBF2 `serverext/r1` working tree on `824d4dc`, `dalian_2_v_2`, ports
+16585/29909/16735/16736) with `adminclient.py --scenario script` and `--scenario scriptends`, without a bot, with a
+bot helicopter hovering 60 m up and with a bot soldier: every command and reply, every end reason, the limits, the
+host API against the player stream of the same tick, `teleport`, both speed setters, a soft ceiling that holds a
+helicopter whose pilot keeps climbing (within 0.2 m of the ceiling after 8 s), a level unload and a closed link; and
+`--fuzz`. Results and costs: `docs/findings/scripts.md`. **Not tested:** what a client sees of any of it (no human
+client; a body moved by `setVelocity` is predicted by its own pilot's client, so that pilot may see corrections),
+more than one player per script on a live server, a server under load, and a Windows build.

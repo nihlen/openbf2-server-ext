@@ -776,6 +776,10 @@ std::vector<Case> validCommands()
     w.u32(34); w.i16(-1); w.u8(43); w.u8(3); w.u8(1); w.u8(2); w.u8(3); CASE(CmdHudEventRaw);
     w.u32(35); w.i16(3); w.f32(60.0f); CASE(CmdRoundClock);
     w.u32(36); w.u8(2); w.u8(1); w.u8(7); w.u8(1); w.u32(1819); for (int i = 0; i < 9; ++i) w.f32(1.0f); CASE(CmdSquadOrder);
+    w.u32(37); w.u32(7); w.u8(1); w.u8(0); w.str("nasa"); w.str("{\"altitude\":300}"); w.str("script.onTick(() => {});"); CASE(CmdStartScript);
+    w.u32(38); w.u32(7); CASE(CmdStopScript);
+    w.u32(39); w.u32(7); w.str("{\"altitude\":250}"); CASE(CmdScriptMessage);
+    w.u32(40); CASE(CmdListScripts);
 #undef CASE
     return cs;
 }
@@ -888,6 +892,19 @@ void testCommandParsing()
     w.u32(1); w.u8(1); w.u8(1); w.u8(5); w.u8(2); w.u32(0); for (int i = 0; i < 9; ++i) w.f32(0); BAD(CmdSquadOrder);   // flags
     w.u32(1); w.u8(1); w.u8(1); w.u8(5); w.u8(0); w.u32(65536); for (int i = 0; i < 9; ++i) w.f32(0); BAD(CmdSquadOrder);
     w.u32(1); w.u8(1); w.u8(1); w.u8(5); w.u8(0); w.u32(0); w.f32(std::numeric_limits<float>::infinity()); for (int i = 0; i < 8; ++i) w.f32(0); BAD(CmdSquadOrder);
+    w.u32(1); w.u32(0); w.u8(1); w.u8(0); w.str("n"); w.str(""); w.str("1"); BAD(CmdStartScript);             // instance 0
+    w.u32(1); w.u32(7); w.u8(0); w.u8(0); w.str("n"); w.str(""); w.str("1"); BAD(CmdStartScript);             // API 0
+    w.u32(1); w.u32(7); w.u8(1); w.u8(1); w.str("n"); w.str(""); w.str("1"); BAD(CmdStartScript);             // flags
+    w.u32(1); w.u32(7); w.u8(1); w.u8(0); w.str(""); w.str(""); w.str("1"); BAD(CmdStartScript);              // no name
+    w.u32(1); w.u32(7); w.u8(1); w.u8(0); w.str(std::string(65, 'n')); w.str(""); w.str("1"); BAD(CmdStartScript);
+    w.u32(1); w.u32(7); w.u8(1); w.u8(0); w.str("a\tb"); w.str(""); w.str("1"); BAD(CmdStartScript);          // control byte
+    w.u32(1); w.u32(7); w.u8(1); w.u8(0); w.str("n\xC3\xA5"); w.str(""); w.str("1"); BAD(CmdStartScript);     // not ASCII
+    w.u32(1); w.u32(7); w.u8(1); w.u8(0); w.str("n"); w.str("\xFF"); w.str("1"); BAD(CmdStartScript);         // arguments not UTF-8
+    w.u32(1); w.u32(7); w.u8(1); w.u8(0); w.str("n"); w.str(""); w.str(""); BAD(CmdStartScript);              // no source
+    w.u32(1); w.u32(7); w.u8(1); w.u8(0); w.str("n"); w.str(""); w.str(std::string(60001, ' ')); BAD(CmdStartScript);
+    w.u32(1); w.u32(7); w.u8(1); w.u8(0); w.str("n"); w.str(""); w.str("1;\xC0\x80"); BAD(CmdStartScript);    // source not UTF-8
+    w.u32(1); w.u32(7); w.str(std::string(8193, '1')); BAD(CmdScriptMessage);
+    w.u32(1); w.u32(7); w.str("\xED\xA0\x80"); BAD(CmdScriptMessage);                                       // a surrogate
 #undef BAD
     for (size_t i = 0; i < bads.size(); ++i)
     {
@@ -1199,16 +1216,20 @@ void testConfig()
                           c, d));
         CHECK(c.adminEnabled && c.adminHost == "127.0.0.1" && c.adminPort == 16710 && c.adminTls &&
               c.adminKey.size() == 32 && c.adminCertSha256.size() == 32 && c.adminIdentity() && c.adminAllowConsole &&
-              c.adminAllowObjects && c.adminQueueBytes == 4 * 1024 * 1024);
+              c.adminAllowObjects && c.adminAllowScripts && c.adminQueueBytes == 4 * 1024 * 1024);
     }
     {
         Config c;
         std::vector<std::string> d;
         CHECK(parseConfig("adminTls 0\nadminConnect localhost:16710\nadminServerId x\nadminKey " + key +
-                              "\nadminAllowConsole 0\nadminAllowObjects 0\nadminQueueBytes 65536\n",
+                              "\nadminAllowConsole 0\nadminAllowObjects 0\nadminAllowScripts 0\nadminQueueBytes 65536\n",
                           c, d));
-        CHECK(!c.adminTls && !c.adminIdentity() && !c.adminAllowConsole && !c.adminAllowObjects &&
+        CHECK(!c.adminTls && !c.adminIdentity() && !c.adminAllowConsole && !c.adminAllowObjects && !c.adminAllowScripts &&
               c.adminQueueBytes == 65536);
+        Config bad;
+        std::vector<std::string> diag;
+        CHECK(!parseConfig("adminTls 0\nadminConnect localhost:16710\nadminServerId x\nadminKey " + key +
+                               "\nadminAllowScripts 2\n", bad, diag) && !diag.empty());
     }
     {
         Config c;
@@ -1636,7 +1657,7 @@ void testGolden()
 {
     const std::string path = std::string(SERVEREXT_FIXTURES) + "/admin-v1-golden.txt";
     std::map<std::string, std::vector<uint8_t> > golden = readGolden(path);
-    CHECK(golden.size() == 73);
+    CHECK(golden.size() == 80);
     if (golden.empty())
     {
         std::printf("  no golden fixtures at %s\n", path.c_str());
@@ -1808,6 +1829,14 @@ void testGolden()
     encodePing(mine["pong"], MsgPong, 13, 0x0102030405060708ull);
     encodeError(mine["error"], 14, ErrDisabled, "off");
     encodeVoteResult(mine["ev_vote_result"], 27, 10, 27, "Enable mod \xC2\xA7X?", 1, 3, 1, 5);
+    {
+        std::vector<std::pair<uint32_t, std::string> > scripts;
+        scripts.push_back(std::make_pair(7u, std::string("nasa")));
+        scripts.push_back(std::make_pair(9u, std::string("dance")));
+        encodeScriptList(mine["script_list"], 33, scripts);
+    }
+    encodeScriptFinished(mine["ev_script_finished"], 28, 10, 7, "nasa", 1, "{\"ticks\":90}", 90, 1234, 56);
+    encodeScriptEvent(mine["ev_script_event"], 29, 10, 7, 1, "{\"player\":3,\"y\":301.5}");
 
     for (std::map<std::string, std::vector<uint8_t> >::iterator it = mine.begin(); it != mine.end(); ++it)
     {
@@ -1833,8 +1862,12 @@ void testGolden()
         CHECK(ok);
         parsed[it->first] = c;
     }
-    CHECK(parsed.size() == 29);
+    CHECK(parsed.size() == 33);
     Command c;
+    c = parsed["cmd_start_script"]; CHECK(c.type == CmdStartScript && c.requestId == 30 && c.instance == 7 && c.value8 == 1 && c.flags == 0 && c.text == "nasa" && c.text2 == "{\"altitude\":300}" && c.source == "script.onTick(() => {});");
+    c = parsed["cmd_stop_script"]; CHECK(c.type == CmdStopScript && c.requestId == 31 && c.instance == 7);
+    c = parsed["cmd_script_message"]; CHECK(c.type == CmdScriptMessage && c.requestId == 32 && c.instance == 7 && c.text2 == "{\"altitude\":250}");
+    c = parsed["cmd_list_scripts"]; CHECK(c.type == CmdListScripts && c.requestId == 33);
     c = parsed["cmd_hud_event_raw"]; CHECK(c.type == CmdHudEventRaw && c.requestId == 29 && c.target16 == -1 && c.value8 == 43 && c.bytes.size() == 20 && c.bytes[4] == 2 && c.bytes[19] == 0);
     c = parsed["cmd_round_clock"]; CHECK(c.type == CmdRoundClock && c.requestId == 30 && c.target16 == 3 && c.value == 90.5f);
     c = parsed["cmd_squad_order"]; CHECK(c.type == CmdSquadOrder && c.requestId == 31 && c.target == 2 && c.player == 1 && c.value8 == 8 && c.flags == 1 && c.netId == 1819 && c.points[0] == 10.0f && c.points[8] == 30.0f);

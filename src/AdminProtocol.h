@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "Protocol.h"
@@ -28,6 +29,9 @@ const uint32_t kNoObjectId = 0xFFFFFFFFu;
 const uint16_t kNoIndex = 0xFFFF;
 const size_t kMaxHudPayload = 52;   // PostRemoteEvent's payload (R7)
 const float kMaxRoundClockSeconds = 86400.0f;
+const size_t kMaxScriptName = 64;        // StartScript name (Script.h has the same limits)
+const size_t kMaxScriptSource = 60000;   // StartScript source
+const size_t kMaxScriptPayload = 8192;   // ScriptMessage message, ScriptEvent payload
 
 // R7: the HUD event ids HudEventRaw accepts, the engine's sendHudEventRaw whitelist: their retail
 // client handlers read the payload as plain data.
@@ -48,15 +52,17 @@ enum Type : uint16_t
     EvVehicleDestroyed = 0x120F, EvControlPoint = 0x1210, EvChat = 0x1211, EvProjectileFired = 0x1212,
     EvProjectileHit = 0x1213, EvKick = 0x1214, EvBan = 0x1215, EvBot = 0x1216,
     EvWeaponFire = 0x1217, EvWeapons = 0x1218, EvProjectileCollision = 0x1219, EvProjectileTrace = 0x121A,
-    EvVoteResult = 0x121B,
+    EvVoteResult = 0x121B, EvScriptFinished = 0x121C, EvScriptEvent = 0x121D,
     // commands
     CmdConsole = 0x1301, CmdSay = 0x1302, CmdTeleport = 0x1303, CmdSetHealth = 0x1304, CmdKillPlayer = 0x1305,
     CmdSetTeam = 0x1306, CmdSetScore = 0x1307, CmdRank = 0x1308, CmdMedal = 0x1309, CmdGameEvent = 0x130A,
     CmdHudEvent = 0x130B, CmdKick = 0x130C, CmdBan = 0x130D, CmdMap = 0x130E, CmdListObjects = 0x130F,
     CmdSetObjectActive = 0x1310, CmdSpawnObject = 0x1311, CmdDeleteObject = 0x1312, CmdStartVote = 0x1313,
     CmdCancelVote = 0x1314, CmdHudEventRaw = 0x1315, CmdRoundClock = 0x1316, CmdSquadOrder = 0x1317,
+    CmdStartScript = 0x1318, CmdStopScript = 0x1319, CmdScriptMessage = 0x131A, CmdListScripts = 0x131B,
     // replies
     MsgOk = 0x1401, MsgConsoleResult = 0x1402, MsgObjectList = 0x1403, MsgObjectSpawned = 0x1404,
+    MsgScriptList = 0x1405,
     // keepalive, either direction
     MsgPing = 0x1501, MsgPong = 0x1502,
     MsgError = 0xFFFF
@@ -72,6 +78,7 @@ enum ErrorCode : uint16_t
 const uint8_t kCapConsole = 1;
 const uint8_t kCapObjects = 2;
 const uint8_t kCapIdentity = 4;
+const uint8_t kCapScripts = 8;   // the script commands (docs/admin-channel-draft.md "Scripts")
 
 // Subscribe streams.
 enum Stream : uint8_t
@@ -313,6 +320,9 @@ void encodeConsoleResult(std::vector<uint8_t>& out, uint32_t requestId, bool tru
                          const std::vector<std::string>& lines);
 void encodeObjectList(std::vector<uint8_t>& out, uint32_t requestId, bool more, const std::vector<ObjectInfo>& objects);
 void encodeObjectSpawned(std::vector<uint8_t>& out, uint32_t requestId, uint32_t objectId, uint32_t netId);
+// ScriptList: the running scripts in start order, at most 255.
+void encodeScriptList(std::vector<uint8_t>& out, uint32_t requestId,
+                      const std::vector<std::pair<uint32_t, std::string> >& scripts);
 void encodePing(std::vector<uint8_t>& out, uint16_t type, uint32_t requestId, uint64_t clock);
 
 // ---------------------------------------------------------------- events
@@ -428,6 +438,14 @@ void encodeWeapons(std::vector<uint8_t>& out, uint32_t seq, uint32_t tick, uint8
 void encodeVoteResult(std::vector<uint8_t>& out, uint32_t seq, uint32_t tick, uint32_t requestId,
                       const std::string& text, uint8_t outcome, uint16_t yes, uint16_t no, uint16_t eligible);
 
+// ScriptFinished. reason: 1 finish, 2 StopScript, 3 error, 4 over its time budget, 5 level unload.
+void encodeScriptFinished(std::vector<uint8_t>& out, uint32_t seq, uint32_t tick, uint32_t instance,
+                          const std::string& name, uint8_t reason, const std::string& result, uint32_t calls,
+                          uint32_t totalUs, uint32_t maxUs);
+// ScriptEvent. kind: 1 data (JSON text), 2 a log line. A payload beyond kMaxScriptPayload is cut.
+void encodeScriptEvent(std::vector<uint8_t>& out, uint32_t seq, uint32_t tick, uint32_t instance, uint8_t kind,
+                       const std::string& payload);
+
 // ---------------------------------------------------------------- hit/miss replay (stream 20)
 
 // ProjectileCollision kinds and flags.
@@ -510,9 +528,10 @@ struct Command
     uint32_t requestId;
     uint8_t player;        // the player id; Say: the team or player id
     uint8_t target;        // Say target, Map action, Ban "by", Subscribe/Unsubscribe stream, StartVote team
-    uint8_t flags;         // Teleport, SetHealth, KillPlayer, SetTeam, Rank flags; SetScore mask; StartVote minimum ballots
+    uint8_t flags;         // Teleport, SetHealth, KillPlayer, SetTeam, Rank flags; SetScore mask; StartVote minimum ballots;
+                           // StartScript flags
     uint8_t value8;        // SetTeam team, Rank rank, GameEvent/HudEvent event, Ban duration, Subscribe rate, SpawnObject team,
-                           // StartVote percent
+                           // StartVote percent, StartScript API version
     int32_t ints[5];       // SetScore values; Medal medal and value; GameEvent/HudEvent data in [0]
     uint32_t seconds;      // Ban, StartVote
     uint16_t index;        // Map
@@ -523,8 +542,10 @@ struct Command
     float pos[3], rot[3];  // Teleport, SpawnObject
     float value;           // SetHealth
     std::string text;      // Console line, Say text, Kick/Ban reason, ListObjects/SpawnObject template, Map name,
-                           // StartVote question
-    std::string text2;     // Map mode
+                           // StartVote question, StartScript name
+    std::string text2;     // Map mode; StartScript arguments and ScriptMessage message (JSON text, UTF-8)
+    std::string source;    // StartScript source (UTF-8)
+    uint32_t instance;     // StartScript, StopScript, ScriptMessage
     int16_t target16;      // HudEventRaw, RoundClock: the player, -1 every client
     std::vector<uint8_t> bytes;   // HudEventRaw payload
     float points[9];       // SquadOrder: three positions
