@@ -967,16 +967,27 @@ void testChurn()
     CHECK(f.host.count() == 0 && f.world.finished.size() == 200);
 }
 
+// Bytes in use on the malloc heap. mallinfo2 is glibc 2.33; older ones (the CentOS 7 build) have mallinfo, whose
+// int counters are enough for this test.
+size_t heapInUse()
+{
+#if defined(__GLIBC__) && __GLIBC_PREREQ(2, 33)
+    return mallinfo2().uordblks;
+#else
+    return static_cast<size_t>(mallinfo().uordblks);
+#endif
+}
+
 // What the host API costs (printed, not checked): CPU time per call from inside one script.
 void printCosts()
 {
     {
         Fixture f;
-        const size_t before = mallinfo2().uordblks;
+        const size_t before = heapInUse();
         for (uint32_t i = 1; i <= 8; ++i)
             f.start(i, "let n = 0; script.onTick(() => { n++; }); script.onStop(() => {});");
         f.tick(3);
-        std::printf("  memory: %.0f KiB per idle script (8 running)\n", (mallinfo2().uordblks - before) / 8.0 / 1024.0);
+        std::printf("  memory: %.0f KiB per idle script (8 running)\n", (heapInUse() - before) / 8.0 / 1024.0);
     }
     {
         // StartScript as a whole: the runtime, both contexts, compiling and the top-level code; then the end.
