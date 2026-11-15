@@ -118,8 +118,9 @@ commits the zip was built from, and the files with their checksums.
 
 A release changes no server by itself. The [bf2-docker](https://github.com/nihlen/bf2-docker) images pin one zip by
 URL and SHA-512, so after a release, update `assets.txt`, `assets.sha512` and `OPENBF2_ZIP` in `build.sh` in each of
-its `images/netsky-openbf2-*/assets/build/` directories, then rebuild the images. The release notes hold the three
-lines to paste.
+its `images/netsky-openbf2-*/assets/build/` directories, then rebuild the images. The zip's URL is
+`https://github.com/nihlen/openbf2-server-ext/releases/download/<name>/<name>.zip`, and its SHA-512 is the release's
+`.sha512` file.
 
 ## Repository layout
 

@@ -10,8 +10,8 @@ name: Release zip
 # The release's tag is the zip's name without ".zip", on the module commit that was built. The download URL is
 #   https://github.com/<owner>/<repo>/releases/download/<tag>/<tag>.zip
 # and the release also carries the zip's .sha512 and the -debug.tar.gz with the unstripped binaries. Its notes
-# (release/notes.sh) list the commits since the previous release, the files with their checksums, and the lines
-# bf2-docker needs to pin the zip: a server image runs a release only after bf2-docker is updated.
+# (release/notes.sh) list the commits since the previous release and the files with their checksums. A server image
+# runs a release only after bf2-docker pins it (README, "Release build").
 
 on:
   workflow_dispatch:

@@ -5,10 +5,9 @@
 #
 # <previous release> is the name of the release before this one (openbf2-serverext-<openbf2>-<module>-<bf2hub>-<backend>).
 # With it the notes start with the commits added since then, per repository. The rest comes from the zip's source.txt:
-# the commits it was built from, the builder, the files with their checksums, and the lines bf2-docker needs to pin
-# this zip.
+# the commits it was built from, the builder and the files with their checksums.
 #
-# Needs unzip, sha512sum and awk. The commit lists need the GitHub CLI (gh) with read access to the three repositories;
+# Needs unzip and awk. The commit lists need the GitHub CLI (gh) with read access to the three repositories;
 # without it each list is replaced by its compare link.
 #
 # Environment: MODULE_SLUG (default: GITHUB_REPOSITORY, then nihlen/openbf2-server-ext), OPENBF2_SLUG
@@ -23,7 +22,6 @@ OPENBF2_SLUG=${OPENBF2_SLUG:-nihlen/OpenBF2}
 BF2HUB_SLUG=${BF2HUB_SLUG:-B2BF/OpenBF2-BF2Hub}
 
 src=$(unzip -p "$zip" source.txt)
-sha512=$(sha512sum "$zip" | cut -d' ' -f1)
 
 # The second word of the source.txt line that starts with $1 (a commit, the domain), and the rest of that line
 commit_of() { printf '%s\n' "$src" | awk -v k="$1" '$1 == k { print $2; exit }'; }
@@ -93,24 +91,6 @@ echo
 echo "\`$name-debug.tar.gz\` holds the same binaries with their debug info, for gdb. It is not deployed."
 echo
 
-echo '## Using it in bf2-docker'
-echo
-echo 'A server image runs this release only once [bf2-docker](https://github.com/nihlen/bf2-docker) pins it. In each'
-echo '`images/netsky-openbf2-*/assets/build/`, replace the previous zip in three files:'
-echo
-echo '`assets.txt`'
-echo '```'
-echo "https://github.com/$MODULE_SLUG/releases/download/$name/$name.zip"
-echo '```'
-echo '`assets.sha512`'
-echo '```'
-echo "$sha512  $name.zip"
-echo '```'
-echo '`build.sh`'
-echo '```'
-echo "OPENBF2_ZIP=\"\$TMP/$name.zip\""
-echo '```'
-echo
 echo '<details><summary>source.txt, as packed in the zip</summary>'
 echo
 echo '```'
