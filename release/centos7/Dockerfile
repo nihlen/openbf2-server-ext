@@ -38,7 +38,10 @@ ENV PATH=/opt/gcc11/bin:$PATH CC=/opt/gcc11/bin/gcc CXX=/opt/gcc11/bin/g++ LD_LI
 
 ARG OPENSSL_VERSION=3.5.9
 ARG OPENSSL_SHA256=603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a
+# SOURCE_DATE_EPOCH (2026-01-01): OpenSSL compiles its build time into the library ("built on"), which would make
+# libserverext.so differ with every build of this image.
 RUN cd /tmp \
+ && export SOURCE_DATE_EPOCH=1767225600 \
  && curl -sSLfO "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz" \
  && echo "${OPENSSL_SHA256}  openssl-${OPENSSL_VERSION}.tar.gz" | sha256sum -c - \
  && tar xzf "openssl-${OPENSSL_VERSION}.tar.gz" \
