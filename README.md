@@ -73,7 +73,7 @@ binaries.
    file, the bot channel listens on `127.0.0.1:16700` and the admin channel is off.
 
 The binaries need glibc 2.35 or newer and OpenSSL 3 (`libssl.so.3`); Debian 12 and 13 and Ubuntu 22.04 and newer have
-both. OpenBF2 has no PunkBuster.
+both. A server on CentOS 7 uses the [CentOS 7 build](#centos-7-build) instead. OpenBF2 has no PunkBuster.
 
 [bf2-docker](https://github.com/nihlen/bf2-docker) has Docker images that do all of this (`images/netsky-openbf2-*`
 on its `combined` branch) and write `serverext.cfg` from environment variables on every start.
@@ -121,6 +121,23 @@ URL and SHA-512, so after a release, update `assets.txt`, `assets.sha512` and `O
 its `images/netsky-openbf2-*/assets/build/` directories, then rebuild the images. The zip's URL is
 `https://github.com/nihlen/openbf2-server-ext/releases/download/<name>/<name>.zip`, and its SHA-512 is the release's
 `.sha512` file.
+
+### CentOS 7 build
+
+For servers that still run CentOS 7 or another distribution of that age, `release/centos7/build.sh` builds the same
+four binaries against glibc 2.17. Its zip has `-centos7` at the end of its name and is installed like the regular
+one. It is published as a separate pre-release, named `... (CentOS 7 only)`, by
+`.github/workflows/release-centos7.yml` (Actions, "Release zip (CentOS 7)", "Run workflow", with the same commits as
+the regular release). It is not for current distributions: its `bf2` needs the ncurses 5 libraries
+(`libncursesw.so.5`, `libtinfo.so.5`, `libformw.so.5`), which Debian 12 and Ubuntu 22.04 no longer install.
+
+- `libserverext.so` carries its own OpenSSL 3.5, linked statically, because CentOS 7's OpenSSL has no TLS 1.3. It
+  gets OpenSSL fixes only through a new build.
+- The builder is CentOS 7 with GCC 11.4 compiled in the image (`release/centos7/Dockerfile`), so the first build
+  takes a while.
+- The build is tested less than the regular one, which is what the live servers and the bf2-docker images run.
+
+Everything it needs is in `release/centos7/` and that workflow. The regular build does not depend on it.
 
 ## Repository layout
 

@@ -84,8 +84,9 @@ jobs:
           zip=$(ls out/*.zip)
           tag=$(basename "$zip" .zip)
           # The newest release that is not this one: the notes list the commits added since. None on the first release.
-          prev=$(gh release list --limit 50 --json tagName,createdAt \
-            --jq "[.[] | select(.tagName != \"$tag\")] | sort_by(.createdAt) | last | .tagName // empty")
+          # Pre-releases are left out: the CentOS 7 zips (release-centos7.yml) are published as pre-releases.
+          prev=$(gh release list --limit 50 --json tagName,createdAt,isPrerelease \
+            --jq "[.[] | select(.tagName != \"$tag\" and (.isPrerelease | not))] | sort_by(.createdAt) | last | .tagName // empty")
           module/release/notes.sh "$zip" "$prev" > notes.md
           { echo "# $tag"; echo; cat notes.md; } >> "$GITHUB_STEP_SUMMARY"
 

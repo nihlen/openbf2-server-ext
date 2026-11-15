@@ -1,0 +1,115 @@
+name: Release zip (CentOS 7)
+
+# Builds the CentOS 7 zip and publishes it as its own GitHub release, marked as a pre-release:
+#   openbf2-serverext-<openbf2>-<module>-<bf2hub>-<backend>-centos7.zip
+# The same four binaries as the "Release zip" workflow, for servers that still run CentOS 7 or another distribution
+# of that age (glibc 2.17, ncurses 5). It runs release/centos7/build.sh, the same script and builder image
+# (release/centos7/Dockerfile) as a local build, from a clean build directory. The module's unit tests run inside the
+# build. The builder image compiles GCC on every run, which is most of the run time.
+#
+# A pre-release of its own keeps it apart from the regular release: it is never "Latest", releases/latest does not
+# lead to it, and the regular release's page holds one zip as before. Its tag is the zip's name without ".zip", on
+# the module commit that was built. Run it by hand for the same OpenBF2 and OpenBF2-BF2Hub commits as the regular
+# release it belongs to; nothing starts it automatically.
+
+on:
+  workflow_dispatch:
+    inputs:
+      openbf2_ref:
+        description: Branch, tag or commit of github.com/nihlen/OpenBF2 (OpenBF2 with the IServerExtension additions)
+        default: serverext/r1
+      bf2hub_ref:
+        description: Branch, tag or commit of github.com/B2BF/OpenBF2-BF2Hub
+        default: 7e378545fe5b0235041d6a70a4035f69c814c30a
+      publish:
+        description: 'Publish a GitHub pre-release (when off, the zip is only a workflow artifact)'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  zip:
+    name: Build the CentOS 7 zip
+    runs-on: ubuntu-22.04
+    timeout-minutes: 300
+    permissions:
+      contents: write   # the publish step creates the tag and the release
+    steps:
+      - name: Check out the module
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: module
+          persist-credentials: false
+
+      - name: Check out OpenBF2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: nihlen/OpenBF2
+          ref: ${{ inputs.openbf2_ref }}
+          path: openbf2
+          persist-credentials: false
+
+      - name: Check out OpenBF2-BF2Hub
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: B2BF/OpenBF2-BF2Hub
+          ref: ${{ inputs.bf2hub_ref }}
+          path: bf2hub
+          persist-credentials: false
+
+      - name: Build, test and package
+        env:
+          OPENBF2_REPO: ${{ github.workspace }}/openbf2
+          MODULE_REPO: ${{ github.workspace }}/module
+          BF2HUB_REPO: ${{ github.workspace }}/bf2hub
+          OUT: ${{ github.workspace }}/out
+          CLEAN: '1'
+          JOBS: '2'
+        run: |
+          module/release/centos7/build.sh
+
+      - name: Write the release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          # out/ holds exactly one zip; its name ends with -centos7.zip
+          zip=$(ls out/*.zip)
+          tag=$(basename "$zip" .zip)
+          module/release/centos7/notes.sh "$zip" > notes.md
+          { echo "# $tag"; echo; cat notes.md; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the zip
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: openbf2-serverext-centos7
+          path: |
+            out/*.zip
+            out/*.zip.sha512
+            out/*-debug.tar.gz
+            out/*.build.log
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+      - name: Publish the pre-release
+        if: ${{ inputs.publish }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          zip=$(ls out/*.zip)
+          tag=$(basename "$zip" .zip)
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "release $tag exists already: it is not replaced" >&2
+            exit 1
+          fi
+          gh release create "$tag" "$zip" "$zip.sha512" "out/$tag-debug.tar.gz" \
+            --target "$GITHUB_SHA" --title "$tag (CentOS 7 only)" --notes-file notes.md --prerelease --latest=false
+          echo "https://github.com/$GH_REPO/releases/download/$tag/$tag.zip" >> "$GITHUB_STEP_SUMMARY"
