@@ -9,7 +9,9 @@ name: Release zip
 #
 # The release's tag is the zip's name without ".zip", on the module commit that was built. The download URL is
 #   https://github.com/<owner>/<repo>/releases/download/<tag>/<tag>.zip
-# and the release also carries the zip's .sha512 and the -debug.tar.gz with the unstripped binaries.
+# and the release also carries the zip's .sha512 and the -debug.tar.gz with the unstripped binaries. Its notes
+# (release/notes.sh) list the commits since the previous release, the files with their checksums, and the lines
+# bf2-docker needs to pin the zip: a server image runs a release only after bf2-docker is updated.
 
 on:
   workflow_dispatch:
@@ -72,15 +74,20 @@ jobs:
           JOBS: '2'
         run: |
           module/release/build.sh
+
+      - name: Write the release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
           # out/ holds exactly one zip; its name ends with the GameSpy backend (e.g. -bf2hub.zip)
           zip=$(ls out/*.zip)
-          {
-            echo '```'
-            cat "$zip.sha512"
-            unzip -p "$zip" source.txt
-            echo '```'
-          } > notes.md
-          { echo '### Release zip'; cat notes.md; } >> "$GITHUB_STEP_SUMMARY"
+          tag=$(basename "$zip" .zip)
+          # The newest release that is not this one: the notes list the commits added since. None on the first release.
+          prev=$(gh release list --limit 50 --json tagName,createdAt \
+            --jq "[.[] | select(.tagName != \"$tag\")] | sort_by(.createdAt) | last | .tagName // empty")
+          module/release/notes.sh "$zip" "$prev" > notes.md
+          { echo "# $tag"; echo; cat notes.md; } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload the zip
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

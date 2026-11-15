@@ -41,3 +41,5 @@ admin channel. Settings are in [docs/configuration.md](docs/configuration.md).
 - `tools/testclient/serverext_client.py` and `tools/adminclient/adminclient.py` test the two channels against a
   running server. A protocol change must pass them before a client depends on it.
 - The release zip is built from commits by `release/build.sh`, not from the working tree.
+- A release is not in use until bf2-docker pins it. After making one, say so and name what has to change there
+  (README, "Release build"); the release notes hold the lines.

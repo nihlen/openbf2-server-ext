@@ -112,7 +112,14 @@ same zip, byte for byte. The output is in `release/out/`. Ubuntu 22.04 is the ta
 static libstdc++), and its glibc 2.35 keeps the binaries loadable on current Debian and Ubuntu.
 
 `.github/workflows/release.yml` runs the same script on GitHub Actions and publishes the result as a release. It is
-started by hand, with the OpenBF2 and OpenBF2-BF2Hub commits as inputs.
+started by hand (Actions, "Release zip", "Run workflow"), with the OpenBF2 and OpenBF2-BF2Hub commits as inputs. A
+push does not start it. The release notes come from `release/notes.sh`: the commits since the previous release, the
+commits the zip was built from, and the files with their checksums.
+
+A release changes no server by itself. The [bf2-docker](https://github.com/nihlen/bf2-docker) images pin one zip by
+URL and SHA-512, so after a release, update `assets.txt`, `assets.sha512` and `OPENBF2_ZIP` in `build.sh` in each of
+its `images/netsky-openbf2-*/assets/build/` directories, then rebuild the images. The release notes hold the three
+lines to paste.
 
 ## Repository layout
 
