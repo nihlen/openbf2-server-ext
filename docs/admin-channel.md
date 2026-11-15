@@ -67,7 +67,7 @@ codec style and nothing else: they use separate connections, versions and type r
 
 ### Encryption
 
-- TLS 1.3 only, in the module, with OpenSSL 1.1.1 or 3.x (linked dynamically).
+- TLS 1.3 only, in the module, with OpenSSL 1.1.1 or 3.x.
 - The client presents a certificate; a self-signed one is enough. The module pins it: `adminCertSha256` is the
   SHA-256 of the certificate's SubjectPublicKeyInfo. The module checks the leaf's public key against the pin and
   ignores the CA chain, host names and expiry. Rotating the client's key means updating the pin on every server.
