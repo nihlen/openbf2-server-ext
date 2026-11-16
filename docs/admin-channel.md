@@ -1439,4 +1439,4 @@ last frame, with a full frame every second. That is a new stream encoding, not a
 - **Seat preferences cover the first two seats** and not man-down players
   ([Lifetime and scope](#lifetime-and-scope)).
 - **`ServerHealth` describes the server process, not the network.** Packet loss and jitter between the server and
-  a player are not in it, and the engine's per-connection counters are not reachable from the module.
+  a player are not in it.
