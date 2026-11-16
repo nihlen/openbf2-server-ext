@@ -10,6 +10,7 @@
 #include <utility>
 #include <vector>
 
+#include "Health.h"
 #include "Protocol.h"
 
 namespace serverext {
@@ -51,7 +52,7 @@ enum Type : uint16_t
     EvVehicleDestroyed = 0x120F, EvControlPoint = 0x1210, EvChat = 0x1211, EvProjectileFired = 0x1212,
     EvProjectileHit = 0x1213, EvKick = 0x1214, EvBan = 0x1215, EvBot = 0x1216,
     EvWeaponFire = 0x1217, EvWeapons = 0x1218, EvProjectileCollision = 0x1219, EvProjectileTrace = 0x121A,
-    EvVoteResult = 0x121B, EvScriptFinished = 0x121C, EvScriptEvent = 0x121D,
+    EvVoteResult = 0x121B, EvScriptFinished = 0x121C, EvScriptEvent = 0x121D, EvServerHealth = 0x121E,
     // commands
     CmdConsole = 0x1301, CmdSay = 0x1302, CmdTeleport = 0x1303, CmdSetHealth = 0x1304, CmdKillPlayer = 0x1305,
     CmdSetTeam = 0x1306, CmdSetScore = 0x1307, CmdRank = 0x1308, CmdMedal = 0x1309, CmdGameEvent = 0x130A,
@@ -81,13 +82,14 @@ const uint8_t kCapIdentity = 4;
 const uint8_t kCapScripts = 8;   // the script commands (docs/admin-channel.md "Scripts")
 const uint8_t kCapSeatPreference = 16;   // SeatPreference (docs/admin-channel.md "Seat preferences")
 const uint8_t kCapSetCollision = 32;     // SetCollision (docs/admin-channel.md "Command semantics")
+const uint8_t kCapServerHealth = 64;     // stream 21, ServerHealth (docs/admin-channel.md "Server health")
 
 // Subscribe streams.
 enum Stream : uint8_t
 {
     StreamPlayers = 1, StreamVehicles = 2, StreamProjectiles = 3, StreamGame = 4, StreamAim = 5,
     StreamDamageEvents = 16, StreamProjectileEvents = 17, StreamWeaponFireEvents = 18, StreamWeaponEvents = 19,
-    StreamProjectileReplay = 20
+    StreamProjectileReplay = 20, StreamServerHealth = 21
 };
 
 // ObjectRef kinds.
@@ -444,6 +446,8 @@ void encodeVoteResult(std::vector<uint8_t>& out, uint32_t seq, uint32_t tick, ui
 void encodeScriptFinished(std::vector<uint8_t>& out, uint32_t seq, uint32_t tick, uint32_t instance,
                           const std::string& name, uint8_t reason, const std::string& result, uint32_t calls,
                           uint32_t totalUs, uint32_t maxUs);
+// ServerHealth: one window of ticks (Health.h).
+void encodeServerHealth(std::vector<uint8_t>& out, uint32_t seq, uint32_t tick, const health::Window& w);
 // ScriptEvent. kind: 1 data (JSON text), 2 a log line. A payload beyond kMaxScriptPayload is cut.
 void encodeScriptEvent(std::vector<uint8_t>& out, uint32_t seq, uint32_t tick, uint32_t instance, uint8_t kind,
                        const std::string& payload);

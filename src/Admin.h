@@ -10,6 +10,8 @@
 #include <string>
 #include <vector>
 
+#include "Health.h"
+
 namespace dice {
 namespace hfe {
 class ClassManager;
@@ -40,6 +42,8 @@ public:
     virtual ~AdminChannel() {}
     // Once per simulation tick, from the bot channel's tick handler, with its tick number.
     virtual void tick(unsigned long tick) = 0;
+    // A completed ServerHealth window (Health.h), after tick() on the tick that completed it.
+    virtual void health(const health::Window& window) = 0;
     // Bot-channel bot notifications: kind is admin::BotKind.
     virtual void onBot(uint8_t kind, int playerId, int team, uint32_t connection) = 0;
     // One line for the module's load log.

@@ -971,6 +971,33 @@ void encodeScriptFinished(std::vector<uint8_t>& out, uint32_t seq, uint32_t tick
     w.finish();
 }
 
+void encodeServerHealth(std::vector<uint8_t>& out, uint32_t seq, uint32_t tick, const health::Window& h)
+{
+    Writer w(out);
+    beginEvent(w, EvServerHealth, seq, tick);
+    w.u16(h.ticks);
+    w.u32(h.wallUs);
+    w.u8(h.flags);
+    w.u32(h.intervalP50Us);
+    w.u32(h.intervalP99Us);
+    w.u32(h.intervalMaxUs);
+    w.u16(h.lateTicks);
+    w.u16(h.shortTicks);
+    w.u32(h.cpuP50Us);
+    w.u32(h.cpuP99Us);
+    w.u32(h.cpuMaxUs);
+    w.u32(h.handlerP99Us);
+    w.u32(h.handlerMaxUs);
+    w.u32(h.involuntarySwitches);
+    w.u32(h.majorFaults);
+    w.u16(h.cpus);
+    w.u16(h.hostBusy);
+    w.u16(h.hostSteal);
+    w.u16(h.hostIoWait);
+    w.u32(h.residentKb);
+    w.finish();
+}
+
 void encodeScriptEvent(std::vector<uint8_t>& out, uint32_t seq, uint32_t tick, uint32_t instance, uint8_t kind,
                        const std::string& payload)
 {
@@ -1110,7 +1137,8 @@ bool parseCommand(uint16_t type, const uint8_t* p, size_t n, Command& out, std::
             return false;
         const uint8_t s = out.target;
         const bool eventStream = s == StreamDamageEvents || s == StreamProjectileEvents ||
-                                 s == StreamWeaponFireEvents || s == StreamWeaponEvents || s == StreamProjectileReplay;
+                                 s == StreamWeaponFireEvents || s == StreamWeaponEvents || s == StreamProjectileReplay ||
+                                 s == StreamServerHealth;
         if (s != StreamPlayers && s != StreamVehicles && s != StreamProjectiles && s != StreamGame && s != StreamAim &&
             !eventStream)
             return bad(badValue, "unknown stream");

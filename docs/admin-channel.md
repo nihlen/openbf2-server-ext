@@ -11,7 +11,8 @@ The channel gives a client:
 - state streams (players, vehicles, projectiles, game state, aim) at a rate the client picks, up to 30 Hz;
 - typed commands with typed replies (chat, teleport, health, teams, score, kick, ban, maps, objects, votes, HUD
   events);
-- scripts: JavaScript the client pushes and the module runs inside the server tick.
+- scripts: JavaScript the client pushes and the module runs inside the server tick;
+- the server's health every 10 s: how regularly its ticks run, what a tick costs and what the host does to it.
 
 The bot channel, the module's other protocol, is described in [protocol.md](protocol.md). The two share framing and
 codec style and nothing else: they use separate connections, versions and type ranges.
@@ -31,6 +32,7 @@ codec style and nothing else: they use separate connections, versions and type r
 - [Server votes](#server-votes)
 - [Scripts](#scripts)
 - [Seat preferences](#seat-preferences)
+- [Server health](#server-health)
 - [Engine interface](#engine-interface)
 - [Cost](#cost)
 - [Testing a client](#testing-a-client)
@@ -209,7 +211,7 @@ streams, or fields with a capability bit in `Welcome`. A module answers a type i
 closes the link, so:
 
 - the client sends the script commands, `SeatPreference` and `SetCollision` only when the matching capability bit is
-  set;
+  set, and subscribes to stream 21 only when capability bit 6 is set;
 - commands without a capability bit (`StartVote`, `CancelVote`, `HudEventRaw`, `RoundClock`, `SquadOrder`) and the
   current structure layouts need a module that has them. Module and client are deployed together.
 
@@ -291,6 +293,7 @@ Capability bits:
 | 3 | scripts can be run ([Scripts](#scripts)) |
 | 4 | the module accepts `SeatPreference` ([Seat preferences](#seat-preferences)) |
 | 5 | the module accepts `SetCollision` ([Command semantics](#command-semantics)) |
+| 6 | the module has stream 21, `ServerHealth` ([Server health](#server-health)) |
 
 ### Keepalive
 
@@ -482,7 +485,7 @@ cleared wreck, or a vehicle waiting for its spawner).
 |---|---|
 | `u32` | request id |
 | `u8` | stream, below |
-| `u8` | rate, Hz, 1..30 (ignored for streams 16 to 20) |
+| `u8` | rate, Hz, 1..30 (ignored for streams 16 to 21) |
 | `u8` | filters F (at most 64) |
 | F × string | template names, 1-256 bytes each, compared without case |
 
@@ -498,10 +501,13 @@ cleared wreck, or a vehicle waiting for its spawner).
 | 18 | `WeaponFire` events | any number. None: every launch. Else: launches whose weapon or projectile template matches one |
 | 19 | `Weapons` events | none |
 | 20 | `ProjectileCollision` and `ProjectileTrace` events | at least one projectile template |
+| 21 | `ServerHealth` events | none |
 
 - Streams 1 to 5 are state streams with a rate. The module sends a frame every `round(30 / rate)` ticks.
 - Streams 16 to 20 switch on event types that are off by default because of their volume. Every hit is one
   `Damage` event.
+- Stream 21 switches on `ServerHealth`, one event per 10 s. It is off by default so that a client which does not know
+  the event never receives it.
 - A new `Subscribe` for a stream replaces the old one.
 - Subscribing to stream 19 reports every player's weapons at once.
 
@@ -558,6 +564,7 @@ engine's script event with that id.
 | `0x121B` | VoteResult | `u32` request id of the `StartVote`, string question, `u8` outcome (1 passed, 2 failed, 3 cancelled by `CancelVote`, 4 cancelled by a level unload), `u16` yes, `u16` no, `u16` voters | [Server votes](#server-votes) |
 | `0x121C` | ScriptFinished | `u32` instance, string name, `u8` reason, string result, `u32` calls, `u32` CPU time of all calls in microseconds, `u32` CPU time of the longest call in microseconds | [Scripts](#scripts) |
 | `0x121D` | ScriptEvent | `u32` instance, `u8` kind (1 data: JSON text, 2 a log line), string payload (at most 8192 bytes) | [Scripts](#scripts) |
+| `0x121E` | ServerHealth | [Server health](#server-health); only while subscribed (stream 21) | the module's tick hook, the main thread's clocks and the host's `/proc` |
 
 Notes on single events:
 
@@ -1235,6 +1242,94 @@ if X.spawnAtTick <= base + 2: X.spawnAtTick = base + 3
 - The rule does not look at the spawn point itself. In a group without an enter-on-spawn point it only delays the
   later player by a pass or two.
 
+## Server health
+
+`ServerHealth` tells a client how well the server process runs: whether its ticks come on time, how much of a tick the
+main thread works, and whether the host takes the CPU away. It says nothing about a player's connection; a player's
+ping and lag are in `PlayerState`.
+
+- `Welcome` capability bit 6 is set by a module that has the event. The client subscribes to stream 21 only then.
+- While subscribed, the module sends one event per window of 300 ticks (10 s at 30 Hz). The windows run from the
+  server's first tick whether or not a client is subscribed, so the first event after a `Subscribe` covers a full
+  window. The event's tick is the tick that completed the window.
+- The module writes the same figures to its log once a minute, as a `health:` line over a window of 1800 ticks, with
+  or without an admin link.
+
+### How the engine times its ticks
+
+The figures only make sense against how the engine runs.
+
+- The simulation tick is 1/30 s (`TickCalculator(10, 30.0f)`, `Game/Main/BF2Engine.cpp:419`). Each frame the engine
+  runs the ticks that have become due on its clock, up to 10. When more than 10 are due it runs 10 and drops the
+  rest, so the game falls behind real time (`IO/TickCalculator.cpp:20-52`).
+- A dedicated server sleeps at the end of each frame until 1/30 s minus `server-sleep-overhead-time` has passed
+  since the frame began (`Game/Main/BF2Engine.cpp:1949-1972`). The variable's default is 5 ms (`:1567-1568`), so a
+  frame takes 28.3 ms and the server shows about 35 frames per second.
+- Frames are therefore shorter than ticks. In normal running five ticks in six follow the one before by one frame
+  (28.3 ms) and the sixth by two (56.7 ms), because the frame between them had no tick due.
+- When a frame starts late, the ticks that became due meanwhile run in that one frame, directly after each other.
+
+### `0x121E ServerHealth`
+
+After the sequence number and the tick:
+
+| Type | Field |
+|---|---|
+| `u16` | ticks in the window (300) |
+| `u32` | real time the window took, microseconds |
+| `u8` | flags, below |
+| `u32` | tick interval, median, microseconds |
+| `u32` | tick interval, 99th percentile |
+| `u32` | tick interval, longest |
+| `u16` | late ticks: intervals above 66 667 microseconds (two ticks) |
+| `u16` | short ticks: intervals below 16 667 microseconds (half a tick) |
+| `u32` | main-thread CPU time per tick, median, microseconds |
+| `u32` | main-thread CPU time per tick, 99th percentile |
+| `u32` | main-thread CPU time per tick, largest |
+| `u32` | the module's tick handler, 99th percentile, microseconds |
+| `u32` | the module's tick handler, longest |
+| `u32` | involuntary context switches of the main thread in the window |
+| `u32` | major page faults of the main thread in the window |
+| `u16` | the host's CPUs |
+| `u16` | host CPU busy, hundredths of a percent of all CPUs |
+| `u16` | host CPU steal, hundredths of a percent |
+| `u16` | host CPU I/O wait, hundredths of a percent |
+| `u32` | the server process's resident memory, KiB |
+
+| Flag bit | Meaning |
+|---|---|
+| 0 | stepped time is on (`stepMode 1`): the tick figures do not describe a real-time server |
+| 1 | the host figures are valid |
+| 2 | a level was unloaded during the window: the load that followed is in the tick figures |
+
+- **Tick interval.** The real time between the start of the module's tick handler on one tick and on the next, from a
+  steady clock. On a healthy server the median is one frame, the 99th percentile and the longest are two frames, and
+  there are no late and no short ticks.
+- **Late ticks** count the intervals in which the simulation stood still for more than two ticks. The limit is above
+  the two-frame interval of normal running.
+- **Short ticks** count the ticks that ran in the same frame as the one before: a frame started so late that two
+  ticks were due. With the default frame length a frame more than 38 ms late always causes one, and a frame 5 to
+  38 ms late does when a tick was about to become due.
+- **Ticks lost.** The window always has 300 ticks. When the engine dropped ticks, the window's real time is longer
+  than 10 s by the time they stood for: `real time × 30 − ticks`, within one tick.
+- **CPU time per tick** is the main thread's CPU time (`CLOCK_THREAD_CPUTIME_ID`) between the same two points:
+  everything the main thread did for one tick, the engine's work and the module's. A tick has 33 333 microseconds;
+  the nearer the 99th percentile is to that, the less room the server has.
+- **The module's tick handler** is the module's own part of that, the bot channel and the admin channel together.
+- **Involuntary context switches** count how often the kernel took the main thread off a CPU while it still wanted
+  to run. **Major page faults** count how often it waited for a page to be read from disk: the host is short of
+  memory. Both come from `getrusage(RUSAGE_THREAD)`.
+- **Host figures** are the differences of `/proc/stat` over the window: busy is user, nice, system and interrupt
+  time, steal is time the hypervisor gave to other machines, I/O wait is idle time with disk I/O outstanding. In a
+  container they describe the whole machine the container runs on. The resident memory is `/proc/self/statm`. They
+  are read once a second by a thread of their own, so a window's figures cover its 10 s to within a second. Flag bit
+  1 is clear, and the three percentages are 0, when `/proc/stat` could not be read or no new sample fell in the
+  window.
+- **A level load** stops the ticks for as long as it takes. The window it falls in has flag bit 2 and one very long
+  interval; a client should leave such a window out of its statistics.
+- Nothing in the event is read from the engine, and the main thread makes no file or socket call for it: two clock
+  reads per tick and one `getrusage` per window.
+
 ## Engine interface
 
 The OpenBF2 engine exports no symbols, so the module uses only typed virtual calls on engine interfaces. What it
@@ -1284,6 +1379,7 @@ Measured on a 30 Hz server with bots:
 - **`AimStream`.** 50 bytes per living player per frame: about 96 KB/s for 64 players at 30 Hz.
 - **`WeaponFire`.** About 80 bytes per event, about 0.8 KB/s while one gun fires.
 - **Scripts.** QuickJS-NG adds about 1.2 MB to `libserverext.so` and no shared library.
+- **`ServerHealth`.** 79 bytes per 10 s. Measuring costs two clock reads per tick, well under a microsecond.
 
 If stream bandwidth becomes a problem, the cheap step is a stream encoding that skips entities unchanged since the
 last frame, with a full frame every second. That is a new stream encoding, not a protocol redesign.
@@ -1342,3 +1438,5 @@ last frame, with a full frame every second. That is a new stream encoding, not a
 - **The script time budget stops mistakes, not attacks** ([Limits](#limits)).
 - **Seat preferences cover the first two seats** and not man-down players
   ([Lifetime and scope](#lifetime-and-scope)).
+- **`ServerHealth` describes the server process, not the network.** Packet loss and jitter between the server and
+  a player are not in it, and the engine's per-connection counters are not reachable from the module.

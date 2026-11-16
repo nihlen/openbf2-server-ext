@@ -48,6 +48,7 @@
 #include "Channel.h"
 #include "Config.h"
 #include "EngineUtil.h"
+#include "Health.h"
 #include "IoThread.h"
 #include "Neutral.h"
 #include "PendingInput.h"
@@ -324,7 +325,7 @@ public:
         : m_em(0), m_ext(0), m_players(0), m_objects(0), m_game(0), m_server(0), m_system(0),
           m_tick(0), m_unloadSeen(false), m_mask(humanMappingMask()),
           m_rejectedInputs(0), m_lastRejectLog(0), m_scanKey(0), m_scanFull(true),
-          m_lastRestart(0), m_restarted(false), m_admin(0), m_stepOwnerLogged(0) {}
+          m_lastRestart(0), m_restarted(false), m_lastHandlerUs(0), m_admin(0), m_stepOwnerLogged(0) {}
 
     bool init(ClassManager* cm)
     {
@@ -398,6 +399,8 @@ public:
              tickOk ? 1 : 0, handle, hudOk ? 1 : 0, chatOk ? 1 : 0, damageOk ? 1 : 0, projectileOk ? 1 : 0, spotOk ? 1 : 0,
              (void*)m_system);
         logLine("%s", m_admin ? m_admin->describe().c_str() : "admin channel: off (no adminConnect in serverext.cfg)");
+        if (!m_health.start(m_config.stepMode))
+            logLine("server health: the host thread did not start; no host figures");
         // v4 stepped time (R3): installed once, for the life of the server (IServerExtension::setTickSource)
         if (m_config.stepMode)
         {
@@ -439,6 +442,7 @@ public:
                 m_tracked.clear();
                 m_spotted.clear();
                 m_scanFull = true;   // rebuilt with one full walk on the next tick
+                m_health.noteLevelLoad();
                 logLine("tick %lu: level unload", m_tick);
             }
             return;
@@ -452,6 +456,7 @@ public:
         if (category != kTickCategory || id != kTickEventId)
             return;
 
+        const unsigned int healthDone = m_health.tick(m_lastHandlerUs);
         const std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
         // Re-post first so the chain survives any early return.
         m_em->postEventNextUpdate(kTickCategory, kTickEventId, 0);
@@ -464,9 +469,16 @@ public:
         sendVehicleList();
         sendRoundState();
         if (m_admin)
+        {
             m_admin->tick(m_tick);
+            if (healthDone & health::Monitor::EventWindow)
+                m_admin->health(m_health.eventWindow());
+        }
+        if (healthDone & health::Monitor::LogWindow)
+            logHealth(m_health.logWindow());
         m_unloadSeen = m_unloadSeen && hasMissingBots();
         const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+        m_lastHandlerUs = us < 0 ? 0 : us > 4294967295.0 ? 0xFFFFFFFFu : static_cast<uint32_t>(us);
         m_cost.add(us);
         if (m_tick % kStatsPeriodTicks == 0)
         {
@@ -479,6 +491,24 @@ public:
             m_keptMark = m_keptPresses;
             m_steersMark = m_steers;
         }
+    }
+
+    // The minute's server health (docs/admin-channel.md "Server health"; the same figures as ServerHealth).
+    void logHealth(const health::Window& w)
+    {
+        char host[160];
+        if (w.flags & health::kFlagHostValid)
+            std::snprintf(host, sizeof(host), "host %u CPUs busy %.2f%% steal %.2f%% iowait %.2f%%", w.cpus,
+                          w.hostBusy / 100.0, w.hostSteal / 100.0, w.hostIoWait / 100.0);
+        else
+            std::snprintf(host, sizeof(host), "host figures not available");
+        logLine("tick %lu health: %u ticks in %.3f s%s%s | tick interval (us) p50 %u p99 %u max %u, late (>66.7 ms) %u, "
+                "short (<16.7 ms) %u | main thread CPU per tick (us) p50 %u p99 %u max %u, %u involuntary switches, "
+                "%u major faults | %s, resident %u MiB",
+                m_tick, w.ticks, w.wallUs / 1e6, (w.flags & health::kFlagLevelLoad) ? " (with a level load)" : "",
+                (w.flags & health::kFlagStepped) ? " (stepped time)" : "", w.intervalP50Us, w.intervalP99Us,
+                w.intervalMaxUs, w.lateTicks, w.shortTicks, w.cpuP50Us, w.cpuP99Us, w.cpuMaxUs, w.involuntarySwitches,
+                w.majorFaults, host, w.residentKb / 1024);
     }
 
     // ---------------------------------------------------------------- engine observers
@@ -2230,6 +2260,8 @@ private:
     std::vector<proto::StateEntry> m_entries;
     std::vector<uint8_t> m_stateBuf;
     CostStats m_cost;
+    health::Monitor m_health;
+    uint32_t m_lastHandlerUs;        // what the tick handler took on the tick before
     AdminChannel* m_admin;           // the admin channel, or null when adminConnect is not set
     uint32_t m_stepOwnerLogged;   // the stepping connection last logged (R3)
 };

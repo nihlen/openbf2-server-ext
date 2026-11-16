@@ -193,7 +193,8 @@ public:
         : m_config(config), m_host(host), m_logFn(log), m_em(0), m_ext(0), m_players(0), m_objects(0), m_game(0),
           m_server(0), m_system(0), m_console(0), m_templates(0), m_link(0), m_io(0), m_session(0), m_seq(0),
           m_tick(0), m_lastStatus(-2), m_lastBeginRound(-2), m_cpsScanned(false), m_lastCpScan(0), m_damageEvents(false),
-          m_projectileEvents(false), m_fireEvents(false), m_weaponEvents(false), m_firesDropped(0), m_replay(false),
+          m_projectileEvents(false), m_fireEvents(false), m_weaponEvents(false), m_healthEvents(false),
+          m_firesDropped(0), m_replay(false),
           m_collisionsThisTick(0), m_collisionsDropped(0), m_tracesSent(0), m_tracesSkipped(0), m_r4(false),
           m_voteHook(false), m_voteRequest(0), m_voteReposts(0), m_selfPost(-1), m_selfSeen(false),
           m_scripts(this), m_scriptEventsDropped(0), m_seatPrefCount(0), m_seatDelays(0), m_seatProbes(0),
@@ -309,6 +310,15 @@ public:
         m_cost.add(us);
         if (m_tick % kStatsPeriodTicks == 0)
             reportStats();
+    }
+
+    virtual void health(const health::Window& window)
+    {
+        if (!m_session || !m_healthEvents)
+            return;
+        std::vector<uint8_t> f;
+        encodeServerHealth(f, ++m_seq, tickNumber(), window);
+        event(f);
     }
 
     virtual void onBot(uint8_t kind, int playerId, int team, uint32_t connection)
@@ -1044,7 +1054,7 @@ private:
         m_pending.clear();
         for (int i = 0; i <= StreamAim; ++i)
             m_streams[i] = StreamSub();
-        m_damageEvents = m_projectileEvents = m_fireEvents = m_weaponEvents = false;
+        m_damageEvents = m_projectileEvents = m_fireEvents = m_weaponEvents = m_healthEvents = false;
         m_projectileEventFilters.clear();
         m_fireFilters.clear();
         m_fires.clear();
@@ -1083,7 +1093,7 @@ private:
         }
         w.capabilities = (m_config.adminAllowConsole ? kCapConsole : 0) | (m_config.adminAllowObjects ? kCapObjects : 0) |
                          (m_config.adminIdentity() ? kCapIdentity : 0) | (m_config.adminAllowScripts ? kCapScripts : 0) |
-                         kCapSeatPreference | kCapSetCollision;
+                         kCapSeatPreference | kCapSetCollision | kCapServerHealth;
         w.map = cp1252ToUtf8(m_game->getCurrentMapName());
         w.mode = cp1252ToUtf8(m_game->getCurrentMapGameMode());
         const int size = m_game->getCurrentMapSize();
@@ -2713,6 +2723,8 @@ private:
             m_replay = true;
             m_replayFilters = filters;
         }
+        else if (c.target == StreamServerHealth)
+            m_healthEvents = true;
         else
         {
             StreamSub& s = m_streams[c.target];
@@ -2751,6 +2763,8 @@ private:
             m_replayFilters.clear();
             m_traces.clear();
         }
+        else if (c.target == StreamServerHealth)
+            m_healthEvents = false;
         else if (c.target >= StreamPlayers && c.target <= StreamAim)
             m_streams[c.target] = StreamSub();
         else
@@ -3336,6 +3350,7 @@ private:
     std::vector<std::string> m_projectileEventFilters;
     bool m_fireEvents;
     bool m_weaponEvents;
+    bool m_healthEvents;                        // stream 21
     std::vector<std::string> m_fireFilters;   // lowered; empty: every launch
     std::vector<PendingFire> m_fires;
     uint64_t m_firesDropped;

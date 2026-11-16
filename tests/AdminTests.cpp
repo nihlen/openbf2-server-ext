@@ -38,6 +38,7 @@
 #include "AdminProtocol.h"
 #include "AdminSession.h"
 #include "Config.h"
+#include "Health.h"
 #include "Rotation.h"
 
 using namespace serverext;
@@ -786,6 +787,7 @@ std::vector<Case> validCommands()
     w.u32(44); w.u8(1); w.u32(3); w.u8(0); CASE(CmdSetCollision);
     w.u32(45); w.u8(2); w.u32(1819); w.u8(1); CASE(CmdSetCollision);
     w.u32(46); w.u8(3); w.u32(29328); w.u8(0); CASE(CmdSetCollision);
+    w.u32(47); w.u8(StreamServerHealth); w.u8(0); w.u8(0); CASE(MsgSubscribe);
 #undef CASE
     return cs;
 }
@@ -854,7 +856,8 @@ void testCommandParsing()
     w.u32(1); w.u8(StreamAim); w.u8(5); w.u8(1); w.str("x"); BAD(MsgSubscribe);               // aim takes no filter
     w.u32(1); w.u8(StreamWeaponEvents); w.u8(0); w.u8(1); w.str("x"); BAD(MsgSubscribe);      // weapons takes none
     w.u32(1); w.u8(StreamProjectileReplay); w.u8(0); w.u8(0); BAD(MsgSubscribe);              // replay needs a filter
-    w.u32(1); w.u8(21); w.u8(0); w.u8(0); BAD(MsgSubscribe);                                  // unknown event stream
+    w.u32(1); w.u8(22); w.u8(0); w.u8(0); BAD(MsgSubscribe);                                  // unknown event stream
+    w.u32(1); w.u8(StreamServerHealth); w.u8(0); w.u8(1); w.str("x"); BAD(MsgSubscribe);      // health takes no filter
     w.u32(1); w.str(""); BAD(CmdConsole);
     w.u32(1); w.str("a\nb"); BAD(CmdConsole);
     w.u32(1); w.str(std::string(4097, 'a')); BAD(CmdConsole);
@@ -1620,6 +1623,177 @@ void testIo()
     }
 }
 
+// ---------------------------------------------------------------- server health
+
+void testHealth()
+{
+    using namespace serverext::health;
+
+    // quantile: the smallest value with at least q of the values at or below it
+    {
+        std::vector<uint32_t> none;
+        CHECK(quantile(none, 0.5) == 0);
+        std::vector<uint32_t> one(1, 7);
+        CHECK(quantile(one, 0.5) == 7 && quantile(one, 0.99) == 7 && quantile(one, 1.0) == 7);
+        std::vector<uint32_t> v;
+        for (uint32_t i = 100; i >= 1; --i)
+            v.push_back(i);
+        CHECK(quantile(v, 0.5) == 50 && quantile(v, 0.99) == 99 && quantile(v, 1.0) == 100 && quantile(v, 0.001) == 1);
+        CHECK(quantile(v, 0.0) == 1 && quantile(v, 2.0) == 100);
+    }
+    CHECK(share(0, 0) == 0 && share(5, 0) == 0 && share(1, 4) == 2500 && share(9, 4) == 10000 && share(1, 3) == 3333);
+    CHECK(share(278, 10000) == 278 && share(0xFFFFFFFFFFFFull, 0xFFFFFFFFFFFFull) == 10000);
+
+    // A steady 30 Hz server: the first call sets the starting point, the window completes on the 5th interval.
+    {
+        Sampler s(5);
+        uint64_t wall = 1000000, cpu = 500;
+        CHECK(!s.add(wall, cpu, 0));
+        for (int i = 1; i <= 4; ++i)
+            CHECK(!s.add(wall += 33333, cpu += 300, 80));
+        CHECK(s.add(wall += 33333, cpu += 300, 80));
+        const Window& w = s.window();
+        CHECK(w.ticks == 5 && w.wallUs == 5 * 33333 && w.flags == 0);
+        CHECK(w.intervalP50Us == 33333 && w.intervalP99Us == 33333 && w.intervalMaxUs == 33333);
+        CHECK(w.lateTicks == 0 && w.shortTicks == 0);
+        CHECK(w.cpuP50Us == 300 && w.cpuP99Us == 300 && w.cpuMaxUs == 300 && w.handlerP99Us == 80 && w.handlerMaxUs == 80);
+        CHECK(w.involuntarySwitches == 0 && w.majorFaults == 0 && w.cpus == 0 && w.residentKb == 0);
+
+        // The next window: a frame 70 ms late, then two ticks in one frame, and a level load noted in it.
+        s.noteLevelLoad();
+        CHECK(!s.add(wall += 33333, cpu += 300, 90));
+        CHECK(!s.add(wall += 103333, cpu += 20000, 90));      // late
+        CHECK(!s.add(wall += 400, cpu += 350, 2500));         // caught up in the same frame
+        CHECK(!s.add(wall += 33000, cpu += 300, 90));
+        CHECK(s.add(wall += 33333, cpu += 300, 90));
+        const Window& x = s.window();
+        CHECK(x.ticks == 5 && x.wallUs == 33333 + 103333 + 400 + 33000 + 33333 && x.flags == kFlagLevelLoad);
+        CHECK(x.lateTicks == 1 && x.shortTicks == 1 && x.intervalMaxUs == 103333 && x.intervalP50Us == 33333);
+        CHECK(x.cpuMaxUs == 20000 && x.cpuP50Us == 300 && x.handlerMaxUs == 2500 && x.handlerP99Us == 2500);
+
+        // The flag belongs to that window only.
+        for (int i = 0; i < 4; ++i)
+            CHECK(!s.add(wall += 33333, cpu += 300, 90));
+        CHECK(s.add(wall += 33333, cpu += 300, 90) && s.window().flags == 0 && s.window().lateTicks == 0);
+    }
+    // The limits of late and short, clocks that go back, and values beyond 32 bits.
+    {
+        Sampler s(6);
+        uint64_t wall = 10, cpu = 10;
+        CHECK(!s.add(wall, cpu, 0));
+        CHECK(!s.add(wall += kLateIntervalUs, cpu, 0));         // exactly the limit: not late
+        CHECK(!s.add(wall += kLateIntervalUs + 1, cpu, 0));     // late
+        CHECK(!s.add(wall += kShortIntervalUs, cpu, 0));        // exactly the limit: not short
+        CHECK(!s.add(wall += kShortIntervalUs - 1, cpu, 0));    // short
+        CHECK(!s.add(wall - 5, cpu - 5, 0xFFFFFFFFu));          // both clocks went back: no time, counted as short
+        CHECK(s.add(wall + 0x200000000ull, cpu + 0x200000000ull, 0));
+        const Window& w = s.window();
+        CHECK(w.ticks == 6 && w.lateTicks == 2 && w.shortTicks == 2);
+        CHECK(w.intervalMaxUs == 0xFFFFFFFFu && w.cpuMaxUs == 0xFFFFFFFFu && w.wallUs == 0xFFFFFFFFu);
+        CHECK(w.handlerMaxUs == 0xFFFFFFFFu);
+    }
+    // A window size outside 1..65535 is brought inside it.
+    {
+        Sampler s(0);
+        CHECK(!s.add(0, 0, 0) && s.add(33333, 100, 1) && s.window().ticks == 1);
+    }
+
+    // /proc/stat
+    {
+        const std::string stat =
+            "cpu  1000 20 300 80000 40 5 15 2600 7 9\n"
+            "cpu0 500 10 150 40000 20 2 8 1300 0 0\n"
+            "cpu1 500 10 150 40000 20 3 7 1300 0 0\n"
+            "intr 12345 0 0\nctxt 99\nbtime 1\nprocesses 5\n";
+        CpuTimes c;
+        CHECK(parseProcStat(stat.data(), stat.size(), c));
+        CHECK(c.busy == 1000 + 20 + 300 + 5 + 15 && c.steal == 2600 && c.ioWait == 40 && c.cpus == 2);
+        CHECK(c.total == c.busy + 80000 + 40 + 2600);
+        // Hostile and broken text: nothing is read past the size, and a bad file leaves the output alone.
+        CpuTimes keep;
+        keep.busy = 42;
+        const char* const bad[] = {
+            "", "cpu", "cpu ", "cpu  1 2 3 4 5 6 7", "cpu  1 2 3 4 5 6 7 x", "cpu  -1 2 3 4 5 6 7 8",
+            "cpu0 1 2 3 4 5 6 7 8\n", "cpux 1 2 3 4 5 6 7 8", "intr 1 2 3 4 5 6 7 8 9\n",
+            "cpu  99999999999999999999999 2 3 4 5 6 7 8", "cpu  1 2 3 4 5 6 7\n8", "\n\n\n" };
+        for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); ++i)
+            CHECK(!parseProcStat(bad[i], std::strlen(bad[i]), keep) && keep.busy == 42);
+        for (size_t cut = 0; cut < stat.size(); ++cut)
+        {
+            CpuTimes part;
+            parseProcStat(stat.data(), cut, part);      // any truncation: must not crash
+        }
+        CHECK(!parseProcStat(stat.data(), 20, keep));   // the cpu line cut before its eighth field
+        // No line end after the last field, tabs, and no cpuN lines.
+        const std::string bare = "cpu\t1 2 3 4 5 6 7 8";
+        CHECK(!parseProcStat(bare.data(), bare.size(), c));   // "cpu" must be followed by a space
+        const std::string spaced = "cpu \t 1 2 3 4 5 6 7 8";
+        CHECK(parseProcStat(spaced.data(), spaced.size(), c) && c.cpus == 0 && c.steal == 8 && c.total == 1 + 2 + 3 + 6 + 7 + 4 + 5 + 8);
+    }
+    // /proc/self/statm
+    {
+        uint64_t pages = 0;
+        const std::string statm = "40000 12345 900 5 0 20000 0\n";
+        CHECK(parseStatm(statm.data(), statm.size(), pages) && pages == 12345);
+        uint64_t keep = 7;
+        const char* const bad[] = { "", "40000", "40000 ", "40000 x", "x 1", "40000\n12345", "-1 5" };
+        for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); ++i)
+            CHECK(!parseStatm(bad[i], std::strlen(bad[i]), keep) && keep == 7);
+    }
+
+    // The event: 8 bytes of sequence number and tick, then 63 bytes.
+    {
+        Window w;
+        w.ticks = 300; w.wallUs = 0x01020304; w.flags = kFlagHostValid | kFlagLevelLoad; w.intervalMaxUs = 70000;
+        w.lateTicks = 2; w.shortTicks = 3; w.hostSteal = 278; w.residentKb = 0xA0B0C0D0;
+        std::vector<uint8_t> buf;
+        encodeServerHealth(buf, 9, 1234, w);
+        const std::vector<proto::Frame> f = frames(buf);
+        CHECK(f.size() == 1 && f[0].type == EvServerHealth && f[0].payload.size() == 8 + 63);
+        if (f.size() == 1 && f[0].payload.size() == 8 + 63)
+        {
+            Reader r(&f[0].payload[0], f[0].payload.size());
+            CHECK(r.u32() == 9 && r.u32() == 1234 && r.u16() == 300 && r.u32() == 0x01020304 && r.u8() == 6);
+            CHECK(r.u32() == 0 && r.u32() == 0 && r.u32() == 70000 && r.u16() == 2 && r.u16() == 3);
+            for (int i = 0; i < 7; ++i)
+                CHECK(r.u32() == 0);
+            CHECK(r.u16() == 0 && r.u16() == 0 && r.u16() == 278 && r.u16() == 0 && r.u32() == 0xA0B0C0D0 && r.done());
+        }
+    }
+
+    // The monitor on this thread: real clocks, getrusage and the host thread reading this machine's /proc.
+    {
+        static Monitor m;   // its thread lives for the process
+        CHECK(m.start(false));
+        timespec wait = { 1, 300000000 };
+        nanosleep(&wait, 0);        // one host sample before the first tick, so the first window has a base
+        unsigned int events = 0, logs = 0;
+        volatile unsigned int spin = 0;
+        for (unsigned int i = 0; i <= kEventWindowTicks; ++i)
+        {
+            const unsigned int done = m.tick(123);
+            events += (done & Monitor::EventWindow) ? 1 : 0;
+            logs += (done & Monitor::LogWindow) ? 1 : 0;
+            m.noteLevelLoad();
+            for (unsigned int k = 0; k < 20000; ++k)
+                spin += k;
+            timespec nap = { 0, 5000000 };
+            nanosleep(&nap, 0);     // 300 ticks of 5 ms: the window spans a host sample
+        }
+        const Window& w = m.eventWindow();
+        CHECK(events == 1 && logs == 0 && w.ticks == kEventWindowTicks);
+        CHECK(w.wallUs > 1400000 && w.wallUs < 60000000 && w.intervalP50Us >= 5000 && w.intervalMaxUs >= w.intervalP99Us);
+        CHECK(w.cpuMaxUs > 0 && w.cpuP50Us < 5000000 && w.handlerMaxUs == 123 && w.handlerP99Us == 123);
+        CHECK((w.flags & kFlagLevelLoad) && !(w.flags & kFlagStepped));
+        CHECK((w.flags & kFlagHostValid) && w.cpus >= 1 && w.residentKb > 0);
+        CHECK(w.hostBusy + w.hostSteal + w.hostIoWait <= 10000);
+        std::printf("  health monitor: %u ticks in %.3f s, interval us p50 %u max %u, cpu us p50 %u max %u, %u switches, "
+                    "host %u CPUs busy %.2f%% steal %.2f%%, resident %u KiB\n", w.ticks, w.wallUs / 1e6, w.intervalP50Us,
+                    w.intervalMaxUs, w.cpuP50Us, w.cpuMaxUs, w.involuntarySwitches, w.cpus, w.hostBusy / 100.0,
+                    w.hostSteal / 100.0, w.residentKb);
+    }
+}
+
 // ---------------------------------------------------------------- golden fixtures
 
 // The canonical samples of tools/adminclient/adminclient.py golden_samples(). The module's messages
@@ -1679,7 +1853,7 @@ void testGolden()
 {
     const std::string path = std::string(SERVEREXT_FIXTURES) + "/admin-v1-golden.txt";
     std::map<std::string, std::vector<uint8_t> > golden = readGolden(path);
-    CHECK(golden.size() == 84);
+    CHECK(golden.size() == 86);
     if (golden.empty())
     {
         std::printf("  no golden fixtures at %s\n", path.c_str());
@@ -1859,6 +2033,15 @@ void testGolden()
     }
     encodeScriptFinished(mine["ev_script_finished"], 28, 10, 7, "nasa", 1, "{\"ticks\":90}", 90, 1234, 56);
     encodeScriptEvent(mine["ev_script_event"], 29, 10, 7, 1, "{\"player\":3,\"y\":301.5}");
+    {
+        health::Window h;
+        h.ticks = 300; h.wallUs = 10000123; h.flags = health::kFlagHostValid;
+        h.intervalP50Us = 33334; h.intervalP99Us = 34100; h.intervalMaxUs = 61234; h.lateTicks = 1; h.shortTicks = 1;
+        h.cpuP50Us = 310; h.cpuP99Us = 1250; h.cpuMaxUs = 4800; h.handlerP99Us = 350; h.handlerMaxUs = 900;
+        h.involuntarySwitches = 12; h.majorFaults = 0; h.cpus = 1; h.hostBusy = 412; h.hostSteal = 278;
+        h.hostIoWait = 3; h.residentKb = 159744;
+        encodeServerHealth(mine["ev_server_health"], 30, 10, h);
+    }
 
     for (std::map<std::string, std::vector<uint8_t> >::iterator it = mine.begin(); it != mine.end(); ++it)
     {
@@ -1884,7 +2067,7 @@ void testGolden()
         CHECK(ok);
         parsed[it->first] = c;
     }
-    CHECK(parsed.size() == 37);
+    CHECK(parsed.size() == 38);
     Command c;
     c = parsed["cmd_set_collision_off"]; CHECK(c.type == CmdSetCollision && c.requestId == 36 && c.ref.kind == RefPlayer && c.ref.id == 3 && c.flags == 0);
     c = parsed["cmd_set_collision_on"]; CHECK(c.type == CmdSetCollision && c.requestId == 37 && c.ref.kind == RefNetId && c.ref.id == 1819 && c.flags == 1);
@@ -1901,6 +2084,7 @@ void testGolden()
     c = parsed["cmd_cancel_vote"]; CHECK(c.type == CmdCancelVote && c.requestId == 28);
     c = parsed["cmd_request_snapshot"]; CHECK(c.type == MsgRequestSnapshot && c.requestId == 1);
     c = parsed["cmd_subscribe_fire"]; CHECK(c.requestId == 25 && c.target == 18 && c.filters.size() == 1 && c.filters[0] == "ahe_z10_FlareLauncher");
+    c = parsed["cmd_subscribe_health"]; CHECK(c.requestId == 38 && c.target == StreamServerHealth && c.filters.empty());
     c = parsed["cmd_subscribe_replay"]; CHECK(c.requestId == 26 && c.target == StreamProjectileReplay && c.filters.size() == 1 && c.filters[0] == "agm114_hellfire_tv");
     c = parsed["cmd_subscribe"]; CHECK(c.requestId == 3 && c.target == 3 && c.value8 == 5 && c.filters.size() == 1 && c.filters[0] == "agm114_hellfire_tv");
     c = parsed["cmd_unsubscribe"]; CHECK(c.requestId == 5 && c.target == 2);
@@ -1950,6 +2134,7 @@ int main()
     testFuzz();
     testLink();
     testConfig();
+    testHealth();
     testGolden();
     testIo();
     std::printf("%d checks, %d failures\n", g_checks, g_failures);

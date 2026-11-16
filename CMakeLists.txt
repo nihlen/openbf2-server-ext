@@ -54,7 +54,8 @@ add_library(serverext_core STATIC
     src/AdminProtocol.cpp
     src/AdminCrypto.cpp
     src/AdminLink.cpp
-    src/AdminSession.cpp)
+    src/AdminSession.cpp
+    src/Health.cpp)
 target_include_directories(serverext_core PUBLIC src)
 target_compile_options(serverext_core PRIVATE ${SERVEREXT_COMMON_FLAGS})
 target_link_libraries(serverext_core PUBLIC OpenSSL::Crypto)

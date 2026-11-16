@@ -38,7 +38,7 @@ load into an OpenBF2 build without them.
 | Document | Contents |
 |---|---|
 | [docs/protocol.md](docs/protocol.md) | The bot channel: wire format, every message, spawning, the watchdog, stepped time, the engine requirements. |
-| [docs/admin-channel.md](docs/admin-channel.md) | The admin channel: security model, wire format, state, events, commands, votes, scripts. |
+| [docs/admin-channel.md](docs/admin-channel.md) | The admin channel: security model, wire format, state, events, commands, votes, scripts, server health. |
 | [docs/configuration.md](docs/configuration.md) | Every `serverext.cfg` key. |
 
 The two protocol documents are the contracts. The code follows them, and a client is written against them.
@@ -143,7 +143,7 @@ Everything it needs is in `release/centos7/` and that workflow. The regular buil
 
 | Path | Contents |
 |---|---|
-| `src/` | The module. The bot channel: `Protocol`, `Config`, `Channel` and `Session` are engine-free, `Module.cpp` is the engine side, `IoThread_posix.cpp` is the socket thread. The admin channel: `AdminProtocol`, `AdminCrypto`, `AdminLink` and `AdminSession` are engine-free, `AdminIo_posix.cpp` is its dial-out and TLS thread, `Admin.cpp` is its engine side. `Script` is the script host: QuickJS runtimes, the `game` API and the limits. |
+| `src/` | The module. The bot channel: `Protocol`, `Config`, `Channel` and `Session` are engine-free, `Module.cpp` is the engine side, `IoThread_posix.cpp` is the socket thread. The admin channel: `AdminProtocol`, `AdminCrypto`, `AdminLink` and `AdminSession` are engine-free, `AdminIo_posix.cpp` is its dial-out and TLS thread, `Admin.cpp` is its engine side. `Script` is the script host: QuickJS runtimes, the `game` API and the limits. `Health` measures the server's tick timing and the host (engine-free): the log's `health:` line and the admin channel's `ServerHealth`. |
 | `tests/` | Unit tests for everything engine-free: framing, parsing, hostile input, configuration, queues; the admin channel including TLS against a local server; the script host against a mock world. `fixtures/admin-v1-golden.txt` holds the admin channel's golden frames, for testing a client codec against the same bytes. |
 | `tools/testclient/` | `serverext_client.py`, a bot channel client with a scenario per feature and a `--fuzz` mode. `tvscan.py` flies scripted TV-missile passes. Python 3, standard library only. |
 | `tools/adminclient/` | `adminclient.py`, a reference admin client: a TLS listener that creates its own certificate and prints its pin, the handshake, every command, scenarios and `--fuzz`. `--scenario runscript --script-file x.js` runs one script on a server and shows its events, errors and CPU time. |
