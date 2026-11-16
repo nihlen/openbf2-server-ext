@@ -53,6 +53,7 @@ enum Type : uint16_t
     EvProjectileHit = 0x1213, EvKick = 0x1214, EvBan = 0x1215, EvBot = 0x1216,
     EvWeaponFire = 0x1217, EvWeapons = 0x1218, EvProjectileCollision = 0x1219, EvProjectileTrace = 0x121A,
     EvVoteResult = 0x121B, EvScriptFinished = 0x121C, EvScriptEvent = 0x121D, EvServerHealth = 0x121E,
+    EvPlayerConnections = 0x121F,
     // commands
     CmdConsole = 0x1301, CmdSay = 0x1302, CmdTeleport = 0x1303, CmdSetHealth = 0x1304, CmdKillPlayer = 0x1305,
     CmdSetTeam = 0x1306, CmdSetScore = 0x1307, CmdRank = 0x1308, CmdMedal = 0x1309, CmdGameEvent = 0x130A,
@@ -82,7 +83,7 @@ const uint8_t kCapIdentity = 4;
 const uint8_t kCapScripts = 8;   // the script commands (docs/admin-channel.md "Scripts")
 const uint8_t kCapSeatPreference = 16;   // SeatPreference (docs/admin-channel.md "Seat preferences")
 const uint8_t kCapSetCollision = 32;     // SetCollision (docs/admin-channel.md "Command semantics")
-const uint8_t kCapServerHealth = 64;     // stream 21, ServerHealth (docs/admin-channel.md "Server health")
+const uint8_t kCapServerHealth = 64;     // stream 21, ServerHealth and PlayerConnections (docs/admin-channel.md "Server health")
 
 // Subscribe streams.
 enum Stream : uint8_t
@@ -448,6 +449,9 @@ void encodeScriptFinished(std::vector<uint8_t>& out, uint32_t seq, uint32_t tick
                           uint32_t totalUs, uint32_t maxUs);
 // ServerHealth: one window of ticks (Health.h).
 void encodeServerHealth(std::vector<uint8_t>& out, uint32_t seq, uint32_t tick, const health::Window& w);
+// PlayerConnections: the connections of the players with a reading in the window (Health.h), at most 255.
+void encodePlayerConnections(std::vector<uint8_t>& out, uint32_t seq, uint32_t tick,
+                             const std::vector<std::pair<uint8_t, health::ConnectionWindow> >& players);
 // ScriptEvent. kind: 1 data (JSON text), 2 a log line. A payload beyond kMaxScriptPayload is cut.
 void encodeScriptEvent(std::vector<uint8_t>& out, uint32_t seq, uint32_t tick, uint32_t instance, uint8_t kind,
                        const std::string& payload);

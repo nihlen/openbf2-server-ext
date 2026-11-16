@@ -12,7 +12,8 @@ The channel gives a client:
 - typed commands with typed replies (chat, teleport, health, teams, score, kick, ban, maps, objects, votes, HUD
   events);
 - scripts: JavaScript the client pushes and the module runs inside the server tick;
-- the server's health every 10 s: how regularly its ticks run, what a tick costs and what the host does to it.
+- the server's health every 10 s: how regularly its ticks run, what a tick costs, what the host does to it, and
+  how each player's connection carries packets.
 
 The bot channel, the module's other protocol, is described in [protocol.md](protocol.md). The two share framing and
 codec style and nothing else: they use separate connections, versions and type ranges.
@@ -293,7 +294,7 @@ Capability bits:
 | 3 | scripts can be run ([Scripts](#scripts)) |
 | 4 | the module accepts `SeatPreference` ([Seat preferences](#seat-preferences)) |
 | 5 | the module accepts `SetCollision` ([Command semantics](#command-semantics)) |
-| 6 | the module has stream 21, `ServerHealth` ([Server health](#server-health)) |
+| 6 | the module has stream 21, `ServerHealth` and `PlayerConnections` ([Server health](#server-health)) |
 
 ### Keepalive
 
@@ -501,13 +502,13 @@ cleared wreck, or a vehicle waiting for its spawner).
 | 18 | `WeaponFire` events | any number. None: every launch. Else: launches whose weapon or projectile template matches one |
 | 19 | `Weapons` events | none |
 | 20 | `ProjectileCollision` and `ProjectileTrace` events | at least one projectile template |
-| 21 | `ServerHealth` events | none |
+| 21 | `ServerHealth` and `PlayerConnections` events | none |
 
 - Streams 1 to 5 are state streams with a rate. The module sends a frame every `round(30 / rate)` ticks.
 - Streams 16 to 20 switch on event types that are off by default because of their volume. Every hit is one
   `Damage` event.
-- Stream 21 switches on `ServerHealth`, one event per 10 s. It is off by default so that a client which does not know
-  the event never receives it.
+- Stream 21 switches on `ServerHealth` and `PlayerConnections`, one of each per 10 s. It is off by default so that a
+  client which does not know the events never receives them.
 - A new `Subscribe` for a stream replaces the old one.
 - Subscribing to stream 19 reports every player's weapons at once.
 
@@ -565,6 +566,7 @@ engine's script event with that id.
 | `0x121C` | ScriptFinished | `u32` instance, string name, `u8` reason, string result, `u32` calls, `u32` CPU time of all calls in microseconds, `u32` CPU time of the longest call in microseconds | [Scripts](#scripts) |
 | `0x121D` | ScriptEvent | `u32` instance, `u8` kind (1 data: JSON text, 2 a log line), string payload (at most 8192 bytes) | [Scripts](#scripts) |
 | `0x121E` | ServerHealth | [Server health](#server-health); only while subscribed (stream 21) | the module's tick hook, the main thread's clocks and the host's `/proc` |
+| `0x121F` | PlayerConnections | [Server health](#server-health); only while subscribed (stream 21) | the engine's per-connection statistics |
 
 Notes on single events:
 
@@ -1244,14 +1246,15 @@ if X.spawnAtTick <= base + 2: X.spawnAtTick = base + 3
 
 ## Server health
 
-`ServerHealth` tells a client how well the server process runs: whether its ticks come on time, how much of a tick the
-main thread works, and whether the host takes the CPU away. It says nothing about a player's connection; a player's
-ping and lag are in `PlayerState`.
+Two events describe how well the server runs. `ServerHealth` is about the server process: whether its ticks come on
+time, how much of a tick the main thread works, and whether the host takes the CPU away. `PlayerConnections` is about
+the network between the server and each player: packets per second in both directions and packets lost.
 
-- `Welcome` capability bit 6 is set by a module that has the event. The client subscribes to stream 21 only then.
-- While subscribed, the module sends one event per window of 300 ticks (10 s at 30 Hz). The windows run from the
-  server's first tick whether or not a client is subscribed, so the first event after a `Subscribe` covers a full
-  window. The event's tick is the tick that completed the window.
+- `Welcome` capability bit 6 is set by a module that has both events. The client subscribes to stream 21 only then.
+- While subscribed, the module sends one `ServerHealth` per window of 300 ticks (10 s at 30 Hz), followed by one
+  `PlayerConnections` for the same window with the next sequence number and the same tick. The windows run from the
+  server's first tick whether or not a client is subscribed, so the first `ServerHealth` after a `Subscribe` covers a
+  full window. The events' tick is the tick that completed the window.
 - The module writes the same figures to its log once a minute, as a `health:` line over a window of 1800 ticks, with
   or without an admin link.
 
@@ -1330,6 +1333,50 @@ After the sequence number and the tick:
 - Nothing in the event is read from the engine, and the main thread makes no file or socket call for it: two clock
   reads per tick and one `getrusage` per window.
 
+### `0x121F PlayerConnections`
+
+After the sequence number and the tick:
+
+| Type | Field |
+|---|---|
+| `u8` | N, players with a reading in the window |
+| N × entry | below, 40 bytes each |
+
+| Type | Field |
+|---|---|
+| `u8` | player id |
+| `u8` | readings the figures are from, 1 or 2 in a full window |
+| `u16` | ping at the last reading, ms |
+| `u16` | lowest ping of the readings |
+| `u16` | highest ping of the readings |
+| `f32` | packets per second the server sent to the player |
+| `f32` | packets per second the server received from the player |
+| `f32` | bytes per second sent |
+| `f32` | bytes per second received |
+| `f32` | packets per second lost on the way to the player, mean of the readings |
+| `f32` | the same, the highest reading |
+| `f32` | packets per second lost on the way from the player, mean of the readings |
+| `f32` | the same, the highest reading |
+
+- **Source.** `IGameServer::getConnectionStatus` (`Game/IGameServer.h:52`), which returns the network layer's record
+  for a connection (`ConnectionStatus`, `IO/Network/ProtocolLayer/NetServer.h:28-37`; `NetServer.cpp:177-191`). A
+  connection's id is its player's id (`Game/GameServer/GameServer.cpp:3915`). No engine change is involved.
+- **What a reading covers.** The network layer keeps 10 records per connection, each over at least 500 ms, and the
+  record it returns is their average (`IO/Network/ProtocolLayer/SWConnection.cpp:487-535`, `:540-566`): about the last
+  5 s. The module reads every connection every 150 ticks, so the two readings of a window cover its 10 s. Records
+  that are not filled yet count as zero, so the figures of a player's first 5 s are too low.
+- **Who is in it.** Connected human players. A bot has no connection and no entry. A player who joined during the
+  window has one reading; a player who left during it has none.
+- **Packets sent and received** are datagrams of the game's own protocol. A client sends 10 or 30 a second and is
+  sent 4 to 20, depending on the connection type it chose, so the two rates also show that choice.
+- **Lost on the way to the player** is what the player's acknowledgements report missing. **Lost on the way from the
+  player** is gaps in the sequence numbers the server received; a packet that arrives out of order is counted as lost.
+  Divide by the packet rate of the same direction for a loss ratio.
+- **Ping** is the round trip of the ping request the server sends each connection every 3 s
+  (`NetServer.cpp:434-435`, `:1340-1357`), averaged over the same 10 records. `PlayerState`'s ping is the same
+  measurement as the player object holds it.
+- **Values.** A rate that is not a finite number of 0 or more is sent as 0, and a ping above 65 535 as 65 535.
+
 ## Engine interface
 
 The OpenBF2 engine exports no symbols, so the module uses only typed virtual calls on engine interfaces. What it
@@ -1380,6 +1427,8 @@ Measured on a 30 Hz server with bots:
 - **`WeaponFire`.** About 80 bytes per event, about 0.8 KB/s while one gun fires.
 - **Scripts.** QuickJS-NG adds about 1.2 MB to `libserverext.so` and no shared library.
 - **`ServerHealth`.** 79 bytes per 10 s. Measuring costs two clock reads per tick, well under a microsecond.
+- **`PlayerConnections`.** 17 bytes plus 40 per human player per 10 s. One call per player every 5 s; the engine
+  gathers the figures whether they are read or not.
 
 If stream bandwidth becomes a problem, the cheap step is a stream encoding that skips entities unchanged since the
 last frame, with a full frame every second. That is a new stream encoding, not a protocol redesign.
@@ -1438,5 +1487,11 @@ last frame, with a full frame every second. That is a new stream encoding, not a
 - **The script time budget stops mistakes, not attacks** ([Limits](#limits)).
 - **Seat preferences cover the first two seats** and not man-down players
   ([Lifetime and scope](#lifetime-and-scope)).
-- **`ServerHealth` describes the server process, not the network.** Packet loss and jitter between the server and
-  a player are not in it.
+- **`PlayerConnections` is read while the engine's network thread writes it.** `NetServer::getConnectionStatus`
+  looks the connection up without the network layer's lock (`NetServer.cpp:160-161`), as the engine's own send path
+  does for every connection every frame (`:879-889`). A reading can therefore mix two moments' figures. The module
+  adds two such lookups per player per 10 s to the engine's own.
+- **`PlayerConnections` has no real-client test.** The automated tests have no game client, so only the empty event
+  and the codec are covered; the figures of a real connection are unverified.
+- **No measure of late input.** Whether a player's input or steering reached the server in time for its tick is not
+  in either event; it would need an engine addition.

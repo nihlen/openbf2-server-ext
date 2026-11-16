@@ -93,6 +93,51 @@ private:
 // below it. 0 for no values.
 uint32_t quantile(std::vector<uint32_t>& values, double q);
 
+const unsigned int kConnectionSampleTicks = 150;   // a player's connection is read every 5 s, twice per window
+
+// One reading of a player's connection: the engine's ConnectionStatus, its averages over about 5 s.
+struct ConnectionSample
+{
+    float bytesSent, bytesReceived;         // per second, as the server sees them
+    float packetsSent, packetsReceived;
+    float lostSent, lostReceived;           // packets per second
+    uint32_t ping;                          // ms
+
+    ConnectionSample() : bytesSent(0), bytesReceived(0), packetsSent(0), packetsReceived(0), lostSent(0),
+                         lostReceived(0), ping(0) {}
+};
+
+// A player's connection over one window. The layout of a PlayerConnections entry after the player id.
+struct ConnectionWindow
+{
+    uint8_t samples;                        // readings the figures are from
+    uint16_t pingLast, pingMin, pingMax;    // ms
+    float packetsSent, packetsReceived;     // per second, the mean of the readings
+    float bytesSent, bytesReceived;
+    float lostSent, lostSentPeak;           // packets per second: the mean and the highest reading
+    float lostReceived, lostReceivedPeak;
+
+    ConnectionWindow();
+};
+
+// Collects one player's readings for a window. A value that is not a finite number of 0 or more counts as 0: the
+// engine's network thread writes the figures while they are read.
+class ConnectionStats
+{
+public:
+    ConnectionStats() { reset(); }
+    void add(const ConnectionSample& sample);
+    // @return False, and out untouched, when there was no reading.
+    bool finish(ConnectionWindow& out) const;
+    void reset();
+
+private:
+    unsigned int m_samples;
+    double m_sum[6];        // bytes sent, bytes received, packets sent, packets received, lost sent, lost received
+    float m_lostSentPeak, m_lostReceivedPeak;
+    uint16_t m_pingLast, m_pingMin, m_pingMax;
+};
+
 // The first line of /proc/stat in clock ticks, and the number of "cpuN" lines.
 struct CpuTimes
 {

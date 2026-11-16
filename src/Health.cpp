@@ -85,6 +85,66 @@ Window::Window()
 {
 }
 
+ConnectionWindow::ConnectionWindow()
+    : samples(0), pingLast(0), pingMin(0), pingMax(0), packetsSent(0), packetsReceived(0), bytesSent(0),
+      bytesReceived(0), lostSent(0), lostSentPeak(0), lostReceived(0), lostReceivedPeak(0)
+{
+}
+
+namespace {
+
+// A rate as the engine gave it: a finite number of 0 or more, else 0.
+float rate(float v) { return std::isfinite(v) && v > 0.0f ? v : 0.0f; }
+
+} // namespace
+
+void ConnectionStats::reset()
+{
+    m_samples = 0;
+    for (int i = 0; i < 6; ++i)
+        m_sum[i] = 0;
+    m_lostSentPeak = m_lostReceivedPeak = 0;
+    m_pingLast = m_pingMin = m_pingMax = 0;
+}
+
+void ConnectionStats::add(const ConnectionSample& s)
+{
+    if (m_samples >= 255)
+        return;
+    const float v[6] = { rate(s.bytesSent), rate(s.bytesReceived), rate(s.packetsSent), rate(s.packetsReceived),
+                         rate(s.lostSent), rate(s.lostReceived) };
+    for (int i = 0; i < 6; ++i)
+        m_sum[i] += v[i];
+    if (v[4] > m_lostSentPeak) m_lostSentPeak = v[4];
+    if (v[5] > m_lostReceivedPeak) m_lostReceivedPeak = v[5];
+    const uint16_t ping = clamp16(s.ping);
+    m_pingLast = ping;
+    if (!m_samples || ping < m_pingMin) m_pingMin = ping;
+    if (!m_samples || ping > m_pingMax) m_pingMax = ping;
+    ++m_samples;
+}
+
+bool ConnectionStats::finish(ConnectionWindow& out) const
+{
+    if (!m_samples)
+        return false;
+    ConnectionWindow w;
+    w.samples = static_cast<uint8_t>(m_samples);
+    w.pingLast = m_pingLast;
+    w.pingMin = m_pingMin;
+    w.pingMax = m_pingMax;
+    w.bytesSent = static_cast<float>(m_sum[0] / m_samples);
+    w.bytesReceived = static_cast<float>(m_sum[1] / m_samples);
+    w.packetsSent = static_cast<float>(m_sum[2] / m_samples);
+    w.packetsReceived = static_cast<float>(m_sum[3] / m_samples);
+    w.lostSent = static_cast<float>(m_sum[4] / m_samples);
+    w.lostReceived = static_cast<float>(m_sum[5] / m_samples);
+    w.lostSentPeak = m_lostSentPeak;
+    w.lostReceivedPeak = m_lostReceivedPeak;
+    out = w;
+    return true;
+}
+
 uint32_t quantile(std::vector<uint32_t>& values, double q)
 {
     if (values.empty())

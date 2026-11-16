@@ -57,6 +57,7 @@ EV_VEHICLE_DESTROYED, EV_CONTROL_POINT, EV_CHAT, EV_PROJECTILE_FIRED = 0x120F, 0
 EV_PROJECTILE_HIT, EV_KICK, EV_BAN, EV_BOT = 0x1213, 0x1214, 0x1215, 0x1216
 EV_WEAPON_FIRE, EV_WEAPONS, EV_PROJECTILE_COLLISION, EV_PROJECTILE_TRACE = 0x1217, 0x1218, 0x1219, 0x121A
 EV_VOTE_RESULT, EV_SCRIPT_FINISHED, EV_SCRIPT_EVENT, EV_SERVER_HEALTH = 0x121B, 0x121C, 0x121D, 0x121E
+EV_PLAYER_CONNECTIONS = 0x121F
 CMD_CONSOLE, CMD_SAY, CMD_TELEPORT, CMD_SET_HEALTH, CMD_KILL_PLAYER = 0x1301, 0x1302, 0x1303, 0x1304, 0x1305
 CMD_SET_TEAM, CMD_SET_SCORE, CMD_RANK, CMD_MEDAL, CMD_GAME_EVENT = 0x1306, 0x1307, 0x1308, 0x1309, 0x130A
 CMD_HUD_EVENT, CMD_KICK, CMD_BAN, CMD_MAP, CMD_LIST_OBJECTS = 0x130B, 0x130C, 0x130D, 0x130E, 0x130F
@@ -70,7 +71,7 @@ PING, PONG, ERROR = 0x1501, 0x1502, 0xFFFF
 
 NAMES = {v: k for k, v in list(globals().items()) if isinstance(v, int) and k.isupper() and 0x1000 <= v <= 0xFFFF
          and k not in ("VERSION",)}
-EVENT_TYPES = range(0x1201, 0x121F)
+EVENT_TYPES = range(0x1201, 0x1220)
 CAP_CONSOLE, CAP_OBJECTS, CAP_IDENTITY, CAP_SCRIPTS, CAP_SEAT_PREFERENCE, CAP_SET_COLLISION = 1, 2, 4, 8, 16, 32
 CAP_SERVER_HEALTH = 64
 HEALTH_STEPPED, HEALTH_HOST_VALID, HEALTH_LEVEL_LOAD = 1, 2, 4
@@ -361,6 +362,12 @@ def decode(t, payload):
                      cpu_p99_us=r.u32(), cpu_max_us=r.u32(), handler_p99_us=r.u32(), handler_max_us=r.u32(),
                      involuntary_switches=r.u32(), major_faults=r.u32(), cpus=r.u16(), host_busy=r.u16(),
                      host_steal=r.u16(), host_iowait=r.u16(), resident_kb=r.u32())
+        elif t == EV_PLAYER_CONNECTIONS:
+            m["players"] = [{"player": r.u8(), "samples": r.u8(), "ping": r.u16(), "ping_min": r.u16(),
+                             "ping_max": r.u16(), "packets_sent": r.f32(), "packets_received": r.f32(),
+                             "bytes_sent": r.f32(), "bytes_received": r.f32(), "lost_sent": r.f32(),
+                             "lost_sent_peak": r.f32(), "lost_received": r.f32(), "lost_received_peak": r.f32()}
+                            for _ in range(r.u8())]
     elif t == OK:
         m.update(request=r.u32())
     elif t == CONSOLE_RESULT:
@@ -664,6 +671,11 @@ def golden_samples():
     s["ev_server_health"] = (EV_SERVER_HEALTH, ev(30).u16(300).u32(10000123).u8(HEALTH_HOST_VALID).u32(33334).u32(34100)
                              .u32(61234).u16(1).u16(1).u32(310).u32(1250).u32(4800).u32(350).u32(900).u32(12).u32(0)
                              .u16(1).u16(412).u16(278).u16(3).u32(159744).b)
+    s["ev_player_connections"] = (EV_PLAYER_CONNECTIONS, ev(31).u8(2)
+                                  .u8(0).u8(2).u16(41).u16(38).u16(44).f32(20.0).f32(30.0).f32(2400.5).f32(1100.25)
+                                  .f32(0.0).f32(0.0).f32(0.25).f32(0.5)
+                                  .u8(3).u8(1).u16(120).u16(120).u16(120).f32(10.0).f32(10.0).f32(900.0).f32(400.0)
+                                  .f32(1.5).f32(1.5).f32(0.0).f32(0.0).b)
     return s
 
 
@@ -878,6 +890,13 @@ def describe(m):
     if n == "EV_PLAYER_DISCONNECT":
         return "%s seq %d: %d reason %s (engine %d)" % (n, m["seq"], m["player"], DISC.get(m["reason"], m["reason"]),
                                                        m["engine_reason"])
+    if n == "EV_PLAYER_CONNECTIONS":
+        return "%s seq %d tick %d: %d players%s" % (n, m["seq"], m["tick"], len(m["players"]), "".join(
+            " | %d: ping %d (%d..%d) ms, packets/s out %.1f in %.1f, bytes/s out %.0f in %.0f, lost/s out %.2f (peak %.2f) "
+            "in %.2f (peak %.2f), %d readings" % (
+                c["player"], c["ping"], c["ping_min"], c["ping_max"], c["packets_sent"], c["packets_received"],
+                c["bytes_sent"], c["bytes_received"], c["lost_sent"], c["lost_sent_peak"], c["lost_received"],
+                c["lost_received_peak"], c["samples"]) for c in m["players"]))
     if n == "EV_SERVER_HEALTH":
         return ("%s seq %d tick %d: %d ticks in %.3f s flags %d | interval us p50 %d p99 %d max %d, late %d short %d | "
                 "CPU per tick us p50 %d p99 %d max %d, handler p99 %d max %d, %d involuntary switches, %d major faults | "
@@ -1195,7 +1214,8 @@ def scenario_health(lst, args):
         link.pump(11.0)
     except Closed as e:
         c.check(False, "the link stayed up: %s" % e)
-    c.check(not [m for m in link.events if m["type"] == EV_SERVER_HEALTH], "no ServerHealth in 11 s before the Subscribe")
+    c.check(not [m for m in link.events if m["type"] in (EV_SERVER_HEALTH, EV_PLAYER_CONNECTIONS)],
+            "no ServerHealth or PlayerConnections in 11 s before the Subscribe")
     r = link.request(SUBSCRIBE, p_subscribe(rq(), 21, 0))
     c.check(r["name"] == "OK", "Subscribe 21 -> Ok")
     want = max(1, int(args.seconds) // 10)
@@ -1228,14 +1248,27 @@ def scenario_health(lst, args):
     if len(got) >= 2:
         c.check(all(b["tick"] - a["tick"] == 300 for a, b in zip(got, got[1:])),
                 "the events are 300 ticks apart: %s" % [m["tick"] for m in got])
+    # Each ServerHealth is followed by the window's PlayerConnections: the next sequence number, the same tick
+    link.pump(0.5)
+    conns = {m["seq"]: m for m in link.events if m["type"] == EV_PLAYER_CONNECTIONS}
+    for m in got:
+        pc = conns.get(m["seq"] + 1)
+        c.check(pc is not None and pc["tick"] == m["tick"], "seq %d: PlayerConnections follows as seq %d with the same tick" % (m["seq"], m["seq"] + 1))
+        if pc:
+            humans = [p["id"] for p in link.snapshot["players"] if not p["flags"] & 3]
+            c.check(all(x["samples"] >= 1 and x["ping_min"] <= x["ping"] <= x["ping_max"] and x["lost_sent"] <= x["lost_sent_peak"]
+                        and x["lost_received"] <= x["lost_received_peak"] for x in pc["players"]),
+                    "seq %d: %d connections, each with a reading and ordered figures (humans in the snapshot: %s)" % (
+                        pc["seq"], len(pc["players"]), humans))
     r = link.request(UNSUBSCRIBE, W().u32(rq()).u8(21).b)
     c.check(r["name"] == "OK", "Unsubscribe 21 -> Ok")
-    seen = len([m for m in link.events if m["type"] == EV_SERVER_HEALTH])
+    seen = len([m for m in link.events if m["type"] in (EV_SERVER_HEALTH, EV_PLAYER_CONNECTIONS)])
     try:
         link.pump(11.0)
     except Closed as e:
         c.check(False, "the link stayed up: %s" % e)
-    c.check(len([m for m in link.events if m["type"] == EV_SERVER_HEALTH]) == seen, "no ServerHealth in 11 s after the Unsubscribe")
+    c.check(len([m for m in link.events if m["type"] in (EV_SERVER_HEALTH, EV_PLAYER_CONNECTIONS)]) == seen,
+            "no ServerHealth or PlayerConnections in 11 s after the Unsubscribe")
     c.check(link.gaps == 0, "no sequence gaps")
     return c.summary("health")
 

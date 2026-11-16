@@ -29,6 +29,7 @@
 #include "Game/Objects/IControlPoint.h"
 #include "Game/Objects/IWeaponObject.h"
 #include "IO/Console/Console.h"
+#include "IO/Network/ProtocolLayer/NetServer.h"   // io::ConnectionStatus, the record of IGameServer::getConnectionStatus
 #include "Physics/IPhysicsNode.h"
 #include "Scene/Object/ObjectManager.h"
 #include "Scene/Object/ObjectTypes/Base/ObjectTemplateManager.h"
@@ -293,6 +294,8 @@ public:
             if (m_scripts.count())
                 m_scripts.tick();
             sampleTraces();
+            if (m_healthEvents && m_tick % health::kConnectionSampleTicks == 0)
+                sampleConnections();
             pollGameState();
             if (!m_cpsScanned || (m_cps.empty() && m_tick - m_lastCpScan >= kCpRescanTicks))
                 scanControlPoints();
@@ -319,6 +322,48 @@ public:
         std::vector<uint8_t> f;
         encodeServerHealth(f, ++m_seq, tickNumber(), window);
         event(f);
+
+        // The same window's connections: the players with a reading since the last one
+        std::vector<std::pair<uint8_t, health::ConnectionWindow> > players;
+        for (int id = 0; id < 256; ++id)
+        {
+            health::ConnectionWindow c;
+            if (m_connections[id].finish(c))
+                players.push_back(std::make_pair(static_cast<uint8_t>(id), c));
+            m_connections[id].reset();
+        }
+        std::vector<uint8_t> g;
+        encodePlayerConnections(g, ++m_seq, tickNumber(), players);
+        event(g);
+    }
+
+    // Reads every connected human player's connection (IGameServer::getConnectionStatus: the network layer's
+    // averages over its last 10 records of at least 500 ms each). A bot has no connection and no reading.
+    void sampleConnections()
+    {
+        const std::list<world::IPlayer*>& players = m_players->getPlayers();
+        for (std::list<world::IPlayer*>::const_iterator it = players.begin(); it != players.end(); ++it)
+        {
+            world::IPlayer* p = *it;
+            if (!p || p->getIsAIPlayer() || !p->getIsRemote())
+                continue;
+            const int id = p->getId();
+            if (id < 0 || id > 255)
+                continue;
+            io::ConnectionStatus st;
+            std::memset(&st, 0, sizeof(st));
+            if (!m_server->getConnectionStatus(id, st))
+                continue;
+            health::ConnectionSample s;
+            s.bytesSent = st.bytesSentPerSecond;
+            s.bytesReceived = st.bytesReceivedPerSecond;
+            s.packetsSent = st.packetsSentPerSecond;
+            s.packetsReceived = st.packetsReceivedPerSecond;
+            s.lostSent = st.packetsLostSendPerSecond;
+            s.lostReceived = st.packetsLostReceivePerSecond;
+            s.ping = st.ping;
+            m_connections[id].add(s);
+        }
     }
 
     virtual void onBot(uint8_t kind, int playerId, int team, uint32_t connection)
@@ -1055,6 +1100,8 @@ private:
         for (int i = 0; i <= StreamAim; ++i)
             m_streams[i] = StreamSub();
         m_damageEvents = m_projectileEvents = m_fireEvents = m_weaponEvents = m_healthEvents = false;
+        for (int i = 0; i < 256; ++i)
+            m_connections[i].reset();
         m_projectileEventFilters.clear();
         m_fireFilters.clear();
         m_fires.clear();
@@ -1799,6 +1846,7 @@ private:
         else if (engineReason >= 0)
             reason = DiscOther;
         std::vector<uint8_t> f;
+        m_connections[id & 0xFF].reset();   // the id may go to the next player within the window
         encodePlayerDisconnect(f, ++m_seq, tickNumber(), static_cast<uint8_t>(id), reason,
                                static_cast<uint16_t>(engineReason < 0 || engineReason > 0xFFFE ? 0xFFFF : engineReason));
         event(f);
@@ -2764,7 +2812,11 @@ private:
             m_traces.clear();
         }
         else if (c.target == StreamServerHealth)
+        {
             m_healthEvents = false;
+            for (int i = 0; i < 256; ++i)
+                m_connections[i].reset();
+        }
         else if (c.target >= StreamPlayers && c.target <= StreamAim)
             m_streams[c.target] = StreamSub();
         else
@@ -3351,6 +3403,7 @@ private:
     bool m_fireEvents;
     bool m_weaponEvents;
     bool m_healthEvents;                        // stream 21
+    health::ConnectionStats m_connections[256]; // by player id: the readings of the window in progress
     std::vector<std::string> m_fireFilters;   // lowered; empty: every launch
     std::vector<PendingFire> m_fires;
     uint64_t m_firesDropped;

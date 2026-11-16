@@ -998,6 +998,33 @@ void encodeServerHealth(std::vector<uint8_t>& out, uint32_t seq, uint32_t tick, 
     w.finish();
 }
 
+void encodePlayerConnections(std::vector<uint8_t>& out, uint32_t seq, uint32_t tick,
+                             const std::vector<std::pair<uint8_t, health::ConnectionWindow> >& players)
+{
+    Writer w(out);
+    beginEvent(w, EvPlayerConnections, seq, tick);
+    const size_t n = players.size() > 255 ? 255 : players.size();
+    w.u8(static_cast<uint8_t>(n));
+    for (size_t i = 0; i < n; ++i)
+    {
+        const health::ConnectionWindow& c = players[i].second;
+        w.u8(players[i].first);
+        w.u8(c.samples);
+        w.u16(c.pingLast);
+        w.u16(c.pingMin);
+        w.u16(c.pingMax);
+        w.f32(c.packetsSent);
+        w.f32(c.packetsReceived);
+        w.f32(c.bytesSent);
+        w.f32(c.bytesReceived);
+        w.f32(c.lostSent);
+        w.f32(c.lostSentPeak);
+        w.f32(c.lostReceived);
+        w.f32(c.lostReceivedPeak);
+    }
+    w.finish();
+}
+
 void encodeScriptEvent(std::vector<uint8_t>& out, uint32_t seq, uint32_t tick, uint32_t instance, uint8_t kind,
                        const std::string& payload)
 {

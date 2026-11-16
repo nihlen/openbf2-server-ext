@@ -1761,6 +1761,76 @@ void testHealth()
         }
     }
 
+    // A player's connection over a window: the mean of the readings, the peaks of the loss, the ping's range.
+    {
+        ConnectionStats s;
+        ConnectionWindow keep;
+        keep.samples = 9;
+        CHECK(!s.finish(keep) && keep.samples == 9);
+        ConnectionSample one;
+        one.bytesSent = 2000.0f; one.bytesReceived = 1000.0f; one.packetsSent = 20.0f; one.packetsReceived = 30.0f;
+        one.lostSent = 0.0f; one.lostReceived = 0.5f; one.ping = 44;
+        s.add(one);
+        ConnectionSample two = one;
+        two.bytesSent = 3000.0f; two.packetsReceived = 28.0f; two.lostSent = 2.0f; two.lostReceived = 0.0f; two.ping = 38;
+        s.add(two);
+        ConnectionWindow w;
+        CHECK(s.finish(w) && w.samples == 2 && w.pingLast == 38 && w.pingMin == 38 && w.pingMax == 44);
+        CHECK(w.bytesSent == 2500.0f && w.bytesReceived == 1000.0f && w.packetsSent == 20.0f && w.packetsReceived == 29.0f);
+        CHECK(w.lostSent == 1.0f && w.lostSentPeak == 2.0f && w.lostReceived == 0.25f && w.lostReceivedPeak == 0.5f);
+        s.reset();
+        CHECK(!s.finish(w));
+
+        // What a torn or broken record can hold: not a number, infinite, negative, a ping beyond 16 bits.
+        ConnectionSample bad;
+        bad.bytesSent = std::numeric_limits<float>::quiet_NaN();
+        bad.bytesReceived = std::numeric_limits<float>::infinity();
+        bad.packetsSent = -5.0f;
+        bad.packetsReceived = -std::numeric_limits<float>::infinity();
+        bad.lostSent = std::numeric_limits<float>::quiet_NaN();
+        bad.lostReceived = 3.0f;
+        bad.ping = 0xFFFFFFFFu;
+        s.add(bad);
+        CHECK(s.finish(w) && w.samples == 1 && w.bytesSent == 0.0f && w.bytesReceived == 0.0f && w.packetsSent == 0.0f);
+        CHECK(w.packetsReceived == 0.0f && w.lostSent == 0.0f && w.lostSentPeak == 0.0f && w.lostReceived == 3.0f);
+        CHECK(w.pingLast == 0xFFFF && w.pingMin == 0xFFFF && w.pingMax == 0xFFFF);
+        // No more than 255 readings are counted.
+        s.reset();
+        for (int i = 0; i < 300; ++i)
+            s.add(one);
+        CHECK(s.finish(w) && w.samples == 255 && w.packetsSent == 20.0f);
+    }
+    // The event: sequence number, tick, a count and 40 bytes per player; never more than 255 players.
+    {
+        std::vector<std::pair<uint8_t, ConnectionWindow> > none;
+        std::vector<uint8_t> buf;
+        encodePlayerConnections(buf, 4, 900, none);
+        std::vector<proto::Frame> f = frames(buf);
+        CHECK(f.size() == 1 && f[0].type == EvPlayerConnections && f[0].payload.size() == 8 + 1 && f[0].payload[8] == 0);
+
+        std::vector<std::pair<uint8_t, ConnectionWindow> > many(300);
+        for (size_t i = 0; i < many.size(); ++i)
+        {
+            many[i].first = static_cast<uint8_t>(i);
+            many[i].second.samples = 2;
+            many[i].second.pingLast = static_cast<uint16_t>(i);
+            many[i].second.lostReceivedPeak = 0.5f;
+        }
+        buf.clear();
+        encodePlayerConnections(buf, 5, 1200, many);
+        f = frames(buf);
+        CHECK(f.size() == 1 && f[0].payload.size() == 8 + 1 + 255 * 40);
+        if (f.size() == 1 && f[0].payload.size() == 8 + 1 + 255 * 40)
+        {
+            Reader r(&f[0].payload[0], f[0].payload.size());
+            CHECK(r.u32() == 5 && r.u32() == 1200 && r.u8() == 255);
+            CHECK(r.u8() == 0 && r.u8() == 2 && r.u16() == 0 && r.u16() == 0 && r.u16() == 0);
+            for (int i = 0; i < 7; ++i)
+                CHECK(r.f32() == 0.0f);
+            CHECK(r.f32() == 0.5f && r.u8() == 1 && r.u8() == 2 && r.u16() == 1);
+        }
+    }
+
     // The monitor on this thread: real clocks, getrusage and the host thread reading this machine's /proc.
     {
         static Monitor m;   // its thread lives for the process
@@ -1853,7 +1923,7 @@ void testGolden()
 {
     const std::string path = std::string(SERVEREXT_FIXTURES) + "/admin-v1-golden.txt";
     std::map<std::string, std::vector<uint8_t> > golden = readGolden(path);
-    CHECK(golden.size() == 86);
+    CHECK(golden.size() == 87);
     if (golden.empty())
     {
         std::printf("  no golden fixtures at %s\n", path.c_str());
@@ -2041,6 +2111,17 @@ void testGolden()
         h.involuntarySwitches = 12; h.majorFaults = 0; h.cpus = 1; h.hostBusy = 412; h.hostSteal = 278;
         h.hostIoWait = 3; h.residentKb = 159744;
         encodeServerHealth(mine["ev_server_health"], 30, 10, h);
+
+        std::vector<std::pair<uint8_t, health::ConnectionWindow> > players(2);
+        health::ConnectionWindow& a = players[0].second;
+        players[0].first = 0;
+        a.samples = 2; a.pingLast = 41; a.pingMin = 38; a.pingMax = 44; a.packetsSent = 20.0f; a.packetsReceived = 30.0f;
+        a.bytesSent = 2400.5f; a.bytesReceived = 1100.25f; a.lostReceived = 0.25f; a.lostReceivedPeak = 0.5f;
+        health::ConnectionWindow& b = players[1].second;
+        players[1].first = 3;
+        b.samples = 1; b.pingLast = b.pingMin = b.pingMax = 120; b.packetsSent = b.packetsReceived = 10.0f;
+        b.bytesSent = 900.0f; b.bytesReceived = 400.0f; b.lostSent = b.lostSentPeak = 1.5f;
+        encodePlayerConnections(mine["ev_player_connections"], 31, 10, players);
     }
 
     for (std::map<std::string, std::vector<uint8_t> >::iterator it = mine.begin(); it != mine.end(); ++it)
