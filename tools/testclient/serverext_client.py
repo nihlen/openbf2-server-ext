@@ -20,6 +20,9 @@ Scenarios (--scenario), each the checks for one part of the protocol:
   soak3                                   two bots, the gunner guiding TV missiles periodically
   q12                                     two crews: a TV launch while the other crew's TV missile flies
                                           (protocol.md "Known limitations")
+  tvreload                                a TV missile aimed once and then left alone: does it keep turning when
+                                          its launcher reloads, a second after the shot (OpenBF2 tv-keep-aim-on-reload;
+                                          --tvreload-expect retail|keep)
   q5                                      the watchdog neutral in flight (--q5-neutral module)
   q9                                      what the server's Python and ModManager see of a bot
 """
@@ -2963,6 +2966,75 @@ def run_tvswitch(args):
     return cl.finish()
 
 
+def run_tvreload(args):
+    """The launcher's reload and the missile in flight (OpenBF2 tv-keep-aim-on-reload): a crew hovers seaward of its
+    pad; the gunner aims a TV missile at a point on the sea --tvreload-angle degrees to the side and --tvreload-range
+    metres away (far enough that the missile does not reach the water in its 4 s), fires, and stops
+    steering 0.3 s after the launch. The aim point stays where it was put, so the missile should turn until it points
+    at it. In retail the launcher's reload, about a second after the shot, switches the aim point off and the missile
+    flies straight from then on. --tvreload-expect retail checks that, keep checks that the turn goes on.
+
+    A bot's TV missile ends in mid-air about 33 ticks after its launch, with either setting (not explained yet; a human
+    gunner's flies its 4 s). So only the two or three ticks after the reload can be compared: in retail the missile
+    has stopped turning in them, with the setting it still turns in its last tracked tick."""
+    cl = Client(args, "serverext testclient tvreload")
+    crew = board_crew(cl, args.team, args.name)
+    if not crew:
+        return cl.finish()
+    pilot, gunner, heli = crew
+    cl.pulses[gunner] = BTN_ALT_FIRE
+    cl.run_for(1.0)
+    if not cl.check(f"gunner on the TV launcher: {slot0_name(cl, gunner)}", has_tv(cl, gunner)):
+        return cl.finish()
+    holder = Holder(cl)
+    pad = cl.states[pilot]["pos"]
+    hdg = seaward(pad)
+    if not cl.check("hover reached", climb_hold(cl, holder, pilot, pad[1] + 60.0, hdg, "tvreload")):
+        holder.stop()
+        return cl.finish()
+    rows = []
+    for n in range(args.tvreload_shots):
+        side = args.tvreload_angle if n % 2 == 0 else -args.tvreload_angle
+        target = ahead(cl.states[pilot]["pos"], hdg + side, args.tvreload_range, args.sea_level)
+        s = tv_shot(cl, holder, gunner, f"tvreload shot {n + 1}", aim=lambda: (eye(cl, gunner), target),
+                    retarget=lambda: None, retarget_after=0.3, csv=args.trace_csv or None)
+        if not s or not s["launched"] or len(s["track"]) < 40:
+            cl.check(f"shot {n + 1}: a TV missile flew for at least 40 ticks", False)
+            continue
+        track = s["track"]
+        t0 = track[0][0]
+        yaw = [(t - t0, math.degrees(math.atan2(p["vel"][0], p["vel"][2])),
+                math.degrees(math.atan2(p["vel"][1], math.hypot(p["vel"][0], p["vel"][2])))) for t, p in track
+               if math.hypot(p["vel"][0], p["vel"][2]) > 30.0]
+        turns = []
+        for a, b in zip(yaw, yaw[1:]):
+            dy = (b[1] - a[1] + 180.0) % 360.0 - 180.0
+            turns.append((b[0], math.hypot(dy, b[2] - a[2]) / max(1, b[0] - a[0])))
+        turning = [t for t, d in turns if d > 0.3]
+        total = (yaw[-1][1] - yaw[0][1] + 180.0) % 360.0 - 180.0 if yaw else 0.0
+        last = max(turning) if turning else 0
+        end = turns[-1][0] if turns else 0
+        still = [t for t, d in turns if d <= 0.3 and 8 <= t <= 60]
+        log(f"tvreload shot {n + 1}: aimed {side:+.0f} deg to the side; turned {total:+.1f} deg in yaw over {yaw[-1][0]} ticks; "
+            f"last turning tick +{last}, tracked to +{end}; ticks +8..+60 without a turn: {still[:30]}")
+        rows.append((n + 1, side, total, last, len(yaw)))
+        if args.tvreload_expect == "retail":
+            cl.check(f"shot {n + 1}: retail, the turn stops when the launcher reloads (last turning tick +{last}, about +30)",
+                     24 <= last <= 36)
+            cl.check(f"shot {n + 1}: retail, the missile flies on without turning (tracked to +{end}, not turning at {still})",
+                     end > last and bool(still) and min(still) > last)
+        elif args.tvreload_expect == "keep":
+            cl.check(f"shot {n + 1}: tracked past the reload (to +{end})", end >= 31)
+            cl.check(f"shot {n + 1}: the missile turns in every tick to the end of its track (last turning tick +{last} of +{end}, "
+                     f"not turning at {still})", last == end and not still)
+        cl.run_for(3.0)
+    holder.stop()
+    print("tvreload summary (shot, aim degrees to the side, yaw turned, last turning tick, ticks tracked):", flush=True)
+    for r in rows:
+        print("  %d, %+.0f, %+.1f, +%d, %d" % r, flush=True)
+    return cl.finish()
+
+
 def run_tvwreck(args):
     """The TV camera defect (the tv-bugs investigation; OpenBF2 tv-wreck-hold): crew A hovers and its gunner fires
     a TV missile out to sea (it flies its whole life, 4 s); at once crew B, hovering --tv-range to the side, steers a
@@ -3158,7 +3230,7 @@ def run_viewer(args):
 
 
 SCENARIOS_V3 = {"burst": run_burst, "tv": run_tv, "soak3": run_soak3, "q12": run_q12, "viewer": run_viewer,
-                "tvswitch": run_tvswitch, "tvwreck": run_tvwreck}
+                "tvswitch": run_tvswitch, "tvwreck": run_tvwreck, "tvreload": run_tvreload}
 
 
 # ------------------------------------------------------------------------------------- fuzz
@@ -3431,7 +3503,7 @@ def main():
     ap.add_argument("--vehicle-log-every", type=float, default=60.0, help="seconds between VehicleList summaries")
     ap.add_argument("--scenario", choices=["hover", "walk", "buttons", "blockpad", "allblocked", "wreck", "q9", "q5", "teamswitch",
                                            "view", "weapons", "damage", "spot", "round", "teleport", "multiconn", "soak2",
-                                           "burst", "tv", "soak3", "q12", "viewer", "tvswitch", "tvwreck"],
+                                           "burst", "tv", "soak3", "q12", "viewer", "tvswitch", "tvwreck", "tvreload"],
                     default="hover")
     ap.add_argument("--rcon-port", type=int, default=4723, help="q9: ModManager RCON port")
     ap.add_argument("--rcon-password", default="", help="q9: ModManager RCON password")
@@ -3480,6 +3552,11 @@ def main():
     ap.add_argument("--tvwreck-side", type=float, default=270.0, help="tvwreck: B's bearing from A, degrees from seaward")
     ap.add_argument("--tvwreck-out", type=float, default=200.0, help="tvwreck: metres seaward of the pad for A's hover (0: A stays on its pad)")
     ap.add_argument("--switch-hold", type=float, default=12.0, help="tvswitch: seconds on the gun")
+    ap.add_argument("--tvreload-angle", type=float, default=80.0, help="tvreload: degrees to the side of the heading the missile is aimed")
+    ap.add_argument("--tvreload-range", type=float, default=600.0, help="tvreload: metres from the heli to the aim point on the sea")
+    ap.add_argument("--tvreload-shots", type=int, default=2)
+    ap.add_argument("--tvreload-expect", choices=["retail", "keep", "none"], default="none",
+                    help="tvreload: what to check: retail (the turn stops at the reload), keep (it goes on), none (report only)")
     args = ap.parse_args()
     try:
         if args.fuzz:
