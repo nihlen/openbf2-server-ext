@@ -981,7 +981,7 @@ A client can hold an object the server cannot remove:
 
 ### What the module does
 
-For each client it resyncs, in one tick, through `IServerExtension::resyncClient`
+In the tick of the command, for each client it resyncs, through `IServerExtension::resyncClient`
 ([Engine interface](#engine-interface)):
 
 1. It sends the event a round restart sends first (`PostRemoteEvent` ECGameLogic 6,
@@ -991,14 +991,26 @@ For each client it resyncs, in one tick, through `IServerExtension::resyncClient
 2. It marks every dynamic object as not yet created for this connection and resets the connection's ghosts, as a
    round restart does (`GameServer::resetConnections`). From here the server sends this client events only, no
    object or control state (`GameServer::processGameStateAndSendPackets` requires the connection's reset latch).
-3. It sends the object part of the join database (`ServerConnection::clientSendObjectDatabase`): a create event for
-   every dynamic networked object, then for each living player the events that seat it in its soldier, kit and
-   vehicle, then the sticky projectiles.
+3. It sends the object part of the join database (`ServerConnection::clientSendObjectDatabase`) without the static
+   ghosts: a create event for every dynamic networked object with a base priority of 0 or more (vehicles, soldiers,
+   kits, projectiles), then for each living player the events that seat it in its soldier, kit and vehicle, then
+   the sticky projectiles.
 4. It sends "this player spawned" for every living player (ECNetwork 9, as `ServerGameLogic.cpp:2127-2131`) and the
    squad state.
-5. It sends the game status last. When the client has acknowledged that event, the server sets the reset latch and
+5. It sends the game status. When the client has acknowledged that event, the server sets the reset latch and
    sends object and control state again. Event blocks are confirmed in order
-   (`Game/Common/GameEventManager.cpp:430-455`), so the client has every event of the replay by then.
+   (`Game/Common/GameEventManager.cpp:430-455`), so the client has every event up to here by then.
+
+In the ticks that follow, through `IServerExtension::resyncClientStatics`:
+
+6. It sends the create events of the static ghosts (objects with a negative base priority: the spawned static
+   objects), 4 per tick and client, in networkable-id order, up to the highest id in use when the resync began. An
+   object created later was announced to the client when it was created.
+
+The static ghosts come last and paced because a connection's stream managers share each packet without a budget
+(`ClientConnection::transmitMsgs`, `Game/Common/ClientConnection.cpp`): about 18 create events fill a 640-byte
+packet, and while they do, the client gets no state for its own vehicle. At 4 a tick they take about 190 bytes of
+each packet (the server sends a client 20 packets a second).
 
 The client takes its tick from the server again with the first control state it receives
 (`GameClient.cpp:1564`).
@@ -1013,13 +1025,38 @@ create the new ones, then send `ResyncClient` once.
 - `Error` 6 for one player when the engine refuses: the player has no connection (a bot), the connection is not
   playing yet, or it has not acknowledged an earlier reset (a `ResyncClient` or a round restart). With -1 the module
   resyncs every connected human client it can and answers `Ok`; the log has the counts.
-- Nothing is reported when a resync completes.
+- `Ok` means the resync has begun. Nothing is reported when the client has acknowledged it or when its static
+  objects are sent; the module's log has a line for the latter.
+- A `ResyncClient` for a client whose static objects are still being sent starts over: the client has dropped those
+  it had got.
+- A level unload ends the sending of static objects.
 - A round restart while a resync waits for its acknowledgement: the acknowledgement of the resync sets the reset
   latch before the client has confirmed the restart.
 
 ### What a player sees
 
-Not measured yet.
+Measured on 2026-11-17 with one retail client (a pilot or gunner in an AH-1Z, and on foot) on a test server with
+`dalian_2_v_2`, about 60 resyncs, 3 to 600 spawned static objects. The round was in "waiting for players" throughout
+(one human), so a running round is not covered.
+
+- **No crash, no disconnect**, also with 30 resyncs half a second apart.
+- **The server's state does not change**: the player stays alive, in its seat and vehicle.
+- **The player's own vehicle.** The view stays in the cockpit. For one frame the HUD speed and the rotor read 0.
+  The client has no server state for its vehicle for about one round trip plus 60 ms: under 0.1 s at a ping of
+  16 ms, about 0.2 s at 100 ms, about 0.3 s at 190 ms with 3% packet loss. A hovering heli moved less than 0.5 m
+  (0.9 m at 190 ms); a heli cruising at 30 m/s stayed on its course.
+- **HUD.** The repair and rearm icons show for under a second. A kill line for the player's own name appears in
+  the kill list. The spawn banner can flash.
+- **Static objects** are gone at once and come back at 120 a second in the order they were created: 150 took 1.3 s,
+  600 took 5 s. Until an object is back the client does not collide with it, and the server does.
+- **Other vehicles** keep their course. In one of two cases a heli 200 m away stood still for 0.9 s; otherwise the
+  stall was 0.1 s.
+- **A TV missile in flight is lost to its gunner.** The gunner's view returns to the heli and the missile flies on
+  unguided. The next shot is normal.
+- **On foot** the view jumps up about 2.6 m and settles within 0.3 s, and the weapon is drawn again.
+
+Not tested: more than one human client, a running round (tickets, scores, commander, a squad order on screen), a
+player who is dead or in the spawn menu, passengers, parachutes, and what a player hears.
 
 ## Server votes
 
@@ -1464,7 +1501,7 @@ and a separate adapter object, so no retail vtable or layout changes. Every addi
 | | Getters: `getServerInfo`, `getRoundInfo`, `getTeamName`, `getCdKeyHash`, `getDisconnectReason`, `getMapList`, `getGameStatus`, `getBeginRoundState`, `getTimeToNextStateChange`, `getLagCompensation` | `Welcome`, `GameState`, `PlayerInfo`, `PlayerState`, `PlayerDisconnect` |
 | | Actions: `runMapListEntry`, `restartRound`, `sendGameLogicEvent`, `sendHudEvent`, `sendMedalEvent`, `setRank`, `killPlayer` | `Map`, `GameEvent`, `HudEvent`, `Medal`, `Rank`, `KillPlayer` |
 | R7 | Client presentation: `sendHudEventRaw`, `sendRoundClock`, `issueSquadOrder` | `HudEventRaw`, `RoundClock`, `SquadOrder` |
-| R8 | Client resync: `resyncClient` | `ResyncClient` (draft) |
+| R8 | Client resync: `resyncClient`, `resyncClientStatics` | `ResyncClient` (draft) |
 
 **R4, the script-event observer.**
 
@@ -1482,11 +1519,13 @@ refuses an id outside the whitelist and a size above 52. The module checks the s
 `HudEventRaw`. A module that calls these methods must never be loaded into an engine built without them, as with
 every appended method.
 
-**R8, the client resync** (draft). `resyncClient` is in the extension's own code. It uses what the retail server
-already has: the reset event and connection reset of a round restart, and the join database. Two things are new:
+**R8, the client resync** (draft). `resyncClient` and `resyncClientStatics` are in the extension's own code. They
+use what the retail server already has: the reset event and connection reset of a round restart, and the join
+database. Two things are new:
 
 - `ServerConnection::clientSendDatabase` is split in two. Its first part, the object database, is now
-  `clientSendObjectDatabase`, which `clientSendDatabase` calls first; a join sends what it sent before.
+  `clientSendObjectDatabase`, which `clientSendDatabase` calls first; a join sends what it sent before. For a
+  resync it can send the part without the static ghosts, or a slice of the static ghosts by networkable id.
 - The last event of the replay is a `PostRemoteEvent` subclass that sets the connection's reset latch when the
   client acknowledges it (`GameServer::confirmReset`). On the wire it is an ordinary game-status event.
 
@@ -1551,6 +1590,8 @@ last frame, with a full frame every second. That is a new stream encoding, not a
   follows.
 - **Spawned objects are often invisible.** A template without a networkable exists on the server only. Map changes
   that clients must see need console lines, and so `adminAllowConsole 1`.
+- **`ResyncClient` is tested with one retail client and no running round** ([What a player sees](#what-a-player-sees)).
+  A TV missile in flight is lost to its gunner.
 - **A soldier cannot be turned.** `Teleport`'s rotation, and a script's, do not stick on a soldier.
 - **Teleported and script-moved bodies are predicted by their pilot's client.** That pilot may see corrections.
   What a client sees of a vehicle without collision on the server is unverified.
