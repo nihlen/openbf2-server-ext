@@ -65,6 +65,10 @@ const unsigned int kRadioEventId = 13;        // ECNetwork: RadioMessageReceived
 const int kServerConnection = 0xFF;           // RadioMessageReceivedEvent connection of the server's own game-info lines
 const int kStatusPlaying = 1, kStatusEndGame = 2, kStatusPaused = 4;
 const size_t kMaxCommandsPerTick = 64;
+// ResyncClient: static objects' create events sent to one client per tick (docs/admin-channel.md "Client resync").
+// A create event is about 32 bytes; the server sends a client 20 packets a second of 320 to 640 bytes, shared with
+// the client's own vehicle state. 4 a tick is 120 a second, about 190 bytes a packet.
+const int kResyncStaticsPerTick = 4;
 const size_t kMaxTrackedProjectiles = 256;
 const size_t kMaxPendingFires = 512;      // WeaponFire aggregates per tick; more are dropped and counted
 const size_t kMaxTraces = 64;             // ProjectileTrace flights recorded at once; more are not traced
@@ -283,6 +287,8 @@ public:
         m_tick = tick;
         m_collisionsThisTick = 0;
         processCommands();
+        if (!m_resyncStatics.empty())   // with or without a link: a resync that has begun is finished
+            sendResyncStatics();
         // With or without a link: the preferences outlive it. After this tick's spawn pass, before the next.
         if (m_seatPrefCount)
             orderSeats();
@@ -401,6 +407,7 @@ public:
             m_fires.clear();
             m_traces.clear();
             m_collisionOff.clear();   // the level's objects go with it
+            m_resyncStatics.clear();
             logf("tick %lu: admin: level unload; control points and projectiles forgotten", m_tick);
             return;
         }
@@ -2539,7 +2546,7 @@ private:
             return;
         if (c.target16 != -1)
         {
-            if (!m_ext->resyncClient(c.target16))
+            if (!startResync(c.target16))
             {
                 error(c.requestId, ErrRefused, "no playing connection, or an earlier reset is not acknowledged yet");
                 return;
@@ -2554,13 +2561,44 @@ private:
             world::IPlayer* const p = player(static_cast<uint8_t>(id));
             if (!p || p->getIsAIPlayer() || !p->getIsRemote())
                 continue;
-            if (m_ext->resyncClient(id))
+            if (startResync(id))
                 ++done;
             else
                 ++refused;
         }
         logf("tick %lu: admin: resync of every client: %d started, %d refused", m_tick, done, refused);
         ok(c.requestId);
+    }
+
+    // The reset and everything that moves at once; the static objects follow from sendResyncStatics. A resync that
+    // starts while an earlier one still sends static objects replaces it: the client has dropped those too.
+    bool startResync(int id)
+    {
+        const int upTo = m_ext->resyncClient(id);
+        if (upTo <= 0)
+            return false;
+        ResyncStatics& r = m_resyncStatics[id];
+        r.after = 0;
+        r.upTo = upTo;
+        r.startTick = m_tick;
+        return true;
+    }
+
+    void sendResyncStatics()
+    {
+        for (std::map<int, ResyncStatics>::iterator it = m_resyncStatics.begin(); it != m_resyncStatics.end();)
+        {
+            const int last = m_ext->resyncClientStatics(it->first, it->second.after, it->second.upTo, kResyncStaticsPerTick);
+            if (last > 0)
+            {
+                it->second.after = last;
+                ++it;
+                continue;
+            }
+            logf("tick %lu: admin: resync of player %d's client: static objects %s after %lu ticks", m_tick, it->first,
+                 last == 0 ? "sent" : "dropped (the connection is gone)", m_tick - it->second.startTick);
+            m_resyncStatics.erase(it++);
+        }
     }
 
     void onSquadOrder(const Command& c)
@@ -3399,6 +3437,15 @@ private:
         IObject* object;
         uint8_t kind;
     };
+
+    // ResyncClient: the static objects still to be sent to a client, by player id.
+    struct ResyncStatics
+    {
+        int after;                // the networkable id of the last one sent
+        int upTo;                 // the highest networkable id when the resync began
+        unsigned long startTick;
+    };
+    std::map<int, ResyncStatics> m_resyncStatics;
 
     Config m_config;
     AdminHost* m_host;
