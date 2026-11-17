@@ -1140,7 +1140,7 @@ private:
         }
         w.capabilities = (m_config.adminAllowConsole ? kCapConsole : 0) | (m_config.adminAllowObjects ? kCapObjects : 0) |
                          (m_config.adminIdentity() ? kCapIdentity : 0) | (m_config.adminAllowScripts ? kCapScripts : 0) |
-                         kCapSeatPreference | kCapSetCollision | kCapServerHealth;
+                         kCapSeatPreference | kCapSetCollision | kCapServerHealth | kCapResyncClient;
         w.map = cp1252ToUtf8(m_game->getCurrentMapName());
         w.mode = cp1252ToUtf8(m_game->getCurrentMapGameMode());
         const int size = m_game->getCurrentMapSize();
@@ -2160,6 +2160,7 @@ private:
         case CmdListScripts: onListScripts(c); return;
         case CmdSeatPreference: onSeatPreference(c); return;
         case CmdSetCollision: onSetCollision(c); return;
+        case CmdResyncClient: onResyncClient(c); return;
         default:
             error(c.requestId, ErrUnknownType, "unexpected message type");
             return;
@@ -2525,6 +2526,40 @@ private:
             error(c.requestId, ErrRefused, "the engine refused the round clock");
             return;
         }
+        ok(c.requestId);
+    }
+
+    // ---------------------------------------------------------------- R8 client resync (docs/admin-channel.md "Client resync")
+
+    // One client, or every connected human's client for -1. The engine refuses a connection that is not playing or
+    // that has not acknowledged an earlier reset; with -1 those are skipped and counted in the log.
+    void onResyncClient(const Command& c)
+    {
+        if (!knownTarget(c))
+            return;
+        if (c.target16 != -1)
+        {
+            if (!m_ext->resyncClient(c.target16))
+            {
+                error(c.requestId, ErrRefused, "no playing connection, or an earlier reset is not acknowledged yet");
+                return;
+            }
+            logf("tick %lu: admin: resync of player %d's client", m_tick, c.target16);
+            ok(c.requestId);
+            return;
+        }
+        int done = 0, refused = 0;
+        for (int id = 0; id < 256; ++id)
+        {
+            world::IPlayer* const p = player(static_cast<uint8_t>(id));
+            if (!p || p->getIsAIPlayer() || !p->getIsRemote())
+                continue;
+            if (m_ext->resyncClient(id))
+                ++done;
+            else
+                ++refused;
+        }
+        logf("tick %lu: admin: resync of every client: %d started, %d refused", m_tick, done, refused);
         ok(c.requestId);
     }
 

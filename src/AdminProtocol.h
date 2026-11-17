@@ -61,7 +61,7 @@ enum Type : uint16_t
     CmdSetObjectActive = 0x1310, CmdSpawnObject = 0x1311, CmdDeleteObject = 0x1312, CmdStartVote = 0x1313,
     CmdCancelVote = 0x1314, CmdHudEventRaw = 0x1315, CmdRoundClock = 0x1316, CmdSquadOrder = 0x1317,
     CmdStartScript = 0x1318, CmdStopScript = 0x1319, CmdScriptMessage = 0x131A, CmdListScripts = 0x131B,
-    CmdSeatPreference = 0x131C, CmdSetCollision = 0x131D,
+    CmdSeatPreference = 0x131C, CmdSetCollision = 0x131D, CmdResyncClient = 0x131E,
     // replies
     MsgOk = 0x1401, MsgConsoleResult = 0x1402, MsgObjectList = 0x1403, MsgObjectSpawned = 0x1404,
     MsgScriptList = 0x1405,
@@ -83,6 +83,7 @@ const uint8_t kCapIdentity = 4;
 const uint8_t kCapScripts = 8;   // the script commands (docs/admin-channel.md "Scripts")
 const uint8_t kCapSeatPreference = 16;   // SeatPreference (docs/admin-channel.md "Seat preferences")
 const uint8_t kCapSetCollision = 32;     // SetCollision (docs/admin-channel.md "Command semantics")
+const uint8_t kCapResyncClient = 128;   // ResyncClient (docs/admin-channel.md "Client resync")
 const uint8_t kCapServerHealth = 64;     // stream 21, ServerHealth and PlayerConnections (docs/admin-channel.md "Server health")
 
 // Subscribe streams.
@@ -556,7 +557,7 @@ struct Command
     std::string text2;     // Map mode; StartScript arguments and ScriptMessage message (JSON text, UTF-8)
     std::string source;    // StartScript source (UTF-8)
     uint32_t instance;     // StartScript, StopScript, ScriptMessage
-    int16_t target16;      // HudEventRaw, RoundClock: the player, -1 every client
+    int16_t target16;      // HudEventRaw, RoundClock, ResyncClient: the player, -1 every client
     std::vector<uint8_t> bytes;   // HudEventRaw payload
     float points[9];       // SquadOrder: three positions
     uint32_t netId;        // SquadOrder target networkable id, 0 none

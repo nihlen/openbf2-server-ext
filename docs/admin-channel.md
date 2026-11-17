@@ -30,6 +30,7 @@ codec style and nothing else: they use separate connections, versions and type r
 - [Commands and replies](#commands-and-replies)
 - [Command semantics](#command-semantics)
 - [Client presentation commands](#client-presentation-commands)
+- [Client resync](#client-resync)
 - [Server votes](#server-votes)
 - [Scripts](#scripts)
 - [Seat preferences](#seat-preferences)
@@ -211,8 +212,8 @@ The protocol version is 1 and is not negotiated. Later additions do not change i
 streams, or fields with a capability bit in `Welcome`. A module answers a type it does not know with `Error` 3 and
 closes the link, so:
 
-- the client sends the script commands, `SeatPreference` and `SetCollision` only when the matching capability bit is
-  set, and subscribes to stream 21 only when capability bit 6 is set;
+- the client sends the script commands, `SeatPreference`, `SetCollision` and `ResyncClient` only when the matching
+  capability bit is set, and subscribes to stream 21 only when capability bit 6 is set;
 - commands without a capability bit (`StartVote`, `CancelVote`, `HudEventRaw`, `RoundClock`, `SquadOrder`) and the
   current structure layouts need a module that has them. Module and client are deployed together.
 
@@ -295,6 +296,7 @@ Capability bits:
 | 4 | the module accepts `SeatPreference` ([Seat preferences](#seat-preferences)) |
 | 5 | the module accepts `SetCollision` ([Command semantics](#command-semantics)) |
 | 6 | the module has stream 21, `ServerHealth` and `PlayerConnections` ([Server health](#server-health)) |
+| 7 | the module accepts `ResyncClient` ([Client resync](#client-resync)) |
 
 ### Keepalive
 
@@ -802,6 +804,7 @@ command does, and its errors, is in [Command semantics](#command-semantics).
 | `0x131B` | ListScripts | nothing | `ScriptList` |
 | `0x131C` | SeatPreference | `u8` player, `u8` seat (0 first, 1 second, 255 none) | `Ok` |
 | `0x131D` | SetCollision | `ObjectRef`, `u8` flags (bit 0 collision on; 0 turns it off; other bits must be 0) | `Ok` |
+| `0x131E` | ResyncClient | `i16` player (-1 every connected human client) | `Ok` |
 
 Template names, map names and game modes are at most 256 bytes. Unknown flag bits are `Error` 7 in every command.
 
@@ -880,11 +883,14 @@ Common rules:
   `adminAllowObjects 0`. An object whose template has no networkable is created on the server only and no client
   sees it; `ObjectSpawned` then has networkable id 0. Vehicle templates have one.
 - **DeleteObject**: `ObjectManager::destroyObject`, what the console's `object.delete` runs. The module refuses
-  (`Error` 6) a soldier, a camera, or a vehicle with a player in it. `Error` 9 with `adminAllowObjects 0`.
+  (`Error` 6) a soldier, a camera, or a vehicle with a player in it. `Error` 9 with `adminAllowObjects 0`. A client
+  removes the object only if its own copy has a networkable; a copy without one stays until that client is
+  resynced or the round restarts ([Client resync](#client-resync)).
 - **StartVote, CancelVote**: [Server votes](#server-votes). `StartVote` is `Error` 6 when a vote is running or no
   human player can vote, and `Error` 5 when the module cannot listen for ballots. `CancelVote` is `Error` 6 when no
   vote is running.
 - **HudEventRaw, RoundClock, SquadOrder**: [Client presentation commands](#client-presentation-commands).
+- **ResyncClient**: [Client resync](#client-resync). Sent only when capability bit 7 is set.
 - **StartScript, StopScript, ScriptMessage, ListScripts**: [Scripts](#scripts).
 - **SeatPreference**: stores the player's preference in the module, by player id. Nothing else happens until the
   player and a teammate are dead with the same spawn group, when the module may move the player's spawn tick
@@ -950,6 +956,70 @@ Issues a squad order, or a commander order with flag bit 0, through the engine's
 state stays consistent and members get the retail HUD notices. Order ids: 0 artillery, 1 UAV, 2 vehicle drop,
 3 supply, 5 attack, 6 defend, 7 repair, 8 destroy, 9 mines, 10 attack control point, anything else move. A squad
 exists while it has members; a squad without members is `Error` 6.
+
+## Client resync
+
+**Draft: not yet approved by the maintainer.**
+
+`ResyncClient` makes a client drop every dynamic object it holds and build them again from the server, without a
+round restart. Nobody dies on the server, no vehicle respawns and no score changes.
+
+### Why it exists
+
+A client can hold an object the server cannot remove:
+
+- The server creates an object on clients with a create event that carries a template id and a networkable id
+  (`GameServer::createObjectOnAllClients`). The client creates the object from its own template. If that template
+  has no networkable on the client, the object exists there without a networkable id
+  (`Game/GameClient/GameClient.cpp:1819-1821`).
+- This is how a static object is shown to unmodified clients: its template gets a networkable on the server only
+  (console lines, `networkableInfo.createNewInfo` and `ObjectTemplate.setNetworkableInfo`).
+- The server's destroy event names the networkable id. The client finds no object for it and does nothing
+  (`GameClient.cpp:1909-1917`). No other client event addresses an object without a networkable id.
+- The client destroys such an object in one place: its round reset, which destroys every root object that was not
+  created at map load (`GameLogic::resetAllObjects`, `Game/GameLogic/GameLogic.cpp:2000-2075`).
+
+### What the module does
+
+For each client it resyncs, in one tick, through `IServerExtension::resyncClient`
+([Engine interface](#engine-interface)):
+
+1. It sends the event a round restart sends first (`PostRemoteEvent` ECGameLogic 6,
+   `Game/GameLogic/ServerGameLogic.cpp:342`). The client runs its round reset
+   (`Game/GameLogic/ClientGameLogic.cpp:623-627`, `GameLogic.cpp:2080`): it kills every player locally, destroys
+   every dynamic object, clears its squads and sets its clock to 0. The server does not run it.
+2. It marks every dynamic object as not yet created for this connection and resets the connection's ghosts, as a
+   round restart does (`GameServer::resetConnections`). From here the server sends this client events only, no
+   object or control state (`GameServer::processGameStateAndSendPackets` requires the connection's reset latch).
+3. It sends the object part of the join database (`ServerConnection::clientSendObjectDatabase`): a create event for
+   every dynamic networked object, then for each living player the events that seat it in its soldier, kit and
+   vehicle, then the sticky projectiles.
+4. It sends "this player spawned" for every living player (ECNetwork 9, as `ServerGameLogic.cpp:2127-2131`) and the
+   squad state.
+5. It sends the game status last. When the client has acknowledged that event, the server sets the reset latch and
+   sends object and control state again. Event blocks are confirmed in order
+   (`Game/Common/GameEventManager.cpp:430-455`), so the client has every event of the replay by then.
+
+The client takes its tick from the server again with the first control state it receives
+(`GameClient.cpp:1564`).
+
+An object the server has deleted is not in the replay, so the client's copy is gone after the resync. To move or
+remove objects that clients hold without a networkable: delete them on the server (`DeleteObject`, or the console),
+create the new ones, then send `ResyncClient` once.
+
+### Rules
+
+- A player that does not exist is `Error` 4.
+- `Error` 6 for one player when the engine refuses: the player has no connection (a bot), the connection is not
+  playing yet, or it has not acknowledged an earlier reset (a `ResyncClient` or a round restart). With -1 the module
+  resyncs every connected human client it can and answers `Ok`; the log has the counts.
+- Nothing is reported when a resync completes.
+- A round restart while a resync waits for its acknowledgement: the acknowledgement of the resync sets the reset
+  latch before the client has confirmed the restart.
+
+### What a player sees
+
+Not measured yet.
 
 ## Server votes
 
@@ -1394,6 +1464,7 @@ and a separate adapter object, so no retail vtable or layout changes. Every addi
 | | Getters: `getServerInfo`, `getRoundInfo`, `getTeamName`, `getCdKeyHash`, `getDisconnectReason`, `getMapList`, `getGameStatus`, `getBeginRoundState`, `getTimeToNextStateChange`, `getLagCompensation` | `Welcome`, `GameState`, `PlayerInfo`, `PlayerState`, `PlayerDisconnect` |
 | | Actions: `runMapListEntry`, `restartRound`, `sendGameLogicEvent`, `sendHudEvent`, `sendMedalEvent`, `setRank`, `killPlayer` | `Map`, `GameEvent`, `HudEvent`, `Medal`, `Rank`, `KillPlayer` |
 | R7 | Client presentation: `sendHudEventRaw`, `sendRoundClock`, `issueSquadOrder` | `HudEventRaw`, `RoundClock`, `SquadOrder` |
+| R8 | Client resync: `resyncClient` | `ResyncClient` (draft) |
 
 **R4, the script-event observer.**
 
@@ -1410,6 +1481,14 @@ and a separate adapter object, so no retail vtable or layout changes. Every addi
 refuses an id outside the whitelist and a size above 52. The module checks the same whitelist when it parses
 `HudEventRaw`. A module that calls these methods must never be loaded into an engine built without them, as with
 every appended method.
+
+**R8, the client resync** (draft). `resyncClient` is in the extension's own code. It uses what the retail server
+already has: the reset event and connection reset of a round restart, and the join database. Two things are new:
+
+- `ServerConnection::clientSendDatabase` is split in two. Its first part, the object database, is now
+  `clientSendObjectDatabase`, which `clientSendDatabase` calls first; a join sends what it sent before.
+- The last event of the replay is a `PostRemoteEvent` subclass that sets the connection's reset latch when the
+  client acknowledges it (`GameServer::confirmReset`). On the wire it is an ordinary game-status event.
 
 Everything else the commands need has a typed path and no engine change: the console, chat, kick, object templates
 and the object manager, armour, transforms and physics, score fields and teams. `Ban` runs through the console,

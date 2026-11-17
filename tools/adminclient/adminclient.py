@@ -24,6 +24,7 @@ Python 3 standard library plus the openssl command-line tool (certificate creati
   python3 adminclient.py --key <hex> --scenario collision --seconds 40   # SetCollision; with serverext_client.py
                                                                         # --scenario wreck: does the heli fall through?
   python3 adminclient.py --key <hex> --scenario health --seconds 35      # ServerHealth: capability, stream 21, three windows
+  python3 adminclient.py --key <hex> --scenario clientresync [--resync-player 0] [--resync-count 3]   # ResyncClient
 
 Scenarios: listen, commands, resync, stall, soak, wrongkey, mapchange, script and more. Port 16567 is refused.
 """
@@ -65,7 +66,7 @@ CMD_SET_OBJECT_ACTIVE, CMD_SPAWN_OBJECT, CMD_DELETE_OBJECT = 0x1310, 0x1311, 0x1
 CMD_START_VOTE, CMD_CANCEL_VOTE = 0x1313, 0x1314
 CMD_HUD_EVENT_RAW, CMD_ROUND_CLOCK, CMD_SQUAD_ORDER = 0x1315, 0x1316, 0x1317
 CMD_START_SCRIPT, CMD_STOP_SCRIPT, CMD_SCRIPT_MESSAGE, CMD_LIST_SCRIPTS = 0x1318, 0x1319, 0x131A, 0x131B
-CMD_SEAT_PREFERENCE, CMD_SET_COLLISION = 0x131C, 0x131D
+CMD_SEAT_PREFERENCE, CMD_SET_COLLISION, CMD_RESYNC_CLIENT = 0x131C, 0x131D, 0x131E
 OK, CONSOLE_RESULT, OBJECT_LIST, OBJECT_SPAWNED, SCRIPT_LIST = 0x1401, 0x1402, 0x1403, 0x1404, 0x1405
 PING, PONG, ERROR = 0x1501, 0x1502, 0xFFFF
 
@@ -73,7 +74,7 @@ NAMES = {v: k for k, v in list(globals().items()) if isinstance(v, int) and k.is
          and k not in ("VERSION",)}
 EVENT_TYPES = range(0x1201, 0x1220)
 CAP_CONSOLE, CAP_OBJECTS, CAP_IDENTITY, CAP_SCRIPTS, CAP_SEAT_PREFERENCE, CAP_SET_COLLISION = 1, 2, 4, 8, 16, 32
-CAP_SERVER_HEALTH = 64
+CAP_SERVER_HEALTH, CAP_RESYNC_CLIENT = 64, 128
 HEALTH_STEPPED, HEALTH_HOST_VALID, HEALTH_LEVEL_LOAD = 1, 2, 4
 SEAT_FIRST, SEAT_SECOND, SEAT_NONE = 0, 1, 255
 VOTE_OUTCOMES = {1: "passed", 2: "failed", 3: "cancelled", 4: "level unload"}
@@ -465,6 +466,7 @@ def p_round_clock(req, player, seconds): return W().u32(req).i16(player).f32(sec
 
 def p_seat_preference(req, player, seat): return W().u32(req).u8(player).u8(seat).b
 def p_set_collision(req, kind, ident, on): return p_ref(W().u32(req), kind, ident).u8(1 if on else 0).b
+def p_resync_client(req, player): return W().u32(req).i16(player).b
 
 
 def p_start_script(req, instance, name, source, args="", api=1, flags=0):
@@ -668,6 +670,8 @@ def golden_samples():
     s["cmd_set_collision_off"] = (CMD_SET_COLLISION, p_set_collision(36, REF_PLAYER, 3, False))
     s["cmd_set_collision_on"] = (CMD_SET_COLLISION, p_set_collision(37, REF_NET, 1819, True))
     s["cmd_subscribe_health"] = (SUBSCRIBE, p_subscribe(38, 21, 0))
+    s["cmd_resync_client"] = (CMD_RESYNC_CLIENT, p_resync_client(39, 3))
+    s["cmd_resync_client_all"] = (CMD_RESYNC_CLIENT, p_resync_client(40, -1))
     s["ev_server_health"] = (EV_SERVER_HEALTH, ev(30).u16(300).u32(10000123).u8(HEALTH_HOST_VALID).u32(33334).u32(34100)
                              .u32(61234).u16(1).u16(1).u32(310).u32(1250).u32(4800).u32(350).u32(900).u32(12).u32(0)
                              .u16(1).u16(412).u16(278).u16(3).u32(159744).b)
@@ -1271,6 +1275,58 @@ def scenario_health(lst, args):
             "no ServerHealth or PlayerConnections in 11 s after the Unsubscribe")
     c.check(link.gaps == 0, "no sequence gaps")
     return c.summary("health")
+
+
+def scenario_clientresync(lst, args):
+    """ResyncClient (docs/admin-channel.md "Client resync"): Welcome capability bit 7, Error 4, 6 and 7, Ok for every
+    client (-1), and with --resync-player N that player's client is resynced --resync-count times, --resync-interval
+    seconds apart, while the player stream is logged: the server's own state must not change (life, vehicle,
+    position). What the client shows is for a person, or a recording, to judge."""
+    c = Checks()
+    link = lst.accept(args.accept_timeout)
+    rq = link.next_request
+    caps = link.welcome["caps"]
+    c.check(caps & CAP_RESYNC_CLIENT, "Welcome capability bit 7 (ResyncClient) is set: caps %d" % caps)
+    players = link.snapshot["players"]
+    ids = [p["id"] for p in players]
+    missing = next(i for i in range(256) if i not in ids)
+    r = link.request(CMD_RESYNC_CLIENT, p_resync_client(rq(), missing))
+    c.check(r["name"] == "ERROR" and r["code"] == ERR_UNKNOWN_PLAYER, "ResyncClient of no player (%d) -> Error 4" % missing)
+    r = link.request(CMD_RESYNC_CLIENT, W().u32(rq()).i16(-2).b)
+    c.check(r["name"] == "ERROR" and r["code"] == ERR_INVALID, "ResyncClient of player -2 -> Error 7 (%s)" % r.get("message"))
+    r = link.request(CMD_RESYNC_CLIENT, W().u32(rq()).i16(256).b)
+    c.check(r["name"] == "ERROR" and r["code"] == ERR_INVALID, "ResyncClient of player 256 -> Error 7")
+    bots = [p["id"] for p in players if p["flags"] & 1]
+    if bots:
+        r = link.request(CMD_RESYNC_CLIENT, p_resync_client(rq(), bots[0]))
+        c.check(r["name"] == "ERROR" and r["code"] == ERR_REFUSED, "ResyncClient of a bot (%d, no connection) -> Error 6" % bots[0])
+    r = link.request(CMD_RESYNC_CLIENT, p_resync_client(rq(), -1))
+    c.check(r["name"] == "OK", "ResyncClient of every client (-1) -> Ok")
+    if args.resync_player >= 0:
+        pid = args.resync_player
+        link.request(SUBSCRIBE, p_subscribe(rq(), 1, 30))
+        link.pump(1.0)
+
+        def state():
+            for i, st in (link.last_player_stream or {}).get("players", []):
+                if i == pid:
+                    return st
+            return None
+        for n in range(args.resync_count):
+            link.pump(args.resync_interval)
+            before = state()
+            r = link.request(CMD_RESYNC_CLIENT, p_resync_client(rq(), pid))
+            c.check(r["name"] == "OK", "ResyncClient %d of player %d -> %s %s" % (
+                n + 1, pid, r["name"], r.get("message", "")))
+            link.pump(1.0)
+            after = state()
+            if before and after:
+                c.check(before["life"] == after["life"] and before["root_net"] == after["root_net"],
+                        "the server's player is unchanged a second later: life %d -> %d, root %d -> %d" % (
+                            before["life"], after["life"], before["root_net"], after["root_net"]))
+    r = link.request(PING, p_ping(rq(), 80))
+    c.check(r["name"] == "PONG" and r["clock"] == 80, "the server still ticks (Ping -> Pong)")
+    return c.summary("clientresync")
 
 
 def scenario_collision(lst, args):
@@ -2601,7 +2657,7 @@ def main():
     ap.add_argument("--scenario", default="listen",
                     choices=["listen", "commands", "resync", "stall", "soak", "wrongkey", "wrongpin", "mapchange", "extras",
                              "viewer", "replay", "vote", "r7", "script", "runscript", "scriptends", "seat",
-                             "collision", "health"])
+                             "collision", "health", "clientresync"])
     ap.add_argument("--fuzz", action="store_true")
     ap.add_argument("--fuzz-rounds", type=int, default=24)
     ap.add_argument("--seed", type=int, default=1)
@@ -2633,6 +2689,9 @@ def main():
     ap.add_argument("--seat-keep", action="store_true", help="seat: leave the preference set, hold the link --seconds")
     ap.add_argument("--seat-pair", action="store_true",
                     help="seat: with two bot-channel bots on one team, kill both in one tick and compare their respawns")
+    ap.add_argument("--resync-player", type=int, default=-1, help="clientresync: the player whose client is resynced")
+    ap.add_argument("--resync-count", type=int, default=1, help="clientresync: how many resyncs of --resync-player")
+    ap.add_argument("--resync-interval", type=float, default=5.0, help="clientresync: seconds between them")
     ap.add_argument("--collision-wait", type=float, default=90.0,
                     help="collision: seconds to wait for a player seated in a vehicle")
     ap.add_argument("--collision-control", action="store_true", help="collision: leave collision on (comparison run)")
@@ -2658,7 +2717,7 @@ def main():
                 "extras": scenario_extras, "viewer": scenario_viewer, "replay": scenario_replay,
                 "vote": scenario_vote, "r7": scenario_r7, "script": scenario_script,
                 "runscript": scenario_runscript, "scriptends": scenario_scriptends,
-                "seat": scenario_seat, "collision": scenario_collision,
+                "seat": scenario_seat, "collision": scenario_collision, "clientresync": scenario_clientresync,
                 "health": scenario_health}[args.scenario](lst, args)
     except KeyboardInterrupt:
         return 130

@@ -1112,7 +1112,7 @@ bool isWebAdminMessage(uint16_t type)
     case CmdMap: case CmdListObjects: case CmdSetObjectActive: case CmdSpawnObject: case CmdDeleteObject:
     case CmdStartVote: case CmdCancelVote: case CmdHudEventRaw: case CmdRoundClock: case CmdSquadOrder:
     case CmdStartScript: case CmdStopScript: case CmdScriptMessage: case CmdListScripts: case CmdSeatPreference:
-    case CmdSetCollision:
+    case CmdSetCollision: case CmdResyncClient:
     case MsgPing: case MsgPong: case MsgError:
         return true;
     default:
@@ -1503,6 +1503,15 @@ bool parseCommand(uint16_t type, const uint8_t* p, size_t n, Command& out, std::
             return bad(badValue, "the payload is at most 52 bytes");
         return true;
     }
+
+    case CmdResyncClient:
+        out.requestId = r.u32();
+        out.target16 = r.i16();
+        if (!r.done())
+            return false;
+        if (out.target16 < -1 || out.target16 > 255)
+            return bad(badValue, "player must be 0..255 or -1 (every client)");
+        return true;
 
     case CmdRoundClock:
         out.requestId = r.u32();
