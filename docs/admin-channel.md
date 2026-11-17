@@ -1036,8 +1036,8 @@ create the new ones, then send `ResyncClient` once.
 ### What a player sees
 
 Measured on 2026-11-17 with one retail client (a pilot or gunner in an AH-1Z, and on foot) on a test server with
-`dalian_2_v_2`, about 60 resyncs, 3 to 600 spawned static objects. The round was in "waiting for players" throughout
-(one human), so a running round is not covered.
+`dalian_2_v_2`, about 65 resyncs, 3 to 600 spawned static objects. Most ran while the round waited for players; the
+round items below ran in a running round with a time limit.
 
 - **No crash, no disconnect**, also with 30 resyncs half a second apart.
 - **The server's state does not change**: the player stays alive, in its seat and vehicle.
@@ -1054,9 +1054,16 @@ Measured on 2026-11-17 with one retail client (a pilot or gunner in an AH-1Z, an
 - **A TV missile in flight is lost to its gunner.** The gunner's view returns to the heli and the missile flies on
   unguided. The next shot is normal.
 - **On foot** the view jumps up about 2.6 m and settles within 0.3 s, and the weapon is drawn again.
+- **Scores, tickets and the round clock do not change.** With the scoreboard open, every player's score, kills
+  and deaths and both ticket counts read the same in every frame through the resync. The round clock shows the
+  whole time limit for one frame and then the right time again.
+- **A player who is dead** gets the spawn menu with "invalid spawnpoint": the client has dropped its spawn point
+  selection. In the test the player then spawned 2 s later at another spawn point of its base (on foot beside the
+  heli it had spawned in before). A player who was alive at the resync and dies later respawns where it had
+  chosen.
 
-Not tested: more than one human client, a running round (tickets, scores, commander, a squad order on screen), a
-player who is dead or in the spawn menu, passengers, parachutes, and what a player hears.
+Not tested: more than one human client, the commander and squads (the client clears its squads and the server sends
+them again), passengers, parachutes, and what a player hears.
 
 ## Server votes
 
@@ -1590,8 +1597,8 @@ last frame, with a full frame every second. That is a new stream encoding, not a
   follows.
 - **Spawned objects are often invisible.** A template without a networkable exists on the server only. Map changes
   that clients must see need console lines, and so `adminAllowConsole 1`.
-- **`ResyncClient` is tested with one retail client and no running round** ([What a player sees](#what-a-player-sees)).
-  A TV missile in flight is lost to its gunner.
+- **`ResyncClient` is tested with one retail client** ([What a player sees](#what-a-player-sees)). A TV missile in
+  flight is lost to its gunner, and a dead player loses its spawn point selection.
 - **A soldier cannot be turned.** `Teleport`'s rotation, and a script's, do not stick on a soldier.
 - **Teleported and script-moved bodies are predicted by their pilot's client.** That pilot may see corrections.
   What a client sees of a vehicle without collision on the server is unverified.
