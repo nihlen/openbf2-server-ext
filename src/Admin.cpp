@@ -2168,6 +2168,7 @@ private:
         case CmdSeatPreference: onSeatPreference(c); return;
         case CmdSetCollision: onSetCollision(c); return;
         case CmdResyncClient: onResyncClient(c); return;
+        case CmdSetControlPointTeam: onSetControlPointTeam(c); return;
         default:
             error(c.requestId, ErrUnknownType, "unexpected message type");
             return;
@@ -2567,6 +2568,34 @@ private:
                 ++refused;
         }
         logf("tick %lu: admin: resync of every client: %d started, %d refused", m_tick, done, refused);
+        ok(c.requestId);
+    }
+
+    // ---------------------------------------------------------------- control point team (docs/admin-channel.md "Command semantics")
+
+    // IControlPoint::setTeam: the engine gives the team to the point's spawn groups and object spawners
+    // (OpenBF2 Game/Objects/Game/ControlPoint.cpp:374-388). The team the point has already sends no HUD event
+    // (:318-331) and gives spawn groups made since the round start their team.
+    void onSetControlPointTeam(const Command& c)
+    {
+        uint16_t code;
+        const char* why = "";
+        IObject* o = resolve(c.ref, code, why);
+        if (!o)
+        {
+            error(c.requestId, code, why);
+            return;
+        }
+        IControlPoint* cp = static_cast<IControlPoint*>(o->queryInterface(IID_IControlPoint));
+        if (!cp)
+        {
+            error(c.requestId, ErrUnavailable, "the object is not a control point");
+            return;
+        }
+        const int before = cp->getTeam();
+        cp->setTeam(c.value8);
+        logf("tick %lu: admin: control point '%s' (console id %u) team %d -> %u", m_tick, templateName(o).c_str(),
+             objectIdOf(o), before, c.value8);
         ok(c.requestId);
     }
 

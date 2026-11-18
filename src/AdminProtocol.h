@@ -61,7 +61,7 @@ enum Type : uint16_t
     CmdSetObjectActive = 0x1310, CmdSpawnObject = 0x1311, CmdDeleteObject = 0x1312, CmdStartVote = 0x1313,
     CmdCancelVote = 0x1314, CmdHudEventRaw = 0x1315, CmdRoundClock = 0x1316, CmdSquadOrder = 0x1317,
     CmdStartScript = 0x1318, CmdStopScript = 0x1319, CmdScriptMessage = 0x131A, CmdListScripts = 0x131B,
-    CmdSeatPreference = 0x131C, CmdSetCollision = 0x131D, CmdResyncClient = 0x131E,
+    CmdSeatPreference = 0x131C, CmdSetCollision = 0x131D, CmdResyncClient = 0x131E, CmdSetControlPointTeam = 0x131F,
     // replies
     MsgOk = 0x1401, MsgConsoleResult = 0x1402, MsgObjectList = 0x1403, MsgObjectSpawned = 0x1404,
     MsgScriptList = 0x1405,
@@ -83,7 +83,8 @@ const uint8_t kCapIdentity = 4;
 const uint8_t kCapScripts = 8;   // the script commands (docs/admin-channel.md "Scripts")
 const uint8_t kCapSeatPreference = 16;   // SeatPreference (docs/admin-channel.md "Seat preferences")
 const uint8_t kCapSetCollision = 32;     // SetCollision (docs/admin-channel.md "Command semantics")
-const uint8_t kCapResyncClient = 128;   // ResyncClient (docs/admin-channel.md "Client resync")
+// ResyncClient (docs/admin-channel.md "Client resync") and SetControlPointTeam ("Command semantics")
+const uint8_t kCapResyncClient = 128;
 const uint8_t kCapServerHealth = 64;     // stream 21, ServerHealth and PlayerConnections (docs/admin-channel.md "Server health")
 
 // Subscribe streams.
@@ -542,14 +543,14 @@ struct Command
     uint8_t flags;         // Teleport, SetHealth, KillPlayer, SetTeam, Rank, SetCollision flags; SetScore mask; StartVote minimum ballots;
                            // StartScript flags
     uint8_t value8;        // SetTeam team, Rank rank, GameEvent/HudEvent event, Ban duration, Subscribe rate, SpawnObject team,
-                           // StartVote percent, StartScript API version, SeatPreference seat
+                           // StartVote percent, StartScript API version, SeatPreference seat, SetControlPointTeam team
     int32_t ints[5];       // SetScore values; Medal medal and value; GameEvent/HudEvent data in [0]
     uint32_t seconds;      // Ban, StartVote
     uint16_t index;        // Map
     uint16_t size;         // Map
     uint16_t maxResults;   // ListObjects
     uint64_t clock;        // Ping, Pong
-    ObjectRef ref;         // Teleport, SetHealth, SetObjectActive, DeleteObject
+    ObjectRef ref;         // Teleport, SetHealth, SetObjectActive, DeleteObject, SetCollision, SetControlPointTeam
     float pos[3], rot[3];  // Teleport, SpawnObject
     float value;           // SetHealth
     std::string text;      // Console line, Say text, Kick/Ban reason, ListObjects/SpawnObject template, Map name,

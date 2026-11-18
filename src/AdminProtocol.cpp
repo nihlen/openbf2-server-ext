@@ -1112,7 +1112,7 @@ bool isWebAdminMessage(uint16_t type)
     case CmdMap: case CmdListObjects: case CmdSetObjectActive: case CmdSpawnObject: case CmdDeleteObject:
     case CmdStartVote: case CmdCancelVote: case CmdHudEventRaw: case CmdRoundClock: case CmdSquadOrder:
     case CmdStartScript: case CmdStopScript: case CmdScriptMessage: case CmdListScripts: case CmdSeatPreference:
-    case CmdSetCollision: case CmdResyncClient:
+    case CmdSetCollision: case CmdResyncClient: case CmdSetControlPointTeam:
     case MsgPing: case MsgPong: case MsgError:
         return true;
     default:
@@ -1371,6 +1371,18 @@ bool parseCommand(uint16_t type, const uint8_t* p, size_t n, Command& out, std::
             return false;
         if (out.ref.kind != RefNetId && out.ref.kind != RefConsoleId)
             return bad(badValue, "the object reference must be a networkable id (2) or a console id (3)");
+        return true;
+
+    case CmdSetControlPointTeam:
+        out.requestId = r.u32();
+        readRef(r, out.ref);
+        out.value8 = r.u8();
+        if (!r.done())
+            return false;
+        if (out.ref.kind != RefNetId && out.ref.kind != RefConsoleId)
+            return bad(badValue, "the control point reference must be a networkable id (2) or a console id (3)");
+        if (out.value8 > 2)
+            return bad(badValue, "team must be 0 (neutral), 1 or 2");
         return true;
 
     case CmdSpawnObject:

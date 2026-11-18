@@ -212,8 +212,8 @@ The protocol version is 1 and is not negotiated. Later additions do not change i
 streams, or fields with a capability bit in `Welcome`. A module answers a type it does not know with `Error` 3 and
 closes the link, so:
 
-- the client sends the script commands, `SeatPreference`, `SetCollision` and `ResyncClient` only when the matching
-  capability bit is set, and subscribes to stream 21 only when capability bit 6 is set;
+- the client sends the script commands, `SeatPreference`, `SetCollision`, `ResyncClient` and `SetControlPointTeam`
+  only when the matching capability bit is set, and subscribes to stream 21 only when capability bit 6 is set;
 - commands without a capability bit (`StartVote`, `CancelVote`, `HudEventRaw`, `RoundClock`, `SquadOrder`) and the
   current structure layouts need a module that has them. Module and client are deployed together.
 
@@ -296,7 +296,7 @@ Capability bits:
 | 4 | the module accepts `SeatPreference` ([Seat preferences](#seat-preferences)) |
 | 5 | the module accepts `SetCollision` ([Command semantics](#command-semantics)) |
 | 6 | the module has stream 21, `ServerHealth` and `PlayerConnections` ([Server health](#server-health)) |
-| 7 | the module accepts `ResyncClient` ([Client resync](#client-resync)) |
+| 7 | the module accepts `ResyncClient` ([Client resync](#client-resync)) and `SetControlPointTeam` ([Command semantics](#command-semantics); draft, not approved) |
 
 ### Keepalive
 
@@ -805,6 +805,7 @@ command does, and its errors, is in [Command semantics](#command-semantics).
 | `0x131C` | SeatPreference | `u8` player, `u8` seat (0 first, 1 second, 255 none) | `Ok` |
 | `0x131D` | SetCollision | `ObjectRef`, `u8` flags (bit 0 collision on; 0 turns it off; other bits must be 0) | `Ok` |
 | `0x131E` | ResyncClient | `i16` player (-1 every connected human client) | `Ok` |
+| `0x131F` | SetControlPointTeam | `ObjectRef` (kind 2 or 3) of a control point, `u8` team (0 neutral, 1 or 2) | `Ok` |
 
 Template names, map names and game modes are at most 256 bytes. Unknown flag bits are `Error` 7 in every command.
 
@@ -891,6 +892,20 @@ Common rules:
   vote is running.
 - **HudEventRaw, RoundClock, SquadOrder**: [Client presentation commands](#client-presentation-commands).
 - **ResyncClient**: [Client resync](#client-resync). Sent only when capability bit 7 is set.
+- **SetControlPointTeam** (draft, not approved): `IControlPoint::setTeam(team)` on the control point
+  (`Game/Objects/IControlPoint.h:22`). Sent only when capability bit 7 is set. An object that is not a control point
+  is `Error` 5, a team above 2 `Error` 7.
+  - On the server the engine gives the team to every spawn group and object spawner of the point's
+    `controlPointId` (`Game/Objects/Game/ControlPoint.cpp:374-388`), as it does at a round start (`reset`, `:395-404`)
+    and a capture. A spawn group made after the round started has no team until then, so no player can pick it
+    (`SpawnManager::getGroupsForPlayer`, `Game/GameLogic/SpawnSystem/SpawnManager.cpp:302-324`); this gives it one.
+  - The team the point already has (1 or 2) changes nothing else: no HUD event goes out (`ControlPoint.cpp:318-331`).
+    This is the intended use.
+  - Another team is a capture without its consequences. While the game is playing, the players get the captured and
+    lost HUD events (`:318-365`). The flag stays, no script event is raised, so the game mode (tickets, its own
+    ControlPoint handler) does not hear of it, and the module sends no `ControlPoint` event; the next `Snapshot`
+    has the new team. Setting a neutral point to 0 again sends every player the captured or lost event.
+  - It also zeroes the point's take-over rate (`:372`).
 - **StartScript, StopScript, ScriptMessage, ListScripts**: [Scripts](#scripts).
 - **SeatPreference**: stores the player's preference in the module, by player id. Nothing else happens until the
   player and a teammate are dead with the same spawn group, when the module may move the player's spawn tick

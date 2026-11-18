@@ -25,6 +25,7 @@ Python 3 standard library plus the openssl command-line tool (certificate creati
                                                                         # --scenario wreck: does the heli fall through?
   python3 adminclient.py --key <hex> --scenario health --seconds 35      # ServerHealth: capability, stream 21, three windows
   python3 adminclient.py --key <hex> --scenario clientresync [--resync-player 0] [--resync-count 3]   # ResyncClient
+  python3 adminclient.py --key <hex> --scenario cpteam                  # SetControlPointTeam: every point to its own team
 
 Scenarios: listen, commands, resync, stall, soak, wrongkey, mapchange, script and more. Port 16567 is refused.
 """
@@ -66,7 +67,7 @@ CMD_SET_OBJECT_ACTIVE, CMD_SPAWN_OBJECT, CMD_DELETE_OBJECT = 0x1310, 0x1311, 0x1
 CMD_START_VOTE, CMD_CANCEL_VOTE = 0x1313, 0x1314
 CMD_HUD_EVENT_RAW, CMD_ROUND_CLOCK, CMD_SQUAD_ORDER = 0x1315, 0x1316, 0x1317
 CMD_START_SCRIPT, CMD_STOP_SCRIPT, CMD_SCRIPT_MESSAGE, CMD_LIST_SCRIPTS = 0x1318, 0x1319, 0x131A, 0x131B
-CMD_SEAT_PREFERENCE, CMD_SET_COLLISION, CMD_RESYNC_CLIENT = 0x131C, 0x131D, 0x131E
+CMD_SEAT_PREFERENCE, CMD_SET_COLLISION, CMD_RESYNC_CLIENT, CMD_SET_CONTROL_POINT_TEAM = 0x131C, 0x131D, 0x131E, 0x131F
 OK, CONSOLE_RESULT, OBJECT_LIST, OBJECT_SPAWNED, SCRIPT_LIST = 0x1401, 0x1402, 0x1403, 0x1404, 0x1405
 PING, PONG, ERROR = 0x1501, 0x1502, 0xFFFF
 
@@ -467,6 +468,7 @@ def p_round_clock(req, player, seconds): return W().u32(req).i16(player).f32(sec
 def p_seat_preference(req, player, seat): return W().u32(req).u8(player).u8(seat).b
 def p_set_collision(req, kind, ident, on): return p_ref(W().u32(req), kind, ident).u8(1 if on else 0).b
 def p_resync_client(req, player): return W().u32(req).i16(player).b
+def p_set_control_point_team(req, kind, ident, team): return p_ref(W().u32(req), kind, ident).u8(team).b
 
 
 def p_start_script(req, instance, name, source, args="", api=1, flags=0):
@@ -672,6 +674,7 @@ def golden_samples():
     s["cmd_subscribe_health"] = (SUBSCRIBE, p_subscribe(38, 21, 0))
     s["cmd_resync_client"] = (CMD_RESYNC_CLIENT, p_resync_client(39, 3))
     s["cmd_resync_client_all"] = (CMD_RESYNC_CLIENT, p_resync_client(40, -1))
+    s["cmd_set_control_point_team"] = (CMD_SET_CONTROL_POINT_TEAM, p_set_control_point_team(41, REF_CONSOLE, 812, 2))
     s["ev_server_health"] = (EV_SERVER_HEALTH, ev(30).u16(300).u32(10000123).u8(HEALTH_HOST_VALID).u32(33334).u32(34100)
                              .u32(61234).u16(1).u16(1).u32(310).u32(1250).u32(4800).u32(350).u32(900).u32(12).u32(0)
                              .u16(1).u16(412).u16(278).u16(3).u32(159744).b)
@@ -1327,6 +1330,42 @@ def scenario_clientresync(lst, args):
     r = link.request(PING, p_ping(rq(), 80))
     c.check(r["name"] == "PONG" and r["clock"] == 80, "the server still ticks (Ping -> Pong)")
     return c.summary("clientresync")
+
+
+def scenario_cpteam(lst, args):
+    """SetControlPointTeam (docs/admin-channel.md "Command semantics"): Welcome capability bit 7, Error 5 and 7, and
+    every control point set to the team it has: Ok, and the next Snapshot shows the same teams. The server log has a
+    "control point ... team N -> N" line per point. Run it where nobody plays: it touches every control point."""
+    c = Checks()
+    link = lst.accept(args.accept_timeout)
+    rq = link.next_request
+    caps = link.welcome["caps"]
+    c.check(caps & CAP_RESYNC_CLIENT, "Welcome capability bit 7 (ResyncClient, SetControlPointTeam) is set: caps %d" % caps)
+    cps = link.snapshot["cps"]
+    c.check(len(cps) > 0, "the snapshot has %d control points" % len(cps))
+    r = link.request(CMD_SET_CONTROL_POINT_TEAM, p_set_control_point_team(rq(), REF_CONSOLE, 0x7FFFFFF0, 1))
+    c.check(r["name"] == "ERROR" and r["code"] == ERR_UNAVAILABLE, "SetControlPointTeam of an unknown console id -> Error 5")
+    others = [v for v in link.snapshot["vehicles"] if v.get("obj")]
+    if others:
+        r = link.request(CMD_SET_CONTROL_POINT_TEAM, p_set_control_point_team(rq(), REF_CONSOLE, others[0]["obj"], 1))
+        c.check(r["name"] == "ERROR" and r["code"] == ERR_UNAVAILABLE,
+                "SetControlPointTeam of a vehicle (%s) -> Error 5 (%s)" % (others[0].get("template"), r.get("message")))
+    if cps:
+        r = link.request(CMD_SET_CONTROL_POINT_TEAM, p_set_control_point_team(rq(), REF_CONSOLE, cps[0]["obj"], 3))
+        c.check(r["name"] == "ERROR" and r["code"] == ERR_INVALID, "SetControlPointTeam team 3 -> Error 7")
+        r = link.request(CMD_SET_CONTROL_POINT_TEAM, p_set_control_point_team(rq(), REF_PLAYER, 0, 1))
+        c.check(r["name"] == "ERROR" and r["code"] == ERR_INVALID, "SetControlPointTeam of a player reference -> Error 7")
+    for cp in cps:
+        r = link.request(CMD_SET_CONTROL_POINT_TEAM, p_set_control_point_team(rq(), REF_CONSOLE, cp["obj"], cp["team"]))
+        c.check(r["name"] == "OK", "SetControlPointTeam %s (console id %d) to its team %d -> %s %s" % (
+            cp["template"], cp["obj"], cp["team"], r["name"], r.get("message", "")))
+    s = link.request(REQUEST_SNAPSHOT, W().u32(rq()).b, timeout=10)
+    before = {cp["obj"]: cp["team"] for cp in cps}
+    after = {cp["obj"]: cp["team"] for cp in s["cps"]}
+    c.check(before == after, "the control points' teams are unchanged: %s" % after)
+    r = link.request(PING, p_ping(rq(), 81))
+    c.check(r["name"] == "PONG" and r["clock"] == 81, "the server still ticks (Ping -> Pong)")
+    return c.summary("cpteam")
 
 
 def scenario_collision(lst, args):
@@ -2657,7 +2696,7 @@ def main():
     ap.add_argument("--scenario", default="listen",
                     choices=["listen", "commands", "resync", "stall", "soak", "wrongkey", "wrongpin", "mapchange", "extras",
                              "viewer", "replay", "vote", "r7", "script", "runscript", "scriptends", "seat",
-                             "collision", "health", "clientresync"])
+                             "collision", "health", "clientresync", "cpteam"])
     ap.add_argument("--fuzz", action="store_true")
     ap.add_argument("--fuzz-rounds", type=int, default=24)
     ap.add_argument("--seed", type=int, default=1)
@@ -2718,7 +2757,7 @@ def main():
                 "vote": scenario_vote, "r7": scenario_r7, "script": scenario_script,
                 "runscript": scenario_runscript, "scriptends": scenario_scriptends,
                 "seat": scenario_seat, "collision": scenario_collision, "clientresync": scenario_clientresync,
-                "health": scenario_health}[args.scenario](lst, args)
+                "cpteam": scenario_cpteam, "health": scenario_health}[args.scenario](lst, args)
     except KeyboardInterrupt:
         return 130
 
