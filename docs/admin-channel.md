@@ -296,7 +296,7 @@ Capability bits:
 | 4 | the module accepts `SeatPreference` ([Seat preferences](#seat-preferences)) |
 | 5 | the module accepts `SetCollision` ([Command semantics](#command-semantics)) |
 | 6 | the module has stream 21, `ServerHealth` and `PlayerConnections` ([Server health](#server-health)) |
-| 7 | the module accepts `ResyncClient` ([Client resync](#client-resync)) and `SetControlPointTeam` ([Command semantics](#command-semantics); draft, not approved) |
+| 7 | the module accepts `ResyncClient` ([Client resync](#client-resync)) and `SetControlPointTeam` ([Command semantics](#command-semantics)) |
 
 ### Keepalive
 
@@ -892,7 +892,7 @@ Common rules:
   vote is running.
 - **HudEventRaw, RoundClock, SquadOrder**: [Client presentation commands](#client-presentation-commands).
 - **ResyncClient**: [Client resync](#client-resync). Sent only when capability bit 7 is set.
-- **SetControlPointTeam** (draft, not approved): `IControlPoint::setTeam(team)` on the control point
+- **SetControlPointTeam**: `IControlPoint::setTeam(team)` on the control point
   (`Game/Objects/IControlPoint.h:22`). Sent only when capability bit 7 is set. An object that is not a control point
   is `Error` 5, a team above 2 `Error` 7.
   - On the server the engine gives the team to every spawn group and object spawner of the point's
@@ -973,8 +973,6 @@ state stays consistent and members get the retail HUD notices. Order ids: 0 arti
 exists while it has members; a squad without members is `Error` 6.
 
 ## Client resync
-
-**Draft: not yet approved by the maintainer.**
 
 `ResyncClient` makes a client drop every dynamic object it holds and build them again from the server, without a
 round restart. Nobody dies on the server, no vehicle respawns and no score changes.
@@ -1523,7 +1521,7 @@ and a separate adapter object, so no retail vtable or layout changes. Every addi
 | | Getters: `getServerInfo`, `getRoundInfo`, `getTeamName`, `getCdKeyHash`, `getDisconnectReason`, `getMapList`, `getGameStatus`, `getBeginRoundState`, `getTimeToNextStateChange`, `getLagCompensation` | `Welcome`, `GameState`, `PlayerInfo`, `PlayerState`, `PlayerDisconnect` |
 | | Actions: `runMapListEntry`, `restartRound`, `sendGameLogicEvent`, `sendHudEvent`, `sendMedalEvent`, `setRank`, `killPlayer` | `Map`, `GameEvent`, `HudEvent`, `Medal`, `Rank`, `KillPlayer` |
 | R7 | Client presentation: `sendHudEventRaw`, `sendRoundClock`, `issueSquadOrder` | `HudEventRaw`, `RoundClock`, `SquadOrder` |
-| R8 | Client resync: `resyncClient`, `resyncClientStatics` | `ResyncClient` (draft) |
+| R8 | Client resync: `resyncClient`, `resyncClientStatics` | `ResyncClient` |
 
 **R4, the script-event observer.**
 
@@ -1541,7 +1539,7 @@ refuses an id outside the whitelist and a size above 52. The module checks the s
 `HudEventRaw`. A module that calls these methods must never be loaded into an engine built without them, as with
 every appended method.
 
-**R8, the client resync** (draft). `resyncClient` and `resyncClientStatics` are in the extension's own code. They
+**R8, the client resync**. `resyncClient` and `resyncClientStatics` are in the extension's own code. They
 use what the retail server already has: the reset event and connection reset of a round restart, and the join
 database. Two things are new:
 
