@@ -217,7 +217,7 @@ closes the link, so:
 - commands without a capability bit (`StartVote`, `CancelVote`, `HudEventRaw`, `RoundClock`, `SquadOrder`) and the
   current structure layouts need a module that has them. Module and client are deployed together;
 - `Welcome`'s capability byte has no free bit left. A client learns that a module has stream 22 and
-  `StartClientVote` from its `Ok` to `Subscribe` stream 22 (draft, not approved): an older module answers `Error` 7
+  `StartClientVote` from its `Ok` to `Subscribe` stream 22: an older module answers `Error` 7
   (unknown stream) and keeps the link. The client sends `StartClientVote` only after that `Ok`.
 
 ## Session
@@ -508,7 +508,7 @@ cleared wreck, or a vehicle waiting for its spawner).
 | 19 | `Weapons` events | none |
 | 20 | `ProjectileCollision` and `ProjectileTrace` events | at least one projectile template |
 | 21 | `ServerHealth` and `PlayerConnections` events | none |
-| 22 | `VoteBallot` events (draft, not approved) | none |
+| 22 | `VoteBallot` events | none |
 
 - Streams 1 to 5 are state streams with a rate. The module sends a frame every `round(30 / rate)` ticks.
 - Streams 16 to 20 switch on event types that are off by default because of their volume. Every hit is one
@@ -575,7 +575,7 @@ engine's script event with that id.
 | `0x121D` | ScriptEvent | `u32` instance, `u8` kind (1 data: JSON text, 2 a log line), string payload (at most 8192 bytes) | [Scripts](#scripts) |
 | `0x121E` | ServerHealth | [Server health](#server-health); only while subscribed (stream 21) | the module's tick hook, the main thread's clocks and the host's `/proc` |
 | `0x121F` | PlayerConnections | [Server health](#server-health); only while subscribed (stream 21) | the engine's per-connection statistics |
-| `0x1220` | VoteBallot | `u32` request id of the vote, `u8` player, `u8` choice (1 yes, 2 no, 0 the ballot no longer counts); only while subscribed (stream 22; draft, not approved) | [Server votes](#server-votes) |
+| `0x1220` | VoteBallot | `u32` request id of the vote, `u8` player, `u8` choice (1 yes, 2 no, 0 the ballot no longer counts); only while subscribed (stream 22) | [Server votes](#server-votes) |
 
 Notes on single events:
 
@@ -897,7 +897,7 @@ Common rules:
   resynced or the round restarts ([Client resync](#client-resync)).
 - **StartVote, StartClientVote, CancelVote**: [Server votes](#server-votes). `StartVote` and `StartClientVote` are
   `Error` 6 when a vote is running or no human player can vote, and `Error` 5 when the module cannot listen for
-  ballots. `CancelVote` is `Error` 6 when no vote is running. `StartClientVote` (draft, not approved) is sent only to a
+  ballots. `CancelVote` is `Error` 6 when no vote is running. `StartClientVote` is sent only to a
   module that answered `Ok` to `Subscribe` stream 22; a player listed twice is `Error` 7.
 - **HudEventRaw, RoundClock, SquadOrder**: [Client presentation commands](#client-presentation-commands).
 - **ResyncClient**: [Client resync](#client-resync). Sent only when capability bit 7 is set.
@@ -1110,8 +1110,6 @@ A yes/no vote on any question, run by the module with no engine change. One vote
 
 ### Ballot events
 
-Draft, not approved.
-
 While stream 22 is subscribed, the module sends `VoteBallot` for every vote, `StartVote`'s too:
 
 - choice 1 or 2 when a voter's answer counts: the first one and every change;
@@ -1123,8 +1121,6 @@ A ballot is reported on the tick after the key press, with the voter's "you vote
 count; a client that adds up the `VoteBallot` events gets the same numbers.
 
 ### Votes the client decides
-
-Draft, not approved.
 
 `StartClientVote` starts a vote whose result the client works out from the `VoteBallot` events, by its own rules,
 and announces itself. The players see the same question and "you voted" lines as with `StartVote`.
