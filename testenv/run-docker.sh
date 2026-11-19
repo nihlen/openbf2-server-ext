@@ -17,13 +17,16 @@
 #   GAMESPY_PORT  29903   published udp
 #   RCON_PORT     4723    published on 127.0.0.1, container side is ModManager's 4711
 #   RCON_PASSWORD         random if unset; read it back with `status`
-#   PUBLISH_IP    host address for the game/gamespy ports (default: all interfaces). 127.0.0.1 keeps
+#   PUBLISH_IP    host address for the game/gamespy ports (default: 0.0.0.0, all interfaces). 127.0.0.1 keeps
 #                 them off the LAN; a client on the same machine still joins.
 #   EXTRA_ARGS    more `docker run` arguments
+#   CONTAINER_CLI docker (default), or wslc for WSL containers (from Git Bash): see cli.sh
 # Only containers/images named $TESTENV_NAME are touched.
 set -euo pipefail
 CMD=${1:?usage: run-docker.sh build|start|stop|status|logs|rm}
 HERE=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=cli.sh
+. "$HERE/cli.sh"
 BIN_DIR=${BIN_DIR:-$HOME/bf2-linux-serverext-testenv-bullseye/build/bin_linux}
 TESTENV_NAME=${TESTENV_NAME:-serverext-testenv}
 GAME_PORT=${GAME_PORT:-16571}
@@ -32,7 +35,8 @@ RCON_PORT=${RCON_PORT:-4723}
 MODULE_DIR=${MODULE_DIR:-$HOME/bf2-linux-serverext-testenv-bullseye/module}
 BOT_PORT=${BOT_PORT:-16702}
 WATCHDOG_TICKS=${WATCHDOG_TICKS:-6}
-PUBLISH_IP=${PUBLISH_IP:+$PUBLISH_IP:}
+# Explicit, because wslc publishes on 127.0.0.1 unless told otherwise
+PUBLISH_IP=${PUBLISH_IP:-0.0.0.0}:
 
 for p in "$GAME_PORT" "$GAMESPY_PORT" "$RCON_PORT" "$BOT_PORT"; do
     case "$p" in 16567|16569|29900|29901|4711|4721) echo "refusing reserved port $p" >&2; exit 1;; esac
@@ -49,10 +53,10 @@ build)
     printf '# openbf2-server-ext bot channel (docs/protocol.md)\nbotListen 0.0.0.0:%s\nwatchdogTicks %s\n' \
         "$BOT_PORT" "$WATCHDOG_TICKS" > "$ctx/serverext.cfg"
     md5sum "$ctx/bf2" "$ctx/libdice_py.so" "$ctx/libserverext.so"
-    docker build --build-arg BASE="${BASE:?set BASE to a BF2 server image}" -t "$TESTENV_NAME:latest" "$ctx"
+    "$CLI" build --build-arg BASE="${BASE:?set BASE to a BF2 server image}" -t "$TESTENV_NAME:latest" "$ctx"
     ;;
 start)
-    docker run -d --name "$TESTENV_NAME" \
+    "$CLI" run -d --name "$TESTENV_NAME" \
         -e ENV_SERVER_NAME="serverext test" \
         -e ENV_MAX_PLAYERS=16 \
         -e ENV_SERVER_PORT="$GAME_PORT" \
@@ -68,23 +72,23 @@ start)
         ${EXTRA_ARGS:-} \
         "$TESTENV_NAME:latest"
     ;;
-stop) docker stop -t 15 "$TESTENV_NAME" ;;
-rm)   docker rm -f "$TESTENV_NAME" ;;
+stop) "$CLI" stop -t 15 "$TESTENV_NAME" ;;
+rm)   "$CLI" rm -f "$TESTENV_NAME" ;;
 status)
-    docker ps -a --filter "name=^/$TESTENV_NAME\$" --format '{{.Names}}  {{.Status}}  {{.Ports}}'
-    docker top "$TESTENV_NAME" -o pid,etime,time,rss,args | grep -E 'PID|bin/amd-64/bf2' || true
+    "$CLI" ps -a --filter "name=^$TESTENV_NAME\$"
+    procs "$TESTENV_NAME" | grep -E 'PID|bin/amd-64/bf2' || true
     # bound UDP sockets, matched by hex port in /proc/net/udp (the image has no ss/netstat)
     for p in "$GAME_PORT" "$GAMESPY_PORT"; do
         hex=$(printf '%04X' "$p")
-        docker exec "$TESTENV_NAME" grep -q ":$hex " /proc/net/udp && echo "udp $p bound" || echo "udp $p NOT bound"
+        "$CLI" exec "$TESTENV_NAME" grep -q ":$hex " /proc/net/udp && echo "udp $p bound" || echo "udp $p NOT bound"
     done
-    docker exec "$TESTENV_NAME" grep '^mm_rcon.rconPassword' /home/bf2/srv/mods/bf2/settings/modmanager.con || true
-    docker exec "$TESTENV_NAME" sh -c 'cat /home/bf2/srv/mods/bf2/openbf2.con /home/bf2/srv/serverext.cfg' || true
-    docker logs "$TESTENV_NAME" 2>&1 | grep -a '\[serverext\] loaded\|refusing to load\|could not load' || true
+    "$CLI" exec "$TESTENV_NAME" grep '^mm_rcon.rconPassword' /home/bf2/srv/mods/bf2/settings/modmanager.con || true
+    "$CLI" exec "$TESTENV_NAME" sh -c 'cat /home/bf2/srv/mods/bf2/openbf2.con /home/bf2/srv/serverext.cfg' || true
+    "$CLI" logs "$TESTENV_NAME" 2>&1 | grep -a '\[serverext\] loaded\|refusing to load\|could not load' || true
     ;;
 logs)
-    docker logs --tail 50 "$TESTENV_NAME" 2>&1
-    docker exec "$TESTENV_NAME" sh -c 'tail -c 3000 /volume/bf2.log' | sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g' | tr -s '\n' || true
+    "$CLI" logs --tail 50 "$TESTENV_NAME" 2>&1
+    "$CLI" exec "$TESTENV_NAME" sh -c 'tail -c 3000 /volume/bf2.log' | sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g' | tr -s '\n' || true
     ;;
 *) echo "unknown command $CMD" >&2; exit 2 ;;
 esac

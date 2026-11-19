@@ -12,7 +12,7 @@
 # symbol version and NEEDED libraries. It holds nothing about the machine or how the script was called, so the same
 # commits give the same zip (checked: a clean and an incremental build gave identical binaries).
 #
-# Usage (Git Bash on Windows with Docker Desktop, or Linux with Docker):
+# Usage (Git Bash on Windows with Docker Desktop or WSL containers (CONTAINER_CLI=wslc), or Linux with Docker):
 #   release/build.sh
 #
 # Environment (optional):
@@ -32,6 +32,9 @@
 # serverext-release-builder:jammy (release/Dockerfile). Run one build at a time.
 set -euo pipefail
 export MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*'
+# The container CLI: docker, or wslc (WSL containers) with CONTAINER_CLI=wslc. Only commands and options both
+# have (no build -q, no --format templates)
+CLI=${CONTAINER_CLI:-docker}
 
 # Native Windows tools (git, docker) need C:/... paths: pwd -W in Git Bash (path conversion is off above)
 abspath() { (cd "$1" && { pwd -W 2>/dev/null || pwd; }); }
@@ -52,7 +55,7 @@ BUILDER=serverext-release-builder:jammy
 VOLUME=serverext-release-build
 CONTAINER=serverext-release-build
 
-if [ -n "$(docker ps -q --filter "name=^$CONTAINER\$")" ]; then
+if [ -n "$("$CLI" ps -q --filter "name=^$CONTAINER\$")" ]; then
     echo "a release build is already running (container $CONTAINER)" >&2
     exit 1
 fi
@@ -83,21 +86,22 @@ for r in "$OPENBF2_REPO" "$MODULE_REPO" "$BF2HUB_REPO"; do
 done
 
 # 2. The builder image.
-docker build -q -t "$BUILDER" "$HERE" >/dev/null
+"$CLI" build --progress quiet -t "$BUILDER" "$HERE" >/dev/null
 BUILDER_IMAGE="release/Dockerfile from $(sed -n 's/^FROM //p' "$HERE/Dockerfile")"
 
 # 3. Sources -> volume, synced by content.
-docker volume create "$VOLUME" >/dev/null
+# wslc refuses to create a volume that exists, docker does nothing
+"$CLI" volume inspect "$VOLUME" >/dev/null 2>&1 || "$CLI" volume create "$VOLUME" >/dev/null
 if [ "$CLEAN" = 1 ]; then
-    docker run --rm -v "$VOLUME:/w" "$BUILDER" rm -rf /w/build
+    "$CLI" run --rm -v "$VOLUME:/w" "$BUILDER" rm -rf /w/build
 fi
 stream() { # name repo sha
-    if [ "$(docker run --rm -v "$VOLUME:/w" "$BUILDER" cat "/w/src/$1.rev" 2>/dev/null)" = "$3" ]; then
+    if [ "$("$CLI" run --rm -v "$VOLUME:/w" "$BUILDER" cat "/w/src/$1.rev" 2>/dev/null)" = "$3" ]; then
         echo "$1: $3 already in $VOLUME"
         return
     fi
     echo "$1: syncing $3"
-    git -C "$2" archive --format=tar "$3" | docker run -i --rm -v "$VOLUME:/w" "$BUILDER" sh -ec "
+    git -C "$2" archive --format=tar "$3" | "$CLI" run -i --rm -v "$VOLUME:/w" "$BUILDER" sh -ec "
         rm -rf /w/new/$1 && mkdir -p /w/new/$1 /w/src/$1 && tar x -C /w/new/$1
         rsync -rlc --delete /w/new/$1/ /w/src/$1/
         rm -rf /w/new/$1 && echo $3 > /w/src/$1.rev"
@@ -108,7 +112,7 @@ stream bf2hub "$BF2HUB_REPO" "$BF2HUB_SHA"
 
 # 4. Build, test and package inside the volume.
 mkdir -p "$OUT"
-docker run --rm --name "$CONTAINER" -v "$VOLUME:/w" \
+"$CLI" run --rm --name "$CONTAINER" -v "$VOLUME:/w" \
     -e NAME="$NAME" -e OPENBF2_SHA="$OPENBF2_SHA" -e MODULE_SHA="$MODULE_SHA" -e BF2HUB_SHA="$BF2HUB_SHA" \
     -e OPENBF2_SOURCE -e MODULE_SOURCE -e BF2HUB_SOURCE -e SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
     -e BUILDER_IMAGE="$BUILDER_IMAGE" -e JOBS="$JOBS" -e STRIP="$STRIP" -e GAMESPY_DOMAIN="$GAMESPY_DOMAIN" \
@@ -116,7 +120,7 @@ docker run --rm --name "$CONTAINER" -v "$VOLUME:/w" \
 
 # 5. Outputs -> OUT
 rm -f "$OUT/$NAME.zip" "$OUT/$NAME.zip.sha512" "$OUT/$NAME-debug.tar.gz"
-docker run --rm -v "$VOLUME:/w" "$BUILDER" tar c -C /w/out . | tar x -C "$OUT"
+"$CLI" run --rm -v "$VOLUME:/w" "$BUILDER" tar c -C /w/out . | tar x -C "$OUT"
 echo
 echo "built $OUT/$NAME.zip"
 cat "$OUT/$NAME.zip.sha512"
