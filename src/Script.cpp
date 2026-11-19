@@ -921,6 +921,17 @@ private:
         return JS_NewBool(ctx, angular ? s->m_world->setObjectAngularVelocity(n, v) : s->m_world->setObjectVelocity(n, v));
     }
 
+    static JSValue jsActivateProjectile(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+    {
+        Script* s = self(ctx);
+        int id = 0;
+        if (!argId(ctx, argc >= 1 ? argv[0] : JS_UNDEFINED, "the networkable id", id))
+            return JS_EXCEPTION;
+        if (!validNetId(id))
+            return JS_FALSE;
+        return JS_NewBool(ctx, s->m_world->activateProjectile(static_cast<uint32_t>(id)));
+    }
+
     static JSValue jsSay(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
     {
         Script* s = self(ctx);
@@ -997,6 +1008,7 @@ private:
         ok = ok && defineFn(game, "teleportObject", &Script::jsTeleportObject, 3);
         ok = ok && defineMagic(game, "setObjectVelocity", &Script::jsSetObjectSpeed, 2, 0);
         ok = ok && defineMagic(game, "setObjectAngularVelocity", &Script::jsSetObjectSpeed, 2, 1);
+        ok = ok && defineFn(game, "activateProjectile", &Script::jsActivateProjectile, 1);
         ok = ok && defineFn(game, "say", &Script::jsSay, 2);
         ok = ok && JS_FreezeObject(m_ctx, script) >= 0 && JS_FreezeObject(m_ctx, game) >= 0;
 

@@ -155,6 +155,14 @@ public:
     }
     virtual bool setObjectVelocity(uint32_t netId, const float v[3]) { return objectSpeed(netId, v, false); }
     virtual bool setObjectAngularVelocity(uint32_t netId, const float v[3]) { return objectSpeed(netId, v, true); }
+    std::vector<uint32_t> activated;
+    virtual bool activateProjectile(uint32_t netId)
+    {
+        if (!objects.count(netId) || objects[netId].templ.find("hellfire") == std::string::npos)
+            return false;
+        activated.push_back(netId);
+        return true;
+    }
     virtual void say(const std::string& text, int player)
     {
         says.push_back(std::make_pair(text, player));
@@ -985,6 +993,21 @@ void testObjectApi()
         CHECK(f.world.speeds[0].id == -2065 && !f.world.speeds[0].angular && f.world.speeds[0].v[1] == 2.5f);
         CHECK(f.world.speeds[1].angular && f.world.speeds[1].v[2] == 1.25f);
     }
+
+    // game.activateProjectile: true only for a projectile; a bad id type throws.
+    Fixture g;
+    ObjectView missile;
+    missile.id = 1852;
+    missile.templ = "agm114_hellfire_tv";
+    g.world.objects[1852] = missile;
+    g.world.objects[2065] = heli;
+    CHECK(g.start(1,
+        "function tried(fn) { try { fn(); return 'ok'; } catch (e) { return e.name; } }\n"
+        "script.emit([game.activateProjectile(1852), game.activateProjectile(2065), game.activateProjectile(0),\n"
+        "  game.activateProjectile(70000), tried(() => game.activateProjectile('1852')), tried(() => game.activateProjectile())]);\n",
+        "", "activate") == Ok);
+    CHECK(g.world.events.size() == 1 && g.world.events[0].payload == "[true,false,false,false,\"TypeError\",\"TypeError\"]");
+    CHECK(g.world.activated.size() == 1 && g.world.activated[0] == 1852);
 }
 
 // ---------------------------------------------------------------- handlers and order

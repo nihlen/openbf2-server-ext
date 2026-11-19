@@ -1350,6 +1350,7 @@ sees these members too.
 | `game.teleportObject(id, position, rotation)` | as `game.teleport`, on the object. Returns `false` for no such object |
 | `game.setObjectVelocity(id, velocity)` | as `game.setVelocity`, on the object. Returns `false` for no such object or one without a physics node |
 | `game.setObjectAngularVelocity(id, velocity)` | as `game.setAngularVelocity`, on the object. Returns as `setObjectVelocity` |
+| `game.activateProjectile(id)` | starts the flight effects (trail, looping sound) of a projectile on every client, not on the server ([R9](#engine-interface)). For a projectile that `SpawnObject` made, which a script then moves with `game.teleportObject`: on the server it stays inert, with no flight, collision, damage or time to live. Returns `false` when the id names no projectile. A client that connects later sees the projectile without its effects |
 
 - An empty vehicle falls under gravity. Held by `game.teleportObject` every tick it stays at the pose (measured on a
   test server: an empty AH-1Z 60 m above ground, read back with `game.object`, was at the wanted position to the
@@ -1590,6 +1591,7 @@ and a separate adapter object, so no retail vtable or layout changes. Every addi
 | | Actions: `runMapListEntry`, `restartRound`, `sendGameLogicEvent`, `sendHudEvent`, `sendMedalEvent`, `setRank`, `killPlayer` | `Map`, `GameEvent`, `HudEvent`, `Medal`, `Rank`, `KillPlayer` |
 | R7 | Client presentation: `sendHudEventRaw`, `sendRoundClock`, `issueSquadOrder` | `HudEventRaw`, `RoundClock`, `SquadOrder` |
 | R8 | Client resync: `resyncClient`, `resyncClientStatics` | `ResyncClient` |
+| R9 | Projectile replay (draft, not approved): `activateProjectileOnClients` | the script member `game.activateProjectile` ([Host API, version 2](#host-api-version-2)) |
 
 **R4, the script-event observer.**
 
@@ -1616,6 +1618,16 @@ database. Two things are new:
   resync it can send the part without the static ghosts, or a slice of the static ghosts by networkable id.
 - The last event of the replay is a `PostRemoteEvent` subclass that sets the connection's reset latch when the
   client acknowledges it (`GameServer::confirmReset`). On the wire it is an ordinary game-status event.
+
+**R9, the projectile replay** (draft, not approved). `activateProjectileOnClients(netId)` sends the
+`MissileInitEvent` a launch sends (`GenericProjectile::sendMissileInitEvent`,
+`Game/Objects/Projectiles/GenericProjectile.cpp:1449-1497`) for a projectile the server holds, naming a player id no
+player has. The client's `MissileInitEvent::executeClient` activates its copy before it looks the player up and
+returns when there is none (`Game/GameEvents/MissileInitEvent.cpp:90-95`), so the trail and the looping sound start
+and no launcher, owner or camera is set. A client never detonates a networked projectile on its own
+(`GenericProjectile.cpp:1052-1053`). The server's projectile is not activated: it does not move, collide or expire
+(`GenericProjectile.cpp:572-573`, `958-959`). The method refuses a networkable id that is not a projectile, because
+a client that holds a non-projectile under it would abort. It lives in the extension's own code.
 
 Everything else the commands need has a typed path and no engine change: the console, chat, kick, object templates
 and the object manager, armour, transforms and physics, score fields and teams. `Ban` runs through the console,

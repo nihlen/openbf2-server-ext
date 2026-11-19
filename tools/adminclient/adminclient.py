@@ -2023,6 +2023,26 @@ def scenario_scriptobjects(lst, args):
     c.check(bool(after) and after[0]["pos"][1] > p0[1] + 4.5,
             "game.setObjectVelocity [0, 6, 0] at the end moved it up: y %.2f, held at %.2f" % (
                 after[0]["pos"][1] if after else 0, p0[1] + 4))
+    # game.activateProjectile (engine R9): a spawned TV missile is activated on the clients, a helicopter is no
+    # projectile; the server's missile stays inert, held by teleportObject past its 3.5 s time to live.
+    pm = [p0[0] - 80, p0[1] + 20, p0[2]]
+    r = link.request(CMD_SPAWN_OBJECT, p_spawn(rq(), "agm114_hellfire_tv", pm, (90.0, 0.0, 0.0), 0))
+    if c.check(r["name"] == "OBJECT_SPAWNED" and r["net"], "SpawnObject agm114_hellfire_tv -> net id %s" % r.get("net")):
+        missile = r
+        src = ("const { m, h, p } = script.args; let n = 0;\n"
+               "script.emit([game.activateProjectile(m), game.activateProjectile(h), game.activateProjectile(60000)]);\n"
+               "script.onTick(() => { n++; game.teleportObject(m, [p[0] + n, p[1], p[2]], [90, 0, 0]);\n"
+               "  if (n === 150) { const o = game.object(m); script.finish({ x: o && o.position[0] - p[0] }); } });\n")
+        r = link.request(CMD_START_SCRIPT, p_start_script(rq(), 10, "activate", src,
+                                                          json.dumps({"m": missile["net"], "h": net, "p": pm}), 2))
+        fin = wait_finished(link, 10, 10.0)
+        evs = [json.loads(e["payload"]) for e in script_events(link, 10) if e["kind"] == 1]
+        c.check(r["name"] == "OK" and evs == [[True, False, False]],
+                "game.activateProjectile: true for the missile, false for the helicopter and an unused id: %s" % evs)
+        c.check(fin is not None and fin["reason"] == 1 and json.loads(fin["result"] or "{}").get("x") == 150,
+                "the inert missile is still there after 5 s, moved 150 m by teleportObject: %s" % (fin and fin["result"],))
+        r = link.request(CMD_DELETE_OBJECT, p_object_ref(rq(), REF_CONSOLE, missile["obj"]))
+        c.check(r["name"] == "OK", "DeleteObject of the missile -> %s" % r["name"])
     r = link.request(CMD_DELETE_OBJECT, p_object_ref(rq(), REF_CONSOLE, obj))
     c.check(r["name"] == "OK", "DeleteObject of the helicopter -> %s" % r["name"])
     return c.summary("scriptobjects")

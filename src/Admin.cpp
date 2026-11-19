@@ -2472,6 +2472,10 @@ private:
     virtual bool setVelocity(int id, const float v[3]) { return setSpeed(scriptRoot(id), v, false); }
     virtual bool setAngularVelocity(int id, const float v[3]) { return setSpeed(scriptRoot(id), v, true); }
     virtual bool setObjectVelocity(uint32_t netId, const float v[3]) { return setSpeed(scriptObjectRoot(netId), v, false); }
+    virtual bool activateProjectile(uint32_t netId)
+    {
+        return netId && netId <= 0xFFFF && m_ext->activateProjectileOnClients(static_cast<unsigned short>(netId));
+    }
     virtual bool setObjectAngularVelocity(uint32_t netId, const float v[3])
     {
         return setSpeed(scriptObjectRoot(netId), v, true);

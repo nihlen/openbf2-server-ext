@@ -92,6 +92,9 @@ public:
     virtual bool teleportObject(uint32_t netId, const float* pos, const float* rot) = 0;
     virtual bool setObjectVelocity(uint32_t netId, const float v[3]) = 0;
     virtual bool setObjectAngularVelocity(uint32_t netId, const float v[3]) = 0;
+    // API 2: starts a projectile's flight effects on the clients only (engine R9). @return False when the
+    // id names no projectile.
+    virtual bool activateProjectile(uint32_t netId) = 0;
     // To everyone (player -1) or to one player; text is UTF-8 without control bytes, at most kMaxSayBytes.
     virtual void say(const std::string& text, int player) = 0;
     virtual std::string map() = 0;
