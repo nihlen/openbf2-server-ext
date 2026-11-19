@@ -22,6 +22,13 @@ PlayerView::PlayerView()
         pos[i] = rot[i] = vel[i] = 0.0f;
 }
 
+ObjectView::ObjectView()
+    : id(0)
+{
+    for (int i = 0; i < 3; ++i)
+        pos[i] = rot[i] = vel[i] = 0.0f;
+}
+
 uint64_t threadCpuMicros()
 {
     timespec ts;
@@ -528,7 +535,25 @@ private:
         return out;
     }
 
-    std::string takeException() { return describeException(m_ctx); }
+    std::string takeException()
+    {
+        // QuickJS throws "out of memory" as an InternalError, but when that error object cannot be made either,
+        // the exception is left null. Near the limit a null exception is taken for that.
+        JSValue e = JS_GetException(m_ctx);
+        const bool null = JS_IsNull(e) || JS_IsUndefined(e) || JS_IsUninitialized(e);
+        JS_Throw(m_ctx, e);
+        if (null)
+        {
+            JSMemoryUsage use;
+            JS_ComputeMemoryUsage(m_rt, &use);
+            if (use.malloc_size > static_cast<int64_t>(kMemoryLimit) - 64 * 1024)
+            {
+                JS_FreeValue(m_ctx, JS_GetException(m_ctx));
+                return "InternalError: out of memory";
+            }
+        }
+        return describeException(m_ctx);
+    }
 
     void failFromException()
     {
@@ -825,6 +850,77 @@ private:
         return JS_NewBool(ctx, angular ? s->m_world->setAngularVelocity(id, v) : s->m_world->setVelocity(id, v));
     }
 
+    // ---- API 2: objects by networkable id
+
+    static bool validNetId(int id) { return id >= 1 && id <= 0xFFFF; }
+
+    static JSValue jsObject(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+    {
+        Script* s = self(ctx);
+        int id = 0;
+        if (!argId(ctx, argc >= 1 ? argv[0] : JS_UNDEFINED, "the networkable id", id))
+            return JS_EXCEPTION;
+        ObjectView v;
+        if (!validNetId(id) || !s->m_world->object(static_cast<uint32_t>(id), v))
+            return JS_NULL;
+        sanitizeUtf8(v.templ);
+        JSValue o = JS_NewObject(ctx);
+        if (JS_IsException(o))
+            return o;
+        const bool ok =
+            set(ctx, o, "id", JS_NewUint32(ctx, v.id)) &&
+            set(ctx, o, "template", JS_NewStringLen(ctx, v.templ.data(), v.templ.size())) &&
+            set(ctx, o, "position", vec3(ctx, v.pos)) &&
+            set(ctx, o, "rotation", vec3(ctx, v.rot)) &&
+            set(ctx, o, "velocity", vec3(ctx, v.vel));
+        if (!ok)
+        {
+            JS_FreeValue(ctx, o);
+            return JS_EXCEPTION;
+        }
+        return o;
+    }
+
+    static JSValue jsTeleportObject(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+    {
+        Script* s = self(ctx);
+        int id = 0;
+        if (!argId(ctx, argc >= 1 ? argv[0] : JS_UNDEFINED, "the networkable id", id))
+            return JS_EXCEPTION;
+        const bool hasPos = argc >= 2 && !isNullish(argv[1]);
+        const bool hasRot = argc >= 3 && !isNullish(argv[2]);
+        if (!hasPos && !hasRot)
+            return JS_ThrowTypeError(ctx, "a position or a rotation is needed");
+        float pos[3], rot[3];
+        if (hasPos)
+        {
+            if (!argVec3(ctx, argv[1], "the position", 10000.0f, pos))
+                return JS_EXCEPTION;
+            if (std::fabs(pos[0]) > 8192.0f || std::fabs(pos[2]) > 8192.0f || pos[1] < -1000.0f)
+                return JS_ThrowRangeError(ctx, "the position is outside the world");
+        }
+        if (hasRot && !argVec3(ctx, argv[2], "the rotation", 1.0e6f, rot))
+            return JS_EXCEPTION;
+        if (!validNetId(id))
+            return JS_FALSE;
+        return JS_NewBool(ctx, s->m_world->teleportObject(static_cast<uint32_t>(id), hasPos ? pos : 0, hasRot ? rot : 0));
+    }
+
+    static JSValue jsSetObjectSpeed(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv, int angular)
+    {
+        Script* s = self(ctx);
+        int id = 0;
+        float v[3];
+        if (!argId(ctx, argc >= 1 ? argv[0] : JS_UNDEFINED, "the networkable id", id) ||
+            !argVec3(ctx, argc >= 2 ? argv[1] : JS_UNDEFINED, angular ? "the angular velocity" : "the velocity",
+                     angular ? kMaxAngularSpeed : kMaxSpeed, v))
+            return JS_EXCEPTION;
+        if (!validNetId(id))
+            return JS_FALSE;
+        const uint32_t n = static_cast<uint32_t>(id);
+        return JS_NewBool(ctx, angular ? s->m_world->setObjectAngularVelocity(n, v) : s->m_world->setObjectVelocity(n, v));
+    }
+
     static JSValue jsSay(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
     {
         Script* s = self(ctx);
@@ -897,6 +993,10 @@ private:
         ok = ok && defineFn(game, "teleport", &Script::jsTeleport, 3);
         ok = ok && defineMagic(game, "setVelocity", &Script::jsSetSpeed, 2, 0);
         ok = ok && defineMagic(game, "setAngularVelocity", &Script::jsSetSpeed, 2, 1);
+        ok = ok && defineFn(game, "object", &Script::jsObject, 1);
+        ok = ok && defineFn(game, "teleportObject", &Script::jsTeleportObject, 3);
+        ok = ok && defineMagic(game, "setObjectVelocity", &Script::jsSetObjectSpeed, 2, 0);
+        ok = ok && defineMagic(game, "setObjectAngularVelocity", &Script::jsSetObjectSpeed, 2, 1);
         ok = ok && defineFn(game, "say", &Script::jsSay, 2);
         ok = ok && JS_FreezeObject(m_ctx, script) >= 0 && JS_FreezeObject(m_ctx, game) >= 0;
 

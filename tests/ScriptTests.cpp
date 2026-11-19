@@ -114,6 +114,47 @@ public:
     }
     virtual bool setVelocity(int id, const float v[3]) { return speed(id, v, false); }
     virtual bool setAngularVelocity(int id, const float v[3]) { return speed(id, v, true); }
+
+    // API 2: objects by networkable id. Teleports and speeds of objects are recorded with id = -netId.
+    std::map<uint32_t, ObjectView> objects;
+    virtual bool object(uint32_t netId, ObjectView& out)
+    {
+        std::map<uint32_t, ObjectView>::iterator it = objects.find(netId);
+        if (it == objects.end())
+            return false;
+        out = it->second;
+        return true;
+    }
+    virtual bool teleportObject(uint32_t netId, const float* pos, const float* rot)
+    {
+        if (!objects.count(netId))
+            return false;
+        Teleport t;
+        t.id = -static_cast<int>(netId);
+        t.hasPos = pos != 0;
+        t.hasRot = rot != 0;
+        for (int i = 0; i < 3; ++i)
+        {
+            t.pos[i] = pos ? pos[i] : 0.0f;
+            t.rot[i] = rot ? rot[i] : 0.0f;
+        }
+        teleports.push_back(t);
+        return true;
+    }
+    bool objectSpeed(uint32_t netId, const float v[3], bool angular)
+    {
+        if (!objects.count(netId))
+            return false;
+        Speed s;
+        s.id = -static_cast<int>(netId);
+        s.angular = angular;
+        for (int i = 0; i < 3; ++i)
+            s.v[i] = v[i];
+        speeds.push_back(s);
+        return true;
+    }
+    virtual bool setObjectVelocity(uint32_t netId, const float v[3]) { return objectSpeed(netId, v, false); }
+    virtual bool setObjectAngularVelocity(uint32_t netId, const float v[3]) { return objectSpeed(netId, v, true); }
     virtual void say(const std::string& text, int player)
     {
         says.push_back(std::make_pair(text, player));
@@ -347,7 +388,11 @@ void testStartErrors()
     CHECK(f.start(1, "script.emit('lost'); throw 1;") == InvalidValue);
     CHECK(f.world.events.empty());
 
-    CHECK(f.host.start(1, 2, "test", "", "1", f.error) == Unavailable && has(f.error, "script API 2"));
+    CHECK(f.host.start(1, 3, "test", "", "1", f.error) == Unavailable && has(f.error, "script API 3"));
+    CHECK(f.host.start(1, 2, "test", "", "1", f.error) == Ok);
+    f.host.settle();
+    CHECK(f.host.stop(1, f.error) == Ok);
+    f.host.settle();
     CHECK(f.host.start(1, 0, "test", "", "1", f.error) == InvalidValue);
     CHECK(f.host.start(0, 1, "test", "", "1", f.error) == InvalidValue);
     CHECK(f.host.start(1, 1, "", "", "1", f.error) == InvalidValue);
@@ -810,7 +855,7 @@ void testHostApi()
     CHECK(f.world.events.size() == 6);
     if (f.world.events.size() == 6)
     {
-        CHECK(f.world.events[0].payload == "[1,\"api\",30,\"dalian_2_v_2\",100,100]");
+        CHECK(f.world.events[0].payload == "[2,\"api\",30,\"dalian_2_v_2\",100,100]");
         CHECK(f.world.events[1].payload == "[3,255]");
         CHECK(f.world.events[2].payload ==
               "{\"id\":3,\"name\":\"Pilot \xC3\xA5\",\"team\":2,\"alive\":true,\"bot\":true,\"seated\":true,\"seat\":1,"
@@ -880,6 +925,66 @@ void testHostApi()
               "\"RangeError\",\"ok\",\"ok\"]");
     }
     CHECK(g.world.teleports.size() == 1 && g.world.speeds.size() == 1);
+}
+
+// API 2: objects by networkable id.
+void testObjectApi()
+{
+    Fixture f;
+    ObjectView heli;
+    heli.id = 2065;
+    heli.templ = "ahe_ah1z";
+    heli.pos[0] = 1.5f; heli.pos[1] = 200.0f; heli.pos[2] = -3.0f;
+    heli.rot[0] = 45.0f;
+    heli.vel[1] = -9.5f;
+    f.world.objects[2065] = heli;
+    CHECK(f.start(1,
+        "script.emit(game.object(2065));\n"
+        "script.emit([game.object(2066), game.object(0), game.object(-1), game.object(65536), game.object(1e9)]);\n"
+        "script.emit([\n"
+        "  game.teleportObject(2065, [1, 2, 3], [10, 20, 30]),\n"
+        "  game.teleportObject(2065, null, [40, 50, 60]),\n"
+        "  game.teleportObject(2066, [1, 2, 3], null),\n"
+        "  game.teleportObject(0, [1, 2, 3], null),\n"
+        "  game.teleportObject(70000, [1, 2, 3], null),\n"
+        "  game.setObjectVelocity(2065, [0, 2.5, 0]),\n"
+        "  game.setObjectAngularVelocity(2065, [0, 0, 1.25]),\n"
+        "  game.setObjectVelocity(2066, [0, 0, 0]),\n"
+        "  game.setObjectAngularVelocity(0, [0, 0, 0]),\n"
+        "]);\n"
+        "function tried(fn) { try { fn(); return 'ok'; } catch (e) { return e.name; } }\n"
+        "script.emit([\n"
+        "  tried(() => game.object('2065')), tried(() => game.object()), tried(() => game.object(1.5)),\n"
+        "  tried(() => game.teleportObject(2065)), tried(() => game.teleportObject(2065, null, null)),\n"
+        "  tried(() => game.teleportObject(2065, [1, 2])), tried(() => game.setObjectVelocity(2065)),\n"
+        "  tried(() => game.setObjectAngularVelocity('x', [0, 0, 0])),\n"
+        "  tried(() => game.teleportObject(2065, [9000, 0, 0])), tried(() => game.teleportObject(2065, [0, NaN, 0])),\n"
+        "  tried(() => game.setObjectVelocity(2065, [0, 1001, 0])), tried(() => game.setObjectAngularVelocity(2065, [0, 101, 0])),\n"
+        "]);\n", "", "objects") == Ok);
+    CHECK(f.world.events.size() == 4);
+    if (f.world.events.size() == 4)
+    {
+        CHECK(f.world.events[0].payload ==
+              "{\"id\":2065,\"template\":\"ahe_ah1z\",\"position\":[1.5,200,-3],\"rotation\":[45,0,0],\"velocity\":[0,-9.5,0]}");
+        CHECK(f.world.events[1].payload == "[null,null,null,null,null]");
+        CHECK(f.world.events[2].payload == "[true,true,false,false,false,true,true,false,false]");
+        CHECK(f.world.events[3].payload ==
+              "[\"TypeError\",\"TypeError\",\"TypeError\",\"TypeError\",\"TypeError\",\"TypeError\",\"TypeError\","
+              "\"TypeError\",\"RangeError\",\"RangeError\",\"RangeError\",\"RangeError\"]");
+    }
+    CHECK(f.world.teleports.size() == 2);
+    if (f.world.teleports.size() == 2)
+    {
+        const Teleport& a = f.world.teleports[0];
+        CHECK(a.id == -2065 && a.hasPos && a.hasRot && a.pos[2] == 3.0f && a.rot[0] == 10.0f);
+        CHECK(!f.world.teleports[1].hasPos && f.world.teleports[1].rot[2] == 60.0f);
+    }
+    CHECK(f.world.speeds.size() == 2);
+    if (f.world.speeds.size() == 2)
+    {
+        CHECK(f.world.speeds[0].id == -2065 && !f.world.speeds[0].angular && f.world.speeds[0].v[1] == 2.5f);
+        CHECK(f.world.speeds[1].angular && f.world.speeds[1].v[2] == 1.25f);
+    }
 }
 
 // ---------------------------------------------------------------- handlers and order
@@ -1050,6 +1155,7 @@ int main()
     testEventLimits();
     testLanguage();
     testHostApi();
+    testObjectApi();
     testHandlersAndOrder();
     testLevelUnloadAndLinkClosed();
     testChurn();

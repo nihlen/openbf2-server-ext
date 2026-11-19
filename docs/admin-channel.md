@@ -1197,8 +1197,8 @@ QuickJS-NG (MIT), vendored at a pinned release under `third_party/quickjs-ng` an
 ### Availability
 
 `Welcome` capability bit 3 is set when `adminAllowScripts` is 1. The client sends the script commands only then.
-`StartScript` names the script API version the script needs. This document describes version 1; a later version
-only adds to the API.
+`StartScript` names the script API version the script needs. This document describes versions 1 and 2 (draft, not
+approved: [Host API, version 2](#host-api-version-2)); a later version only adds to the API.
 
 ### Commands
 
@@ -1334,6 +1334,31 @@ Behaviour of the setters:
 - Neither `game.setAngularVelocity` nor a `game.teleport` rotation turns a soldier: a soldier's facing is its own
   look direction.
 - The setters use `IPhysicsNode::setPositionalSpeed` and `setRotationalSpeed` (`Physics/IPhysicsNode.h:50-51`).
+
+### Host API, version 2
+
+**Draft, not approved.** Version 2 adds objects by networkable id, so a script can hold and move objects that
+`SpawnObject` made (an empty helicopter has no player to name). `script.api` is 2. A script that asks for version 1
+sees these members too.
+
+- A networkable id must be an integer number, else a `TypeError`. One outside 1-65535 is no object.
+- Each member acts on the object's root, as `Teleport` with an `ObjectRef` of kind 2 does.
+
+| Member | Meaning |
+|---|---|
+| `game.object(id)` | `null` for no such object, else `{ id, template, position, rotation, velocity }` of the root object (`id` its networkable id) |
+| `game.teleportObject(id, position, rotation)` | as `game.teleport`, on the object. Returns `false` for no such object |
+| `game.setObjectVelocity(id, velocity)` | as `game.setVelocity`, on the object. Returns `false` for no such object or one without a physics node |
+| `game.setObjectAngularVelocity(id, velocity)` | as `game.setAngularVelocity`, on the object. Returns as `setObjectVelocity` |
+
+- An empty vehicle falls under gravity. Held by `game.teleportObject` every tick it stays at the pose (measured on a
+  test server: an empty AH-1Z 60 m above ground, read back with `game.object`, was at the wanted position to the
+  hundredth of a metre while held and while moved along a path; left alone it fell at 20 m/s after 3 s).
+- What a client sees of a moved object is its ghost: the server sends position and rotation, never the speed, and a
+  helicopter (networkable info `BasicInfo`, linear prediction) is drawn between the received poses. Untested with a
+  game client.
+- A soldier, or a vehicle a player sits in, can be moved this way too. Its client predicts its own body and may show
+  corrections ([Known limitations](#known-limitations)).
 
 ## Seat preferences
 

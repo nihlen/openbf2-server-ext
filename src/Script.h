@@ -19,7 +19,7 @@
 namespace serverext {
 namespace script {
 
-const uint8_t kApiVersion = 1;
+const uint8_t kApiVersion = 2;
 const size_t kMaxScripts = 8;
 const size_t kMaxNameBytes = 64;
 const size_t kMaxSourceBytes = 60000;
@@ -63,6 +63,15 @@ struct PlayerView
     PlayerView();
 };
 
+// What game.object(id) returns (API 2): the root object of a networkable id.
+struct ObjectView
+{
+    uint32_t id;            // the root object's networkable id
+    std::string templ;      // its template, UTF-8
+    float pos[3], rot[3], vel[3];
+    ObjectView();
+};
+
 // The game as a script sees it, and where its output goes. All calls come on the main thread,
 // from inside Host's entry points.
 class World
@@ -77,6 +86,12 @@ public:
     // @return False without a root object or a physics node.
     virtual bool setVelocity(int id, const float v[3]) = 0;
     virtual bool setAngularVelocity(int id, const float v[3]) = 0;
+    // API 2: any object by networkable id (1-65535). Each acts on the object's root, as the Teleport command with an
+    // ObjectRef of kind 2. @return False for no such object (and, for the speeds, without a physics node).
+    virtual bool object(uint32_t netId, ObjectView& out) = 0;
+    virtual bool teleportObject(uint32_t netId, const float* pos, const float* rot) = 0;
+    virtual bool setObjectVelocity(uint32_t netId, const float v[3]) = 0;
+    virtual bool setObjectAngularVelocity(uint32_t netId, const float v[3]) = 0;
     // To everyone (player -1) or to one player; text is UTF-8 without control bytes, at most kMaxSayBytes.
     virtual void say(const std::string& text, int player) = 0;
     virtual std::string map() = 0;

@@ -2400,10 +2400,34 @@ private:
         return rootOfPlayer(p);
     }
 
-    // The body of the Teleport command, without its log line: a script may call it every tick.
-    virtual bool teleport(int id, const float* pos, const float* rot)
+    // The root object of a networkable id for a script's command (API 2), or null.
+    IObject* scriptObjectRoot(uint32_t netId)
     {
-        IObject* root = scriptRoot(id);
+        IObject* o = netId && netId <= 0xFFFF ? m_game->getObjectFromNetworkableId(static_cast<unsigned short>(netId)) : 0;
+        return o ? rootOf(o) : 0;
+    }
+
+    virtual bool teleport(int id, const float* pos, const float* rot) { return teleportRoot(scriptRoot(id), pos, rot); }
+    virtual bool teleportObject(uint32_t netId, const float* pos, const float* rot)
+    {
+        return teleportRoot(scriptObjectRoot(netId), pos, rot);
+    }
+
+    virtual bool object(uint32_t netId, script::ObjectView& out)
+    {
+        IObject* root = scriptObjectRoot(netId);
+        if (!root)
+            return false;
+        out.id = netIdOf(root);
+        out.templ = cp1252ToUtf8(templateName(root));
+        placeOf(root, out.pos, out.rot);
+        velocityOf(root, out.vel);
+        return true;
+    }
+
+    // The body of the Teleport command, without its log line: a script may call it every tick.
+    bool teleportRoot(IObject* root, const float* pos, const float* rot)
+    {
         if (!root)
             return false;
         Mat4 t = root->getAbsoluteTransformation();
@@ -2428,9 +2452,8 @@ private:
         return true;
     }
 
-    bool setSpeed(int id, const float v[3], bool angular)
+    bool setSpeed(IObject* root, const float v[3], bool angular)
     {
-        IObject* root = scriptRoot(id);
         IPhysicsNode* node = root ? static_cast<IPhysicsNode*>(root->queryComponent(IID_IPhysicsNode, IID_IPhysicsNode)) : 0;
         if (!node)
             return false;
@@ -2446,8 +2469,13 @@ private:
         return true;
     }
 
-    virtual bool setVelocity(int id, const float v[3]) { return setSpeed(id, v, false); }
-    virtual bool setAngularVelocity(int id, const float v[3]) { return setSpeed(id, v, true); }
+    virtual bool setVelocity(int id, const float v[3]) { return setSpeed(scriptRoot(id), v, false); }
+    virtual bool setAngularVelocity(int id, const float v[3]) { return setSpeed(scriptRoot(id), v, true); }
+    virtual bool setObjectVelocity(uint32_t netId, const float v[3]) { return setSpeed(scriptObjectRoot(netId), v, false); }
+    virtual bool setObjectAngularVelocity(uint32_t netId, const float v[3])
+    {
+        return setSpeed(scriptObjectRoot(netId), v, true);
+    }
 
     virtual void say(const std::string& text, int playerId)
     {

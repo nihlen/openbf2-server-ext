@@ -1653,7 +1653,7 @@ def scenario_script(lst, args):
     ids = sorted(p["id"] for p in snap["players"])
     c.check(r["name"] == "OK" and fin is not None and fin["reason"] == 1 and fin["result"] == "",
             "a script that finishes in its top-level code: Ok, then ScriptFinished reason 1 with no result")
-    c.check(world.get("api") == 1 and world.get("name") == "world" and world.get("args") is None and
+    c.check(world.get("api") == 2 and world.get("name") == "world" and world.get("args") is None and
             world.get("map") == link.welcome["map"] and world.get("rate") == 30 and sorted(world.get("players", [])) == ids,
             "script.api/name/args, game.map/tickRate/players(): %s (snapshot players %s)" % (world, ids))
     c.check(len(evs) == 2 and evs[1]["kind"] == 2 and evs[1]["payload"] == "hello 1 true", "script.log -> ScriptEvent kind 2 %r" % (evs[1:],))
@@ -1714,8 +1714,8 @@ def scenario_script(lst, args):
             "top-level code that throws -> Error 7: %r" % (r.get("message", "").split("\n")[0],))
     r = start(6, "args", "1;", "{nope}")
     c.check(r["name"] == "ERROR" and r["code"] == ERR_INVALID, "arguments that are not JSON -> Error 7 (%s)" % r.get("message", "").split("\n")[0])
-    r = start(6, "newer", "1;", "", 2)
-    c.check(r["name"] == "ERROR" and r["code"] == ERR_UNAVAILABLE, "script API 2 -> Error 5 (%s)" % r.get("message"))
+    r = start(6, "newer", "1;", "", 3)
+    c.check(r["name"] == "ERROR" and r["code"] == ERR_UNAVAILABLE, "script API 3 -> Error 5 (%s)" % r.get("message"))
     r = start(6, "flags", "1;", "", 1, 1)
     c.check(r["name"] == "ERROR" and r["code"] == ERR_INVALID, "flags 1 -> Error 7")
     r = start(0, "zero", "1;")
@@ -1966,6 +1966,66 @@ def scenario_runscript(lst, args):
         SCRIPT_REASONS.get(fin["reason"], fin["reason"]), fin["calls"], fin["total_us"],
         fin["total_us"] / max(fin["calls"], 1), fin["max_us"], (": " + fin["result"]) if fin["result"] else ""))
     return 0 if fin["reason"] in (1, 2) else 1
+
+
+SCRIPT_OBJECTS_SOURCE = r"""
+const id = script.args.id, p0 = script.args.pos;
+let n = 0;
+script.emit({ api: script.api, first: game.object(id), none: [game.object(0), game.object(65536), game.object(id + 40000)],
+              falses: [game.teleportObject(0, p0, null), game.setObjectVelocity(65536, [0, 0, 0])] });
+script.onTick(() => {
+  n++;
+  let pos = p0, rot = [45, 0, 0];
+  if (n > 30 && n <= 90) { const t = (n - 30) / 30; pos = [p0[0] + 5 * t, p0[1] + 2 * t, p0[2]]; rot = [45 + 10 * t, 5, 0]; }
+  else if (n > 90) pos = [p0[0] + 10, p0[1] + 4, p0[2]], rot = [65, 5, 0];
+  if (n > 120) { game.setObjectVelocity(id, [0, 6, 0]); script.finish({ n }); return; }
+  game.teleportObject(id, pos, rot);
+  if (n % 10 === 0) { const o = game.object(id); script.emit({ n, want: pos, got: o.position, rot: o.rotation }); }
+});
+"""
+
+
+def scenario_scriptobjects(lst, args):
+    """Script API 2 (docs/admin-channel.md "Host API, version 2"): an empty helicopter (--spawn-template) spawned 60 m
+    above the map's first one, held by game.teleportObject every tick for 1 s, moved 10 m east and 4 m up over 2 s, held
+    again for 1 s, then given an upward speed with game.setObjectVelocity; game.object reads it back. No bot needed."""
+    c = Checks()
+    link = lst.accept(args.accept_timeout)
+    rq = link.next_request
+    r = link.request(CMD_LIST_OBJECTS, p_list_objects(rq(), args.spawn_template, 16))
+    roots = [o for o in r.get("objects", []) if not o["flags"] & 1 and abs(o["pos"][0]) + abs(o["pos"][2]) > 1]
+    if not c.check(bool(roots), "the map has a %s" % args.spawn_template):
+        return c.summary("scriptobjects")
+    p0 = [roots[0]["pos"][0] + 40, roots[0]["pos"][1] + 60, roots[0]["pos"][2]]
+    r = link.request(CMD_SPAWN_OBJECT, p_spawn(rq(), args.spawn_template, p0, (45.0, 0.0, 0.0), 2))
+    if not c.check(r["name"] == "OBJECT_SPAWNED" and r["net"], "SpawnObject %s -> %s net id %s" % (args.spawn_template, r["name"], r.get("net"))):
+        return c.summary("scriptobjects")
+    net, obj = r["net"], r["obj"]
+    r = link.request(CMD_START_SCRIPT, p_start_script(rq(), 9, "objects", SCRIPT_OBJECTS_SOURCE,
+                                                      json.dumps({"id": net, "pos": p0}), 2))
+    c.check(r["name"] == "OK", "StartScript with API 2 -> %s %s" % (r["name"], r.get("message", "")))
+    fin = wait_finished(link, 9, 10.0)
+    evs = [json.loads(e["payload"]) for e in script_events(link, 9) if e["kind"] == 1]
+    c.check(fin is not None and fin["reason"] == 1, "the script finished itself: %s" % (fin and fin["result"],))
+    first = evs[0] if evs else {}
+    f = first.get("first") or {}
+    c.check(first.get("api") == 2 and f.get("id") == net and f.get("template", "").lower() == args.spawn_template.lower()
+            and max(abs(a - b) for a, b in zip(f.get("position", [1e9] * 3), p0)) < 0.01,
+            "script.api 2; game.object(%d) is the spawned object at its spawn position: %s" % (net, f))
+    c.check(first.get("none") == [None, None, None] and first.get("falses") == [False, False],
+            "no object for ids 0, 65536 and an unused id; teleportObject and setObjectVelocity return false for them")
+    worst = max((max(abs(a - b) for a, b in zip(e["got"], e["want"])) for e in evs[1:]), default=1e9)
+    c.check(len(evs) == 13 and worst < 0.01,
+            "12 samples while held and moved: the object at the wanted position each time (worst %.4f m)" % worst)
+    link.pump(0.5)
+    r = link.request(CMD_LIST_OBJECTS, p_list_objects(rq(), args.spawn_template, 16))
+    after = [o for o in r.get("objects", []) if o["obj"] == obj]
+    c.check(bool(after) and after[0]["pos"][1] > p0[1] + 4.5,
+            "game.setObjectVelocity [0, 6, 0] at the end moved it up: y %.2f, held at %.2f" % (
+                after[0]["pos"][1] if after else 0, p0[1] + 4))
+    r = link.request(CMD_DELETE_OBJECT, p_object_ref(rq(), REF_CONSOLE, obj))
+    c.check(r["name"] == "OK", "DeleteObject of the helicopter -> %s" % r["name"])
+    return c.summary("scriptobjects")
 
 
 def scenario_scriptends(lst, args):
@@ -2779,7 +2839,7 @@ def main():
     ap.add_argument("--scenario", default="listen",
                     choices=["listen", "commands", "resync", "stall", "soak", "wrongkey", "wrongpin", "mapchange", "extras",
                              "viewer", "replay", "vote", "r7", "script", "runscript", "scriptends", "seat",
-                             "collision", "health", "clientresync", "cpteam", "clientvote"])
+                             "collision", "health", "clientresync", "cpteam", "clientvote", "scriptobjects"])
     ap.add_argument("--fuzz", action="store_true")
     ap.add_argument("--fuzz-rounds", type=int, default=24)
     ap.add_argument("--seed", type=int, default=1)
@@ -2839,7 +2899,7 @@ def main():
                 "wrongpin": scenario_wrongpin, "mapchange": scenario_mapchange,
                 "extras": scenario_extras, "viewer": scenario_viewer, "replay": scenario_replay,
                 "vote": scenario_vote, "r7": scenario_r7, "script": scenario_script,
-                "runscript": scenario_runscript, "scriptends": scenario_scriptends,
+                "runscript": scenario_runscript, "scriptends": scenario_scriptends, "scriptobjects": scenario_scriptobjects,
                 "seat": scenario_seat, "collision": scenario_collision, "clientresync": scenario_clientresync,
                 "cpteam": scenario_cpteam, "health": scenario_health,
                 "clientvote": scenario_clientvote}[args.scenario](lst, args)
