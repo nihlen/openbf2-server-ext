@@ -215,7 +215,10 @@ closes the link, so:
 - the client sends the script commands, `SeatPreference`, `SetCollision`, `ResyncClient` and `SetControlPointTeam`
   only when the matching capability bit is set, and subscribes to stream 21 only when capability bit 6 is set;
 - commands without a capability bit (`StartVote`, `CancelVote`, `HudEventRaw`, `RoundClock`, `SquadOrder`) and the
-  current structure layouts need a module that has them. Module and client are deployed together.
+  current structure layouts need a module that has them. Module and client are deployed together;
+- `Welcome`'s capability byte has no free bit left. A client learns that a module has stream 22 and
+  `StartClientVote` from its `Ok` to `Subscribe` stream 22 (draft, not approved): an older module answers `Error` 7
+  (unknown stream) and keeps the link. The client sends `StartClientVote` only after that `Ok`.
 
 ## Session
 
@@ -488,7 +491,7 @@ cleared wreck, or a vehicle waiting for its spawner).
 |---|---|
 | `u32` | request id |
 | `u8` | stream, below |
-| `u8` | rate, Hz, 1..30 (ignored for streams 16 to 21) |
+| `u8` | rate, Hz, 1..30 (ignored for streams 16 to 22) |
 | `u8` | filters F (at most 64) |
 | F × string | template names, 1-256 bytes each, compared without case |
 
@@ -505,12 +508,15 @@ cleared wreck, or a vehicle waiting for its spawner).
 | 19 | `Weapons` events | none |
 | 20 | `ProjectileCollision` and `ProjectileTrace` events | at least one projectile template |
 | 21 | `ServerHealth` and `PlayerConnections` events | none |
+| 22 | `VoteBallot` events (draft, not approved) | none |
 
 - Streams 1 to 5 are state streams with a rate. The module sends a frame every `round(30 / rate)` ticks.
 - Streams 16 to 20 switch on event types that are off by default because of their volume. Every hit is one
   `Damage` event.
 - Stream 21 switches on `ServerHealth` and `PlayerConnections`, one of each per 10 s. It is off by default so that a
   client which does not know the events never receives them.
+- Stream 22 switches on `VoteBallot`, one per ballot of a vote ([Server votes](#server-votes)). Off by default for
+  the same reason. Its `Ok` also tells the client that the module has `StartClientVote`.
 - A new `Subscribe` for a stream replaces the old one.
 - Subscribing to stream 19 reports every player's weapons at once.
 
@@ -564,11 +570,12 @@ engine's script event with that id.
 | `0x1218` | Weapons | `u8` player, `u8` W, W × `WeaponSlot` | only while subscribed (stream 19) |
 | `0x1219` | ProjectileCollision | [Hit/miss replay](#hitmiss-replay); only while subscribed (stream 20) | the engine's projectile-collision observer |
 | `0x121A` | ProjectileTrace | [Hit/miss replay](#hitmiss-replay); only while subscribed (stream 20) | the module's tick hook and the projectile observers |
-| `0x121B` | VoteResult | `u32` request id of the `StartVote`, string question, `u8` outcome (1 passed, 2 failed, 3 cancelled by `CancelVote`, 4 cancelled by a level unload), `u16` yes, `u16` no, `u16` voters | [Server votes](#server-votes) |
+| `0x121B` | VoteResult | `u32` request id of the `StartVote` or `StartClientVote`, string question, `u8` outcome (1 passed, 2 failed, 3 cancelled by `CancelVote`, 4 cancelled by a level unload, 5 time up for a vote the client decides), `u16` yes, `u16` no, `u16` voters | [Server votes](#server-votes) |
 | `0x121C` | ScriptFinished | `u32` instance, string name, `u8` reason, string result, `u32` calls, `u32` CPU time of all calls in microseconds, `u32` CPU time of the longest call in microseconds | [Scripts](#scripts) |
 | `0x121D` | ScriptEvent | `u32` instance, `u8` kind (1 data: JSON text, 2 a log line), string payload (at most 8192 bytes) | [Scripts](#scripts) |
 | `0x121E` | ServerHealth | [Server health](#server-health); only while subscribed (stream 21) | the module's tick hook, the main thread's clocks and the host's `/proc` |
 | `0x121F` | PlayerConnections | [Server health](#server-health); only while subscribed (stream 21) | the engine's per-connection statistics |
+| `0x1220` | VoteBallot | `u32` request id of the vote, `u8` player, `u8` choice (1 yes, 2 no, 0 the ballot no longer counts); only while subscribed (stream 22; draft, not approved) | [Server votes](#server-votes) |
 
 Notes on single events:
 
@@ -806,6 +813,7 @@ command does, and its errors, is in [Command semantics](#command-semantics).
 | `0x131D` | SetCollision | `ObjectRef`, `u8` flags (bit 0 collision on; 0 turns it off; other bits must be 0) | `Ok` |
 | `0x131E` | ResyncClient | `i16` player (-1 every connected human client) | `Ok` |
 | `0x131F` | SetControlPointTeam | `ObjectRef` (kind 2 or 3) of a control point, `u8` team (0 neutral, 1 or 2) | `Ok` |
+| `0x1320` | StartClientVote | string question (1-96 bytes), `u16` seconds (5-600), `u8` team (0 everyone, 1 or 2), `u8` voters N (0-64), N × `u8` player (distinct) | `Ok` |
 
 Template names, map names and game modes are at most 256 bytes. Unknown flag bits are `Error` 7 in every command.
 
@@ -887,9 +895,10 @@ Common rules:
   (`Error` 6) a soldier, a camera, or a vehicle with a player in it. `Error` 9 with `adminAllowObjects 0`. A client
   removes the object only if its own copy has a networkable; a copy without one stays until that client is
   resynced or the round restarts ([Client resync](#client-resync)).
-- **StartVote, CancelVote**: [Server votes](#server-votes). `StartVote` is `Error` 6 when a vote is running or no
-  human player can vote, and `Error` 5 when the module cannot listen for ballots. `CancelVote` is `Error` 6 when no
-  vote is running.
+- **StartVote, StartClientVote, CancelVote**: [Server votes](#server-votes). `StartVote` and `StartClientVote` are
+  `Error` 6 when a vote is running or no human player can vote, and `Error` 5 when the module cannot listen for
+  ballots. `CancelVote` is `Error` 6 when no vote is running. `StartClientVote` (draft, not approved) is sent only to a
+  module that answered `Ok` to `Subscribe` stream 22; a player listed twice is `Error` 7.
 - **HudEventRaw, RoundClock, SquadOrder**: [Client presentation commands](#client-presentation-commands).
 - **ResyncClient**: [Client resync](#client-resync). Sent only when capability bit 7 is set.
 - **SetControlPointTeam**: `IControlPoint::setTeam(team)` on the control point
@@ -1085,7 +1094,8 @@ A yes/no vote on any question, run by the module with no engine change. One vote
 - **How players answer.** With PgUp and PgDn. With no HUD question pending, the retail client turns them into the
   team radio messages `roger_that` and `negative` (`HudQuestionManager.cpp`, `replyWithoutQuestion`), which reach
   the module as radio events.
-- **Commands and event.** `0x1313 StartVote`, `0x1314 CancelVote` and the event `0x121B VoteResult`.
+- **Commands and events.** `0x1313 StartVote`, `0x1320 StartClientVote`, `0x1314 CancelVote`, the event
+  `0x121B VoteResult` and, while stream 22 is subscribed, `0x1220 VoteBallot`.
 - **Voters.** Every human player (not AI-flagged) on a voting team: team 1 or 2, or only the given team for a team
   vote. Re-checked every tick. A voter who leaves, or leaves the team of a team vote, loses the ballot. A voter who
   joins mid-vote gets the vote line at once.
@@ -1097,6 +1107,39 @@ A yes/no vote on any question, run by the module with no engine change. One vote
   - A voter's own line, on the tick after the ballot: `<text> - you voted YES` (or `NO`).
   - The result, to everyone, or to the team of a team vote: `VOTE PASSED: <text> (yes Y, no N)`,
     `VOTE FAILED: …` or `VOTE CANCELLED: <text>`. A level unload cancels without a line.
+
+### Ballot events
+
+Draft, not approved.
+
+While stream 22 is subscribed, the module sends `VoteBallot` for every vote, `StartVote`'s too:
+
+- choice 1 or 2 when a voter's answer counts: the first one and every change;
+- choice 0 when a voter's ballot stops counting: the voter left the server, or left the voting teams (or the team of
+  a team vote).
+
+A ballot is reported on the tick after the key press, with the voter's "you voted" line. All of a vote's
+`VoteBallot` events come before its `VoteResult`. The counts in `VoteResult` are those of the ballots that still
+count; a client that adds up the `VoteBallot` events gets the same numbers.
+
+### Votes the client decides
+
+Draft, not approved.
+
+`StartClientVote` starts a vote whose result the client works out from the `VoteBallot` events, by its own rules,
+and announces itself. The players see the same question and "you voted" lines as with `StartVote`.
+
+- **Voters.** With N = 0, every human player on a voting team, as with `StartVote`. With a list, only the listed
+  players who are human and on a voting team, re-checked every tick. A listed player who disconnects is struck from
+  the list for the rest of the vote, so a new player who gets the same player id does not vote. `Error` 6 when no
+  listed player can vote.
+- **End.** The module ends the vote only when its time is up (`VoteResult` outcome 5), on `CancelVote` (outcome 3) or
+  on a level unload (outcome 4). It does not end it when every voter has voted: the client decides when it has its
+  result, sends `CancelVote` if that is before the time is up, and announces the result.
+- **Lines.** The module sends no `VOTE PASSED`, `VOTE FAILED` or `VOTE CANCELLED` line for such a vote, on any
+  outcome.
+- **Ballots.** The client subscribes to stream 22 before it starts the vote. Without the subscription it learns only
+  the totals in `VoteResult`.
 
 ### Keeping the question on screen
 

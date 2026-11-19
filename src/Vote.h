@@ -6,6 +6,7 @@
 #ifndef SERVEREXT_VOTE_H
 #define SERVEREXT_VOTE_H
 
+#include <cstddef>
 #include <cstdio>
 #include <map>
 #include <string>
@@ -35,7 +36,10 @@ const int kMinSeconds = 5;
 const int kMaxSeconds = 600;
 
 enum Choice { ChoiceNone = 0, ChoiceYes = 1, ChoiceNo = 2 };
-enum Outcome { OutcomeNone = 0, OutcomePassed = 1, OutcomeFailed = 2, OutcomeCancelled = 3, OutcomeUnloaded = 4 };
+// OutcomeTimeUp: the time of a vote the client decides ran out (StartClientVote).
+enum Outcome { OutcomeNone = 0, OutcomePassed = 1, OutcomeFailed = 2, OutcomeCancelled = 3, OutcomeUnloaded = 4,
+               OutcomeTimeUp = 5 };
+const size_t kMaxListedVoters = 64;
 
 struct Params
 {
@@ -44,8 +48,14 @@ struct Params
     int team;           // 0 everyone, else 1 or 2
     int percent;        // yes share of the ballots cast needed to pass, 1..100
     int minVotes;       // ballots needed for a pass
-    Params() : seconds(30), team(0), percent(50), minVotes(1) {}
+    // StartClientVote: the client decides the result; the vote ends only when its time is up or it is
+    // cancelled, and the players get no result line.
+    bool clientDecides;
+    bool listed;              // only the players in voters may vote
+    std::vector<int> voters;
+    Params() : seconds(30), team(0), percent(50), minVotes(1), clientDecides(false), listed(false) {}
 };
+
 
 class Box
 {
@@ -62,12 +72,14 @@ public:
         m_start = now;
         m_end = now + p.seconds;
         m_voters.clear();
+        m_lost.clear();
     }
 
     void stop()
     {
         m_running = false;
         m_voters.clear();
+        m_lost.clear();
     }
 
     bool eligibleTeam(int team) const
@@ -75,8 +87,31 @@ public:
         return (team == 1 || team == 2) && (m_params.team == 0 || team == m_params.team);
     }
 
-    // Once per tick: beginSync, present() for every human player on a voting team, endSync. A voter
-    // who is gone, or who left the team a team vote is for, loses the ballot.
+    // A player who may vote by the list: always without a list.
+    bool listed(int id) const
+    {
+        if (!m_params.listed)
+            return true;
+        for (size_t i = 0; i < m_params.voters.size(); ++i)
+            if (m_params.voters[i] == id)
+                return true;
+        return false;
+    }
+
+    // A listed player disconnected: struck from the list for the rest of the vote, so a new player
+    // with the same id does not vote.
+    void strike(int id)
+    {
+        for (size_t i = 0; i < m_params.voters.size(); ++i)
+            if (m_params.voters[i] == id)
+            {
+                m_params.voters.erase(m_params.voters.begin() + static_cast<std::ptrdiff_t>(i));
+                return;
+            }
+    }
+
+    // Once per tick: beginSync, present() for every listed human player on a voting team, endSync. A
+    // voter who is gone, or who left the team a team vote is for, loses the ballot (reported by lost()).
     void beginSync()
     {
         for (std::map<int, Voter>::iterator it = m_voters.begin(); it != m_voters.end(); ++it)
@@ -97,13 +132,25 @@ public:
         for (std::map<int, Voter>::iterator it = m_voters.begin(); it != m_voters.end();)
         {
             if (!it->second.present)
+            {
+                if (it->second.choice != ChoiceNone)
+                    m_lost.push_back(it->first);
                 m_voters.erase(it++);
+            }
             else
                 ++it;
         }
     }
 
     bool isVoter(int id) const { return m_voters.count(id) != 0; }
+
+    // The voters whose ballot stopped counting since the last call (they left), in order.
+    std::vector<int> takeLost()
+    {
+        std::vector<int> out;
+        out.swap(m_lost);
+        return out;
+    }
 
     // A row reached one player's box, every player's, or one team's.
     void row(int id, double now)
@@ -187,11 +234,14 @@ public:
         return cast >= needed && yes * 100 >= m_params.percent * cast ? OutcomePassed : OutcomeFailed;
     }
 
-    // OutcomeNone while the vote runs; the verdict when the time is up or every voter has voted.
+    // OutcomeNone while the vote runs; the verdict when the time is up or every voter has voted. A
+    // vote the client decides ends only with its time (OutcomeTimeUp).
     int check(double now) const
     {
         if (!m_running)
             return OutcomeNone;
+        if (m_params.clientDecides)
+            return now >= m_end ? OutcomeTimeUp : OutcomeNone;
         int yes, no, eligible;
         counts(yes, no, eligible);
         if (now >= m_end || (eligible > 0 && yes + no == eligible))
@@ -258,6 +308,7 @@ private:
     bool m_running;
     double m_start, m_end;
     std::map<int, Voter> m_voters;
+    std::vector<int> m_lost;
 };
 
 } // namespace vote

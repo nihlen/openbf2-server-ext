@@ -1766,6 +1766,45 @@ void testVote()
     b.counts(yes, no, eligible);
     CHECK(yes == 0 && no == 1 && eligible == 1);
     CHECK(b.check(1.0) == OutcomeFailed);    // everyone left voted; 0 of 1
+    std::vector<int> lost = b.takeLost();    // 5's yes no longer counts
+    CHECK(lost.size() == 1 && lost[0] == 5);
+    CHECK(b.takeLost().empty());
+    b.stop();
+
+    // A vote the client decides: only the listed players vote, and it ends only when its time is up.
+    Params c;
+    c.text = "Load layout X?";
+    c.seconds = 30;
+    c.clientDecides = true;
+    c.listed = true;
+    c.voters.push_back(1);
+    c.voters.push_back(4);
+    b.start(c, 0.0);
+    CHECK(b.listed(1) && b.listed(4) && !b.listed(2));
+    b.beginSync();
+    b.present(1, 1, 0.0);
+    b.present(4, 2, 0.0);
+    b.endSync();
+    CHECK(b.ballot(1, ChoiceYes) && b.ballot(4, ChoiceYes));
+    CHECK(b.check(1.0) == OutcomeNone);      // everyone voted, but the client decides
+    CHECK(b.check(30.0) == OutcomeTimeUp);
+    b.strike(4);                             // 4 disconnected: a new player with id 4 does not vote
+    CHECK(!b.listed(4) && b.listed(1));
+    b.beginSync();
+    b.present(1, 1, 0.0);
+    b.endSync();
+    lost = b.takeLost();
+    CHECK(lost.size() == 1 && lost[0] == 4);
+    b.strike(1);                             // the list is empty now: still nobody else
+    CHECK(!b.listed(1) && !b.listed(2));
+    b.stop();
+
+    // Without a list, every player on a voting team.
+    c.listed = false;
+    c.voters.clear();
+    b.start(c, 0.0);
+    CHECK(b.listed(2) && b.listed(200));
+    b.stop();
 }
 
 int main()

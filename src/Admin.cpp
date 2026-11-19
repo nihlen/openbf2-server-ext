@@ -199,7 +199,7 @@ public:
           m_server(0), m_system(0), m_console(0), m_templates(0), m_link(0), m_io(0), m_session(0), m_seq(0),
           m_tick(0), m_lastStatus(-2), m_lastBeginRound(-2), m_cpsScanned(false), m_lastCpScan(0), m_damageEvents(false),
           m_projectileEvents(false), m_fireEvents(false), m_weaponEvents(false), m_healthEvents(false),
-          m_firesDropped(0), m_replay(false),
+          m_ballotEvents(false), m_firesDropped(0), m_replay(false),
           m_collisionsThisTick(0), m_collisionsDropped(0), m_tracesSent(0), m_tracesSkipped(0), m_r4(false),
           m_voteHook(false), m_voteRequest(0), m_voteReposts(0), m_selfPost(-1), m_selfSeen(false),
           m_scripts(this), m_scriptEventsDropped(0), m_seatPrefCount(0), m_seatDelays(0), m_seatProbes(0),
@@ -1106,7 +1106,7 @@ private:
         m_pending.clear();
         for (int i = 0; i <= StreamAim; ++i)
             m_streams[i] = StreamSub();
-        m_damageEvents = m_projectileEvents = m_fireEvents = m_weaponEvents = m_healthEvents = false;
+        m_damageEvents = m_projectileEvents = m_fireEvents = m_weaponEvents = m_healthEvents = m_ballotEvents = false;
         for (int i = 0; i < 256; ++i)
             m_connections[i].reset();
         m_projectileEventFilters.clear();
@@ -1852,6 +1852,8 @@ private:
             reason = DiscLeft;   // [INFERRED] a client that quits is dropped with result 13
         else if (engineReason >= 0)
             reason = DiscOther;
+        if (m_vote.running())
+            m_vote.strike(id);   // a listed voter's id may go to the next player
         std::vector<uint8_t> f;
         m_connections[id & 0xFF].reset();   // the id may go to the next player within the window
         encodePlayerDisconnect(f, ++m_seq, tickNumber(), static_cast<uint8_t>(id), reason,
@@ -2157,6 +2159,7 @@ private:
         case CmdSpawnObject: onSpawnObject(c); return;
         case CmdDeleteObject: onDeleteObject(c); return;
         case CmdStartVote: onStartVote(c); return;
+        case CmdStartClientVote: onStartClientVote(c); return;
         case CmdCancelVote: onCancelVote(c); return;
         case CmdHudEventRaw: onHudEventRaw(c); return;
         case CmdRoundClock: onRoundClock(c); return;
@@ -2646,6 +2649,32 @@ private:
     // StartVote: one vote at a time, and at least one human player on a voting team.
     void onStartVote(const Command& c)
     {
+        vote::Params p;
+        p.text = c.text;
+        p.seconds = static_cast<int>(c.seconds);
+        p.team = c.target;
+        p.percent = c.value8;
+        p.minVotes = c.flags;
+        startVote(c, p);
+    }
+
+    // StartClientVote: the client decides from the VoteBallot events; with a list, only the listed
+    // players vote.
+    void onStartClientVote(const Command& c)
+    {
+        vote::Params p;
+        p.text = c.text;
+        p.seconds = static_cast<int>(c.seconds);
+        p.team = c.target;
+        p.clientDecides = true;
+        p.listed = !c.players.empty();
+        for (size_t i = 0; i < c.players.size(); ++i)
+            p.voters.push_back(c.players[i]);
+        startVote(c, p);
+    }
+
+    void startVote(const Command& c, const vote::Params& p)
+    {
         if (!m_voteHook)
         {
             error(c.requestId, ErrUnavailable, "the module could not listen for ballots");
@@ -2656,12 +2685,7 @@ private:
             error(c.requestId, ErrRefused, "a vote is already running");
             return;
         }
-        vote::Params p;
-        p.text = c.text;
-        p.seconds = static_cast<int>(c.seconds);
-        p.team = c.target;
-        p.percent = c.value8;
-        p.minVotes = c.flags;
+        m_voteConfirms.clear();
         m_vote.start(p, now());
         syncVoters();
         int yes, no, eligible;
@@ -2674,8 +2698,12 @@ private:
         }
         m_voteRequest = c.requestId;
         m_voteReposts = 0;
-        logf("tick %lu: admin: vote started (request %u, %d s, team %d, %d%%, min %d, %d voters): %s", m_tick,
-             c.requestId, p.seconds, p.team, p.percent, p.minVotes, eligible, p.text.c_str());
+        if (p.clientDecides)
+            logf("tick %lu: admin: client vote started (request %u, %d s, team %d, %d listed, %d voters): %s", m_tick,
+                 c.requestId, p.seconds, p.team, static_cast<int>(p.voters.size()), eligible, p.text.c_str());
+        else
+            logf("tick %lu: admin: vote started (request %u, %d s, team %d, %d%%, min %d, %d voters): %s", m_tick,
+                 c.requestId, p.seconds, p.team, p.percent, p.minVotes, eligible, p.text.c_str());
         ok(c.requestId);
         postDueVoteLines();
     }
@@ -2699,7 +2727,7 @@ private:
         for (std::list<world::IPlayer*>::const_iterator it = players.begin(); it != players.end(); ++it)
         {
             world::IPlayer* p = *it;
-            if (!p || p->getIsAIPlayer() || !m_vote.eligibleTeam(p->getTeam()))
+            if (!p || p->getIsAIPlayer() || !m_vote.eligibleTeam(p->getTeam()) || !m_vote.listed(p->getId()))
                 continue;
             m_vote.present(p->getId(), p->getTeam(), p->getPing() / 1000.0);
         }
@@ -2715,7 +2743,7 @@ private:
             return;
         }
         syncVoters();
-        sendVoteConfirms();
+        reportBallots(true);
         const int outcome = m_vote.check(now());
         if (outcome != vote::OutcomeNone)
         {
@@ -2743,12 +2771,13 @@ private:
         }
     }
 
-    // announce: tell the players (not during a level unload).
+    // announce: tell the players (not during a level unload, and never for a vote the client decides).
     void endVote(int outcome, bool announce)
     {
+        reportBallots(false);   // every VoteBallot before the VoteResult
         int yes, no, eligible;
         m_vote.counts(yes, no, eligible);
-        if (announce)
+        if (announce && !m_vote.params().clientDecides)
         {
             const std::string line = m_vote.resultLine(outcome);
             if (m_vote.params().team == 0)
@@ -2823,18 +2852,34 @@ private:
         logf("tick %lu: admin: vote: player %d voted %s", m_tick, p->getId(), choice == vote::ChoiceYes ? "yes" : "no");
     }
 
-    // The voters' private "<text> - you voted YES/NO" lines. Each is a row in that voter's box.
-    void sendVoteConfirms()
+    // The ballots since the last call: a VoteBallot for each (stream 22), the lost ones first, and with
+    // confirmLines the voters' private "<text> - you voted YES/NO" lines, each a row in that voter's box.
+    void reportBallots(bool confirmLines)
     {
+        const std::vector<int> lost = m_vote.takeLost();
+        for (size_t i = 0; i < lost.size(); ++i)
+            ballotEvent(lost[i], vote::ChoiceNone);
         for (size_t i = 0; i < m_voteConfirms.size(); ++i)
         {
             const int id = m_voteConfirms[i].first;
             if (!m_vote.isVoter(id))
                 continue;
-            m_server->say(m_vote.choiceLine(m_voteConfirms[i].second), static_cast<TargetChannel>(14),
-                          static_cast<ChannelMessageType>(1), 0, static_cast<unsigned int>(id));
+            if (confirmLines)
+                m_server->say(m_vote.choiceLine(m_voteConfirms[i].second), static_cast<TargetChannel>(14),
+                              static_cast<ChannelMessageType>(1), 0, static_cast<unsigned int>(id));
+            ballotEvent(id, m_voteConfirms[i].second);
         }
         m_voteConfirms.clear();
+    }
+
+    void ballotEvent(int player, int choice)
+    {
+        if (!m_session || !m_ballotEvents)
+            return;
+        std::vector<uint8_t> f;
+        encodeVoteBallot(f, ++m_seq, tickNumber(), m_voteRequest, static_cast<uint8_t>(player),
+                         static_cast<uint8_t>(choice));
+        event(f);
     }
 
     // Script events that put a row in every box: a kill-feed line (a kill with a killer, or a
@@ -2875,6 +2920,8 @@ private:
         }
         else if (c.target == StreamServerHealth)
             m_healthEvents = true;
+        else if (c.target == StreamVoteBallots)
+            m_ballotEvents = true;
         else
         {
             StreamSub& s = m_streams[c.target];
@@ -2919,6 +2966,8 @@ private:
             for (int i = 0; i < 256; ++i)
                 m_connections[i].reset();
         }
+        else if (c.target == StreamVoteBallots)
+            m_ballotEvents = false;
         else if (c.target >= StreamPlayers && c.target <= StreamAim)
             m_streams[c.target] = StreamSub();
         else
@@ -3514,6 +3563,7 @@ private:
     bool m_fireEvents;
     bool m_weaponEvents;
     bool m_healthEvents;                        // stream 21
+    bool m_ballotEvents;                        // stream 22
     health::ConnectionStats m_connections[256]; // by player id: the readings of the window in progress
     std::vector<std::string> m_fireFilters;   // lowered; empty: every launch
     std::vector<PendingFire> m_fires;

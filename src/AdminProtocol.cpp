@@ -955,6 +955,17 @@ void encodeVoteResult(std::vector<uint8_t>& out, uint32_t seq, uint32_t tick, ui
     w.finish();
 }
 
+void encodeVoteBallot(std::vector<uint8_t>& out, uint32_t seq, uint32_t tick, uint32_t requestId, uint8_t player,
+                      uint8_t choice)
+{
+    Writer w(out);
+    beginEvent(w, EvVoteBallot, seq, tick);
+    w.u32(requestId);
+    w.u8(player);
+    w.u8(choice);
+    w.finish();
+}
+
 void encodeScriptFinished(std::vector<uint8_t>& out, uint32_t seq, uint32_t tick, uint32_t instance,
                           const std::string& name, uint8_t reason, const std::string& result, uint32_t calls,
                           uint32_t totalUs, uint32_t maxUs)
@@ -1112,7 +1123,7 @@ bool isWebAdminMessage(uint16_t type)
     case CmdMap: case CmdListObjects: case CmdSetObjectActive: case CmdSpawnObject: case CmdDeleteObject:
     case CmdStartVote: case CmdCancelVote: case CmdHudEventRaw: case CmdRoundClock: case CmdSquadOrder:
     case CmdStartScript: case CmdStopScript: case CmdScriptMessage: case CmdListScripts: case CmdSeatPreference:
-    case CmdSetCollision: case CmdResyncClient: case CmdSetControlPointTeam:
+    case CmdSetCollision: case CmdResyncClient: case CmdSetControlPointTeam: case CmdStartClientVote:
     case MsgPing: case MsgPong: case MsgError:
         return true;
     default:
@@ -1165,7 +1176,7 @@ bool parseCommand(uint16_t type, const uint8_t* p, size_t n, Command& out, std::
         const uint8_t s = out.target;
         const bool eventStream = s == StreamDamageEvents || s == StreamProjectileEvents ||
                                  s == StreamWeaponFireEvents || s == StreamWeaponEvents || s == StreamProjectileReplay ||
-                                 s == StreamServerHealth;
+                                 s == StreamServerHealth || s == StreamVoteBallots;
         if (s != StreamPlayers && s != StreamVehicles && s != StreamProjectiles && s != StreamGame && s != StreamAim &&
             !eventStream)
             return bad(badValue, "unknown stream");
@@ -1418,6 +1429,31 @@ bool parseCommand(uint16_t type, const uint8_t* p, size_t n, Command& out, std::
             return bad(badValue, "minimum ballots must be 0..64");
         return engineText(raw, vote::kMaxText, false, out.text, badValue,
                           "the question must be 1..96 bytes of UTF-8 without control characters");
+
+    case CmdStartClientVote:
+    {
+        out.requestId = r.u32();
+        r.str(raw);
+        out.seconds = r.u16();
+        out.target = r.u8();
+        const uint8_t count = r.u8();
+        for (uint8_t i = 0; i < count && r.ok(); ++i)
+            out.players.push_back(r.u8());
+        if (!r.done())
+            return false;
+        if (out.seconds < static_cast<uint32_t>(vote::kMinSeconds) || out.seconds > static_cast<uint32_t>(vote::kMaxSeconds))
+            return bad(badValue, "seconds must be 5..600");
+        if (out.target > 2)
+            return bad(badValue, "team must be 0 (everyone), 1 or 2");
+        if (out.players.size() > vote::kMaxListedVoters)
+            return bad(badValue, "at most 64 voters");
+        for (size_t i = 0; i < out.players.size(); ++i)
+            for (size_t j = i + 1; j < out.players.size(); ++j)
+                if (out.players[i] == out.players[j])
+                    return bad(badValue, "a voter is listed twice");
+        return engineText(raw, vote::kMaxText, false, out.text, badValue,
+                          "the question must be 1..96 bytes of UTF-8 without control characters");
+    }
 
     case CmdCancelVote:
     case CmdListScripts:

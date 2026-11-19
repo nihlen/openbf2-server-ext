@@ -792,6 +792,9 @@ std::vector<Case> validCommands()
     w.u32(49); w.i16(-1); CASE(CmdResyncClient);
     w.u32(50); w.u8(3); w.u32(812); w.u8(2); CASE(CmdSetControlPointTeam);
     w.u32(51); w.u8(2); w.u32(3001); w.u8(0); CASE(CmdSetControlPointTeam);
+    w.u32(52); w.u8(StreamVoteBallots); w.u8(0); w.u8(0); CASE(MsgSubscribe);
+    w.u32(53); w.str("Load layout 'Tower run'?"); w.u16(30); w.u8(0); w.u8(4); w.u8(3); w.u8(7); w.u8(0); w.u8(255); CASE(CmdStartClientVote);
+    w.u32(54); w.str("q"); w.u16(5); w.u8(2); w.u8(0); CASE(CmdStartClientVote);
 #undef CASE
     return cs;
 }
@@ -852,6 +855,15 @@ void testCommandParsing()
         CHECK(cmd.type == CmdSetControlPointTeam && cmd.requestId == 50 && cmd.ref.kind == RefConsoleId && cmd.ref.id == 812 && cmd.value8 == 2);
         CHECK(parseCommand(cs[50].type, &cs[50].payload[0], cs[50].payload.size(), cmd, 0));
         CHECK(cmd.requestId == 51 && cmd.ref.kind == RefNetId && cmd.ref.id == 3001 && cmd.value8 == 0);
+        CHECK(parseCommand(cs[51].type, &cs[51].payload[0], cs[51].payload.size(), cmd, 0));
+        CHECK(cmd.requestId == 52 && cmd.target == StreamVoteBallots && cmd.filters.empty());
+        CHECK(parseCommand(cs[52].type, &cs[52].payload[0], cs[52].payload.size(), cmd, 0));
+        CHECK(cmd.type == CmdStartClientVote && cmd.requestId == 53 && cmd.text == "Load layout 'Tower run'?" &&
+              cmd.seconds == 30 && cmd.target == 0 && cmd.players.size() == 4 && cmd.players[0] == 3 &&
+              cmd.players[2] == 0 && cmd.players[3] == 255);
+        Command c2;
+        CHECK(parseCommand(cs[53].type, &cs[53].payload[0], cs[53].payload.size(), c2, 0));
+        CHECK(c2.requestId == 54 && c2.seconds == 5 && c2.target == 2 && c2.players.empty());
     }
     // Bad values: well-formed, so Error 7 for that request, not a framing error.
     struct Bad { uint16_t type; std::vector<uint8_t> payload; };
@@ -868,7 +880,8 @@ void testCommandParsing()
     w.u32(1); w.u8(StreamAim); w.u8(5); w.u8(1); w.str("x"); BAD(MsgSubscribe);               // aim takes no filter
     w.u32(1); w.u8(StreamWeaponEvents); w.u8(0); w.u8(1); w.str("x"); BAD(MsgSubscribe);      // weapons takes none
     w.u32(1); w.u8(StreamProjectileReplay); w.u8(0); w.u8(0); BAD(MsgSubscribe);              // replay needs a filter
-    w.u32(1); w.u8(22); w.u8(0); w.u8(0); BAD(MsgSubscribe);                                  // unknown event stream
+    w.u32(1); w.u8(23); w.u8(0); w.u8(0); BAD(MsgSubscribe);                                  // unknown event stream
+    w.u32(1); w.u8(StreamVoteBallots); w.u8(0); w.u8(1); w.str("x"); BAD(MsgSubscribe);       // ballots take no filter
     w.u32(1); w.u8(StreamServerHealth); w.u8(0); w.u8(1); w.str("x"); BAD(MsgSubscribe);      // health takes no filter
     w.u32(1); w.str(""); BAD(CmdConsole);
     w.u32(1); w.str("a\nb"); BAD(CmdConsole);
@@ -947,6 +960,14 @@ void testCommandParsing()
     w.u32(1); w.u8(3); w.u32(812); w.u8(3); BAD(CmdSetControlPointTeam);                               // team 3
     w.u32(1); w.u8(1); w.u32(3); w.u8(1); BAD(CmdSetControlPointTeam);                                 // a player
     w.u32(1); w.u8(0); w.u32(812); w.u8(1); BAD(CmdSetControlPointTeam);                               // kind 0
+    w.u32(1); w.str("q"); w.u16(4); w.u8(0); w.u8(0); BAD(CmdStartClientVote);                         // 4 s
+    w.u32(1); w.str("q"); w.u16(601); w.u8(0); w.u8(0); BAD(CmdStartClientVote);                       // 601 s
+    w.u32(1); w.str("q"); w.u16(30); w.u8(3); w.u8(0); BAD(CmdStartClientVote);                        // team 3
+    w.u32(1); w.str(""); w.u16(30); w.u8(0); w.u8(0); BAD(CmdStartClientVote);                         // no question
+    w.u32(1); w.str(std::string(97, 'q')); w.u16(30); w.u8(0); w.u8(0); BAD(CmdStartClientVote);
+    w.u32(1); w.str("a\x01"); w.u16(30); w.u8(0); w.u8(0); BAD(CmdStartClientVote);                   // control byte
+    w.u32(1); w.str("q"); w.u16(30); w.u8(0); w.u8(3); w.u8(3); w.u8(5); w.u8(3); BAD(CmdStartClientVote);   // 3 twice
+    w.u32(1); w.str("q"); w.u16(30); w.u8(0); w.u8(65); for (int i = 0; i < 65; ++i) w.u8(static_cast<uint8_t>(i)); BAD(CmdStartClientVote);
 #undef BAD
     for (size_t i = 0; i < bads.size(); ++i)
     {
@@ -1940,7 +1961,7 @@ void testGolden()
 {
     const std::string path = std::string(SERVEREXT_FIXTURES) + "/admin-v1-golden.txt";
     std::map<std::string, std::vector<uint8_t> > golden = readGolden(path);
-    CHECK(golden.size() == 90);
+    CHECK(golden.size() == 93);
     if (golden.empty())
     {
         std::printf("  no golden fixtures at %s\n", path.c_str());
@@ -2112,6 +2133,7 @@ void testGolden()
     encodePing(mine["pong"], MsgPong, 13, 0x0102030405060708ull);
     encodeError(mine["error"], 14, ErrDisabled, "off");
     encodeVoteResult(mine["ev_vote_result"], 27, 10, 27, "Enable mod \xC2\xA7X?", 1, 3, 1, 5);
+    encodeVoteBallot(mine["ev_vote_ballot"], 32, 10, 43, 7, 1);
     {
         std::vector<std::pair<uint32_t, std::string> > scripts;
         scripts.push_back(std::make_pair(7u, std::string("nasa")));
@@ -2165,8 +2187,12 @@ void testGolden()
         CHECK(ok);
         parsed[it->first] = c;
     }
-    CHECK(parsed.size() == 41);
+    CHECK(parsed.size() == 43);
     Command c;
+    c = parsed["cmd_subscribe_ballots"]; CHECK(c.type == MsgSubscribe && c.requestId == 42 && c.target == StreamVoteBallots && c.filters.empty());
+    c = parsed["cmd_start_client_vote"];
+    CHECK(c.type == CmdStartClientVote && c.requestId == 43 && c.text == "Load layout \xA7X?" && c.seconds == 30 &&
+          c.target == 0 && c.players.size() == 4 && c.players[1] == 7 && c.players[3] == 255);
     c = parsed["cmd_set_control_point_team"];
     CHECK(c.type == CmdSetControlPointTeam && c.requestId == 41 && c.ref.kind == RefConsoleId && c.ref.id == 812 && c.value8 == 2);
     c = parsed["cmd_resync_client"]; CHECK(c.type == CmdResyncClient && c.requestId == 39 && c.target16 == 3);

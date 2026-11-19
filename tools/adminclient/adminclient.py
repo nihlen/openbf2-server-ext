@@ -59,7 +59,7 @@ EV_VEHICLE_DESTROYED, EV_CONTROL_POINT, EV_CHAT, EV_PROJECTILE_FIRED = 0x120F, 0
 EV_PROJECTILE_HIT, EV_KICK, EV_BAN, EV_BOT = 0x1213, 0x1214, 0x1215, 0x1216
 EV_WEAPON_FIRE, EV_WEAPONS, EV_PROJECTILE_COLLISION, EV_PROJECTILE_TRACE = 0x1217, 0x1218, 0x1219, 0x121A
 EV_VOTE_RESULT, EV_SCRIPT_FINISHED, EV_SCRIPT_EVENT, EV_SERVER_HEALTH = 0x121B, 0x121C, 0x121D, 0x121E
-EV_PLAYER_CONNECTIONS = 0x121F
+EV_PLAYER_CONNECTIONS, EV_VOTE_BALLOT = 0x121F, 0x1220
 CMD_CONSOLE, CMD_SAY, CMD_TELEPORT, CMD_SET_HEALTH, CMD_KILL_PLAYER = 0x1301, 0x1302, 0x1303, 0x1304, 0x1305
 CMD_SET_TEAM, CMD_SET_SCORE, CMD_RANK, CMD_MEDAL, CMD_GAME_EVENT = 0x1306, 0x1307, 0x1308, 0x1309, 0x130A
 CMD_HUD_EVENT, CMD_KICK, CMD_BAN, CMD_MAP, CMD_LIST_OBJECTS = 0x130B, 0x130C, 0x130D, 0x130E, 0x130F
@@ -68,20 +68,22 @@ CMD_START_VOTE, CMD_CANCEL_VOTE = 0x1313, 0x1314
 CMD_HUD_EVENT_RAW, CMD_ROUND_CLOCK, CMD_SQUAD_ORDER = 0x1315, 0x1316, 0x1317
 CMD_START_SCRIPT, CMD_STOP_SCRIPT, CMD_SCRIPT_MESSAGE, CMD_LIST_SCRIPTS = 0x1318, 0x1319, 0x131A, 0x131B
 CMD_SEAT_PREFERENCE, CMD_SET_COLLISION, CMD_RESYNC_CLIENT, CMD_SET_CONTROL_POINT_TEAM = 0x131C, 0x131D, 0x131E, 0x131F
+CMD_START_CLIENT_VOTE = 0x1320
 OK, CONSOLE_RESULT, OBJECT_LIST, OBJECT_SPAWNED, SCRIPT_LIST = 0x1401, 0x1402, 0x1403, 0x1404, 0x1405
 PING, PONG, ERROR = 0x1501, 0x1502, 0xFFFF
 
 NAMES = {v: k for k, v in list(globals().items()) if isinstance(v, int) and k.isupper() and 0x1000 <= v <= 0xFFFF
          and k not in ("VERSION",)}
-EVENT_TYPES = range(0x1201, 0x1220)
+EVENT_TYPES = range(0x1201, 0x1221)
 CAP_CONSOLE, CAP_OBJECTS, CAP_IDENTITY, CAP_SCRIPTS, CAP_SEAT_PREFERENCE, CAP_SET_COLLISION = 1, 2, 4, 8, 16, 32
 CAP_SERVER_HEALTH, CAP_RESYNC_CLIENT = 64, 128
 HEALTH_STEPPED, HEALTH_HOST_VALID, HEALTH_LEVEL_LOAD = 1, 2, 4
 SEAT_FIRST, SEAT_SECOND, SEAT_NONE = 0, 1, 255
-VOTE_OUTCOMES = {1: "passed", 2: "failed", 3: "cancelled", 4: "level unload"}
+VOTE_OUTCOMES = {1: "passed", 2: "failed", 3: "cancelled", 4: "level unload", 5: "time up"}
+VOTE_CHOICES = {0: "no longer counts", 1: "yes", 2: "no"}
 
 STREAMS = {"players": 1, "vehicles": 2, "projectiles": 3, "game": 4, "aim": 5, "damage": 16, "projectile-events": 17,
-           "fire": 18, "weapons": 19, "replay": 20, "health": 21}
+           "fire": 18, "weapons": 19, "replay": 20, "health": 21, "ballots": 22}
 COLLISION_TERRAIN, COLLISION_OBJECT = 0, 1
 COLLISION_ROOT, COLLISION_SOLDIER, COLLISION_REWOUND = 1, 2, 4
 TRACE_CUT, TRACE_COLLIDED = 1, 2
@@ -353,6 +355,8 @@ def decode(t, payload):
             m["samples"] = samples
         elif t == EV_VOTE_RESULT:
             m.update(request=r.u32(), text=r.s(), outcome=r.u8(), yes=r.u16(), no=r.u16(), eligible=r.u16())
+        elif t == EV_VOTE_BALLOT:
+            m.update(request=r.u32(), player=r.u8(), choice=r.u8())
         elif t == EV_SCRIPT_FINISHED:
             m.update(instance=r.u32(), script=r.s(), reason=r.u8(), result=r.s(), calls=r.u32(), total_us=r.u32(),
                      max_us=r.u32())
@@ -452,6 +456,14 @@ def p_spawn(req, template, pos, rot, team=0): return W().u32(req).s(template).ve
 
 def p_start_vote(req, text, seconds=30, team=0, percent=50, min_votes=1):
     return W().u32(req).s(text).u16(seconds).u8(team).u8(percent).u8(min_votes).b
+
+
+def p_start_client_vote(req, text, seconds=30, team=0, voters=()):
+    """StartClientVote: the client decides from the VoteBallot events (stream 22); voters empty: everyone."""
+    w = W().u32(req).s(text).u16(seconds).u8(team).u8(len(voters))
+    for v in voters:
+        w.u8(v)
+    return w.b
 
 
 def p_hud_event_raw(req, player, event, payload=b""):
@@ -675,6 +687,9 @@ def golden_samples():
     s["cmd_resync_client"] = (CMD_RESYNC_CLIENT, p_resync_client(39, 3))
     s["cmd_resync_client_all"] = (CMD_RESYNC_CLIENT, p_resync_client(40, -1))
     s["cmd_set_control_point_team"] = (CMD_SET_CONTROL_POINT_TEAM, p_set_control_point_team(41, REF_CONSOLE, 812, 2))
+    s["cmd_subscribe_ballots"] = (SUBSCRIBE, p_subscribe(42, 22, 0))
+    s["cmd_start_client_vote"] = (CMD_START_CLIENT_VOTE, p_start_client_vote(43, "Load layout §X?", 30, 0, (3, 7, 0, 255)))
+    s["ev_vote_ballot"] = (EV_VOTE_BALLOT, ev(32).u32(43).u8(7).u8(1).b)
     s["ev_server_health"] = (EV_SERVER_HEALTH, ev(30).u16(300).u32(10000123).u8(HEALTH_HOST_VALID).u32(33334).u32(34100)
                              .u32(61234).u16(1).u16(1).u32(310).u32(1250).u32(4800).u32(350).u32(900).u32(12).u32(0)
                              .u16(1).u16(412).u16(278).u16(3).u32(159744).b)
@@ -1503,6 +1518,74 @@ def scenario_vote(lst, args):
         VOTE_OUTCOMES.get(result["outcome"], result["outcome"]), result["yes"], result["no"], result["eligible"], lines,
         result["text"]))
     return 0
+
+def scenario_clientvote(lst, args):
+    """A vote the client decides (docs/admin-channel.md "Server votes", draft): stream 22 is accepted (an unknown
+    stream, 23, is Error 7 and keeps the link, which is what an older module answers for 22), StartClientVote's value
+    checks (Error 7), and with no human player Error 6 for everyone and for a list, and CancelVote Error 6. With a
+    human on a team (--vote-voters, comma-separated player ids, or empty for everyone) it runs the vote for
+    --vote-seconds and prints every VoteBallot and the VoteResult (outcome 5, time up; the module posts no result
+    line). Ballots need retail clients pressing PgUp/PgDn."""
+    c = Checks()
+    link = lst.accept(args.accept_timeout)
+    rq = link.next_request
+    if args.vote_delay > 0:
+        link.pump(args.vote_delay)
+    r = link.request(SUBSCRIBE, p_subscribe(rq(), 23, 0))
+    c.check(r["name"] == "ERROR" and r["code"] == ERR_INVALID, "Subscribe stream 23 (unknown) -> Error 7")
+    r = link.request(SUBSCRIBE, p_subscribe(rq(), STREAMS["ballots"], 0))
+    c.check(r["name"] == "OK", "Subscribe stream 22 (ballots) -> %s" % r["name"])
+    r = link.request(CMD_START_CLIENT_VOTE, p_start_client_vote(rq(), "q", 30, 0, (3, 3)))
+    c.check(r["name"] == "ERROR" and r["code"] == ERR_INVALID, "StartClientVote with a voter twice -> Error 7")
+    r = link.request(CMD_START_CLIENT_VOTE, p_start_client_vote(rq(), "q", 4, 0))
+    c.check(r["name"] == "ERROR" and r["code"] == ERR_INVALID, "StartClientVote of 4 s -> Error 7")
+    r = link.request(CMD_START_CLIENT_VOTE, p_start_client_vote(rq(), "q", 30, 3))
+    c.check(r["name"] == "ERROR" and r["code"] == ERR_INVALID, "StartClientVote for team 3 -> Error 7")
+    humans = [p for p in link.snapshot["players"] if not (p["flags"] & (INFO_AI | INFO_BOT_CHANNEL))]
+    voters = tuple(int(v) for v in args.vote_voters.split(",") if v.strip()) if args.vote_voters else ()
+    if not humans:
+        r = link.request(CMD_START_CLIENT_VOTE, p_start_client_vote(rq(), args.vote_text, args.vote_seconds, 0))
+        c.check(r["name"] == "ERROR" and r["code"] == ERR_REFUSED, "StartClientVote with no human player -> Error 6")
+        r = link.request(CMD_START_CLIENT_VOTE, p_start_client_vote(rq(), args.vote_text, args.vote_seconds, 0, (0, 1)))
+        c.check(r["name"] == "ERROR" and r["code"] == ERR_REFUSED, "StartClientVote for players 0 and 1 -> Error 6")
+        r = link.request(CMD_CANCEL_VOTE, W().u32(rq()).b)
+        c.check(r["name"] == "ERROR" and r["code"] == ERR_REFUSED, "CancelVote with no vote running -> Error 6")
+    else:
+        r = link.request(CMD_START_CLIENT_VOTE, p_start_client_vote(rq(), args.vote_text, args.vote_seconds,
+                                                                     args.vote_team, voters))
+        c.check(r["name"] == "OK", "StartClientVote (voters %s) -> %s %s" % (voters or "everyone", r["name"],
+                                                                            r.get("message", "")))
+        if r["name"] == "OK":
+            r2 = link.request(CMD_START_CLIENT_VOTE, p_start_client_vote(rq(), "second", 10))
+            c.check(r2["name"] == "ERROR" and r2["code"] == ERR_REFUSED, "a second StartClientVote -> Error 6")
+            t0 = time.time()
+            seen = len(link.events)
+            result = None
+            results = 0
+            while result is None and time.time() < t0 + args.vote_seconds + 15:
+                link.pump(0.25)
+                for m in link.events[seen:]:
+                    if m["type"] == EV_VOTE_BALLOT:
+                        log("%6.1f s  VoteBallot: player %d %s" % (time.time() - t0, m["player"],
+                                                                 VOTE_CHOICES.get(m["choice"], m["choice"])))
+                    elif m["type"] == EV_CHAT and m["sender"] == -1:
+                        if m["text"].startswith("VOTE PASSED") or m["text"].startswith("VOTE FAILED") or \
+                                m["text"].startswith("VOTE CANCELLED"):
+                            results += 1
+                        log("%6.1f s  -> %s" % (time.time() - t0, m["text"]))
+                    elif m["type"] == EV_VOTE_RESULT:
+                        result = m
+                seen = len(link.events)
+            c.check(result is not None and result["outcome"] == 5, "VoteResult outcome 5 (time up): %s" % (
+                result and "yes %d, no %d, voters %d" % (result["yes"], result["no"], result["eligible"])))
+            link.pump(1.0)
+            c.check(results == 0, "no result line from the module (%d seen)" % results)
+    r = link.request(UNSUBSCRIBE, W().u32(rq()).u8(STREAMS["ballots"]).b)
+    c.check(r["name"] == "OK", "Unsubscribe stream 22 -> %s" % r["name"])
+    r = link.request(PING, p_ping(rq(), 81))
+    c.check(r["name"] == "PONG" and r["clock"] == 81, "the link is still up (Ping -> Pong)")
+    return c.summary("clientvote")
+
 
 SCRIPT_REASONS = {1: "finished", 2: "stopped", 3: "error", 4: "over budget", 5: "level unload"}
 
@@ -2696,7 +2779,7 @@ def main():
     ap.add_argument("--scenario", default="listen",
                     choices=["listen", "commands", "resync", "stall", "soak", "wrongkey", "wrongpin", "mapchange", "extras",
                              "viewer", "replay", "vote", "r7", "script", "runscript", "scriptends", "seat",
-                             "collision", "health", "clientresync", "cpteam"])
+                             "collision", "health", "clientresync", "cpteam", "clientvote"])
     ap.add_argument("--fuzz", action="store_true")
     ap.add_argument("--fuzz-rounds", type=int, default=24)
     ap.add_argument("--seed", type=int, default=1)
@@ -2714,6 +2797,7 @@ def main():
     ap.add_argument("--lags", default="0.25,0.15,0", help="replay: forced lag blocks, seconds (0 = off)")
     ap.add_argument("--console-setup", default="", help="replay: console lines run first, separated by |")
     ap.add_argument("--vote-text", default="Enable mod X?", help="vote: the question")
+    ap.add_argument("--vote-voters", default="", help="clientvote: comma-separated player ids (empty: everyone)")
     ap.add_argument("--vote-seconds", type=int, default=30, help="vote: 5..600")
     ap.add_argument("--vote-team", type=int, default=0, help="vote: 0 everyone, 1 or 2")
     ap.add_argument("--vote-percent", type=int, default=50, help="vote: yes share of the ballots needed to pass")
@@ -2757,7 +2841,8 @@ def main():
                 "vote": scenario_vote, "r7": scenario_r7, "script": scenario_script,
                 "runscript": scenario_runscript, "scriptends": scenario_scriptends,
                 "seat": scenario_seat, "collision": scenario_collision, "clientresync": scenario_clientresync,
-                "cpteam": scenario_cpteam, "health": scenario_health}[args.scenario](lst, args)
+                "cpteam": scenario_cpteam, "health": scenario_health,
+                "clientvote": scenario_clientvote}[args.scenario](lst, args)
     except KeyboardInterrupt:
         return 130
 

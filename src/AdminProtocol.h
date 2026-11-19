@@ -53,7 +53,7 @@ enum Type : uint16_t
     EvProjectileHit = 0x1213, EvKick = 0x1214, EvBan = 0x1215, EvBot = 0x1216,
     EvWeaponFire = 0x1217, EvWeapons = 0x1218, EvProjectileCollision = 0x1219, EvProjectileTrace = 0x121A,
     EvVoteResult = 0x121B, EvScriptFinished = 0x121C, EvScriptEvent = 0x121D, EvServerHealth = 0x121E,
-    EvPlayerConnections = 0x121F,
+    EvPlayerConnections = 0x121F, EvVoteBallot = 0x1220,
     // commands
     CmdConsole = 0x1301, CmdSay = 0x1302, CmdTeleport = 0x1303, CmdSetHealth = 0x1304, CmdKillPlayer = 0x1305,
     CmdSetTeam = 0x1306, CmdSetScore = 0x1307, CmdRank = 0x1308, CmdMedal = 0x1309, CmdGameEvent = 0x130A,
@@ -62,6 +62,7 @@ enum Type : uint16_t
     CmdCancelVote = 0x1314, CmdHudEventRaw = 0x1315, CmdRoundClock = 0x1316, CmdSquadOrder = 0x1317,
     CmdStartScript = 0x1318, CmdStopScript = 0x1319, CmdScriptMessage = 0x131A, CmdListScripts = 0x131B,
     CmdSeatPreference = 0x131C, CmdSetCollision = 0x131D, CmdResyncClient = 0x131E, CmdSetControlPointTeam = 0x131F,
+    CmdStartClientVote = 0x1320,
     // replies
     MsgOk = 0x1401, MsgConsoleResult = 0x1402, MsgObjectList = 0x1403, MsgObjectSpawned = 0x1404,
     MsgScriptList = 0x1405,
@@ -92,7 +93,8 @@ enum Stream : uint8_t
 {
     StreamPlayers = 1, StreamVehicles = 2, StreamProjectiles = 3, StreamGame = 4, StreamAim = 5,
     StreamDamageEvents = 16, StreamProjectileEvents = 17, StreamWeaponFireEvents = 18, StreamWeaponEvents = 19,
-    StreamProjectileReplay = 20, StreamServerHealth = 21
+    StreamProjectileReplay = 20, StreamServerHealth = 21,
+    StreamVoteBallots = 22   // VoteBallot; its Ok also means StartClientVote exists (docs/admin-channel.md "Server votes")
 };
 
 // ObjectRef kinds.
@@ -441,9 +443,13 @@ void encodeBot(std::vector<uint8_t>& out, uint32_t seq, uint32_t tick, uint8_t p
 void encodeWeaponFire(std::vector<uint8_t>& out, uint32_t seq, uint32_t tick, const WeaponFireEvent& e);
 void encodeWeapons(std::vector<uint8_t>& out, uint32_t seq, uint32_t tick, uint8_t player,
                    const std::vector<WeaponSlot>& slots);
-// VoteResult. outcome: 1 passed, 2 failed, 3 cancelled by CancelVote, 4 cancelled by a level unload.
+// VoteResult. outcome: 1 passed, 2 failed, 3 cancelled by CancelVote, 4 cancelled by a level unload,
+// 5 time up for a vote the client decides.
 void encodeVoteResult(std::vector<uint8_t>& out, uint32_t seq, uint32_t tick, uint32_t requestId,
                       const std::string& text, uint8_t outcome, uint16_t yes, uint16_t no, uint16_t eligible);
+// VoteBallot (stream 22). choice: 1 yes, 2 no, 0 the ballot no longer counts.
+void encodeVoteBallot(std::vector<uint8_t>& out, uint32_t seq, uint32_t tick, uint32_t requestId, uint8_t player,
+                      uint8_t choice);
 
 // ScriptFinished. reason: 1 finish, 2 StopScript, 3 error, 4 over its time budget, 5 level unload.
 void encodeScriptFinished(std::vector<uint8_t>& out, uint32_t seq, uint32_t tick, uint32_t instance,
@@ -539,13 +545,13 @@ struct Command
     uint32_t session;      // filled by the I/O thread
     uint32_t requestId;
     uint8_t player;        // the player id; Say: the team or player id
-    uint8_t target;        // Say target, Map action, Ban "by", Subscribe/Unsubscribe stream, StartVote team
+    uint8_t target;        // Say target, Map action, Ban "by", Subscribe/Unsubscribe stream, StartVote/StartClientVote team
     uint8_t flags;         // Teleport, SetHealth, KillPlayer, SetTeam, Rank, SetCollision flags; SetScore mask; StartVote minimum ballots;
                            // StartScript flags
     uint8_t value8;        // SetTeam team, Rank rank, GameEvent/HudEvent event, Ban duration, Subscribe rate, SpawnObject team,
                            // StartVote percent, StartScript API version, SeatPreference seat, SetControlPointTeam team
     int32_t ints[5];       // SetScore values; Medal medal and value; GameEvent/HudEvent data in [0]
-    uint32_t seconds;      // Ban, StartVote
+    uint32_t seconds;      // Ban, StartVote, StartClientVote
     uint16_t index;        // Map
     uint16_t size;         // Map
     uint16_t maxResults;   // ListObjects
@@ -554,12 +560,13 @@ struct Command
     float pos[3], rot[3];  // Teleport, SpawnObject
     float value;           // SetHealth
     std::string text;      // Console line, Say text, Kick/Ban reason, ListObjects/SpawnObject template, Map name,
-                           // StartVote question, StartScript name
+                           // StartVote/StartClientVote question, StartScript name
     std::string text2;     // Map mode; StartScript arguments and ScriptMessage message (JSON text, UTF-8)
     std::string source;    // StartScript source (UTF-8)
     uint32_t instance;     // StartScript, StopScript, ScriptMessage
     int16_t target16;      // HudEventRaw, RoundClock, ResyncClient: the player, -1 every client
     std::vector<uint8_t> bytes;   // HudEventRaw payload
+    std::vector<uint8_t> players; // StartClientVote voters (distinct; empty: every human on a voting team)
     float points[9];       // SquadOrder: three positions
     uint32_t netId;        // SquadOrder target networkable id, 0 none
     std::vector<std::string> filters;   // Subscribe
