@@ -1193,8 +1193,8 @@ QuickJS-NG (MIT), vendored at a pinned release under `third_party/quickjs-ng` an
 ### Availability
 
 `Welcome` capability bit 3 is set when `adminAllowScripts` is 1. The client sends the script commands only then.
-`StartScript` names the script API version the script needs. This document describes versions 1 and 2 (draft, not
-approved: [Host API, version 2](#host-api-version-2)); a later version only adds to the API.
+`StartScript` names the script API version the script needs. This document describes versions 1 and 2
+([Host API, version 2](#host-api-version-2)); a later version only adds to the API.
 
 ### Commands
 
@@ -1333,7 +1333,7 @@ Behaviour of the setters:
 
 ### Host API, version 2
 
-**Draft, not approved.** Version 2 adds objects by networkable id, so a script can hold and move objects that
+Version 2 adds objects by networkable id, so a script can hold and move objects that
 `SpawnObject` made (an empty helicopter has no player to name). `script.api` is 2. A script that asks for version 1
 sees these members too.
 
@@ -1587,7 +1587,7 @@ and a separate adapter object, so no retail vtable or layout changes. Every addi
 | | Actions: `runMapListEntry`, `restartRound`, `sendGameLogicEvent`, `sendHudEvent`, `sendMedalEvent`, `setRank`, `killPlayer` | `Map`, `GameEvent`, `HudEvent`, `Medal`, `Rank`, `KillPlayer` |
 | R7 | Client presentation: `sendHudEventRaw`, `sendRoundClock`, `issueSquadOrder` | `HudEventRaw`, `RoundClock`, `SquadOrder` |
 | R8 | Client resync: `resyncClient`, `resyncClientStatics` | `ResyncClient` |
-| R9 | Projectile replay (draft, not approved): `activateProjectileOnClients` | the script member `game.activateProjectile` ([Host API, version 2](#host-api-version-2)) |
+| R9 | Projectile replay: `activateProjectileOnClients` | the script member `game.activateProjectile` ([Host API, version 2](#host-api-version-2)) |
 
 **R4, the script-event observer.**
 
@@ -1615,7 +1615,7 @@ database. Two things are new:
 - The last event of the replay is a `PostRemoteEvent` subclass that sets the connection's reset latch when the
   client acknowledges it (`GameServer::confirmReset`). On the wire it is an ordinary game-status event.
 
-**R9, the projectile replay** (draft, not approved). `activateProjectileOnClients(netId)` sends the
+**R9, the projectile replay.** `activateProjectileOnClients(netId)` sends the
 `MissileInitEvent` a launch sends (`GenericProjectile::sendMissileInitEvent`,
 `Game/Objects/Projectiles/GenericProjectile.cpp:1449-1497`) for a projectile the server holds, naming a player id no
 player has. The client's `MissileInitEvent::executeClient` activates its copy before it looks the player up and
